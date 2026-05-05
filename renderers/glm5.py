@@ -22,6 +22,7 @@ from renderers.base import (
     RenderedTokens,
     ToolSpec,
     reject_assistant_in_extension,
+    should_preserve_past_thinking,
 )
 from renderers.parsing import parse_glm
 
@@ -131,6 +132,8 @@ class GLM5Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> RenderedTokens:
         if not messages:
             raise ValueError("No messages provided.")
@@ -177,11 +180,18 @@ class GLM5Renderer:
                 emit_text(content, i)
 
             elif role == "assistant":
+                preserve_thinking = should_preserve_past_thinking(
+                    messages,
+                    i,
+                    preserve_all_thinking=preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+                )
                 self._render_assistant(
                     msg,
                     i,
                     content,
                     last_ui,
+                    preserve_thinking=preserve_thinking,
                     emit_special=emit_special,
                     emit_text=emit_text,
                 )
@@ -207,9 +217,15 @@ class GLM5Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> list[int]:
         return self.render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
         ).token_ids
 
     def parse_response(self, token_ids: list[int]) -> ParsedResponse:
@@ -303,7 +319,15 @@ class GLM5Renderer:
         return previous_ids + ext
 
     def _render_assistant(
-        self, msg, msg_idx, content, last_user_index, *, emit_special, emit_text
+        self,
+        msg,
+        msg_idx,
+        content,
+        last_user_index,
+        *,
+        preserve_thinking: bool = False,
+        emit_special,
+        emit_text,
     ):
         reasoning_content = ""
         if isinstance(msg.get("reasoning_content"), str):
@@ -320,7 +344,7 @@ class GLM5Renderer:
         emit_special(self._assistant, msg_idx)
 
         include_thinking = (
-            not self._clear_thinking or msg_idx > last_user_index
+            (not self._clear_thinking or msg_idx > last_user_index) or preserve_thinking
         ) and reasoning_content
 
         if include_thinking:

@@ -33,6 +33,7 @@ from renderers.base import (
     RenderedTokens,
     ToolSpec,
     reject_assistant_in_extension,
+    should_preserve_past_thinking,
     trim_to_turn_close,
 )
 
@@ -571,6 +572,8 @@ class KimiK25Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> RenderedTokens:
         """Render messages to tokens, matching the K2.5 chat template.
 
@@ -642,10 +645,17 @@ class KimiK25Renderer:
             # Body
             if role == "assistant":
                 is_suffix = i > last_non_tc_assistant
+                preserve_thinking = should_preserve_past_thinking(
+                    messages,
+                    i,
+                    preserve_all_thinking=preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+                )
                 self._render_assistant_body(
                     msg,
                     i,
                     is_suffix=is_suffix,
+                    preserve_thinking=preserve_thinking,
                     emit_special=emit_special,
                     emit_text=emit_text,
                 )
@@ -684,9 +694,15 @@ class KimiK25Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> list[int]:
         return self.render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
         ).token_ids
 
     def parse_response(self, token_ids: list[int]) -> ParsedResponse:
@@ -828,6 +844,7 @@ class KimiK25Renderer:
         msg_idx: int,
         *,
         is_suffix: bool,
+        preserve_thinking: bool = False,
         emit_special,
         emit_text,
     ) -> None:
@@ -877,7 +894,8 @@ class KimiK25Renderer:
             text_content = content or ""
 
         # Hist/suffix split: hist drops reasoning, suffix keeps it.
-        if is_suffix:
+        # Override flag preserves reasoning on hist when caller asks for it.
+        if is_suffix or (preserve_thinking and reasoning_content):
             emit_text(f"<think>{reasoning_content}</think>", msg_idx)
         else:
             emit_text("<think></think>", msg_idx)

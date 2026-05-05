@@ -17,6 +17,7 @@ from renderers.base import (
     RenderedTokens,
     ToolSpec,
     reject_assistant_in_extension,
+    should_preserve_past_thinking,
     trim_to_turn_close,
 )
 from renderers.parsing import parse_qwen35
@@ -146,6 +147,8 @@ class Qwen35Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> RenderedTokens:
         if not messages:
             raise ValueError("No messages provided.")
@@ -217,11 +220,18 @@ class Qwen35Renderer:
                 emit_text("\n", i)
 
             elif role == "assistant":
+                preserve_thinking = should_preserve_past_thinking(
+                    messages,
+                    i,
+                    preserve_all_thinking=preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+                )
                 self._render_assistant(
                     msg,
                     i,
                     content,
                     last_qi,
+                    preserve_thinking=preserve_thinking,
                     emit_special=emit_special,
                     emit_text=emit_text,
                     emit_ids=emit_ids,
@@ -260,9 +270,15 @@ class Qwen35Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> list[int]:
         return self.render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
         ).token_ids
 
     def parse_response(self, token_ids: list[int]) -> ParsedResponse:
@@ -391,6 +407,7 @@ class Qwen35Renderer:
         content: str,
         last_query_index: int,
         *,
+        preserve_thinking: bool = False,
         emit_special,
         emit_text,
         emit_ids,
@@ -414,7 +431,10 @@ class Qwen35Renderer:
 
         emit_special(self._im_start, msg_idx)
 
-        if self._should_render_thinking(msg_idx, last_query_index):
+        emit_thinking = self._should_render_thinking(msg_idx, last_query_index) or (
+            preserve_thinking and bool(reasoning_content)
+        )
+        if emit_thinking:
             # Include thinking block
             emit_text("assistant\n", msg_idx)
             emit_special(self._think, msg_idx)

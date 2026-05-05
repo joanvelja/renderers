@@ -21,6 +21,7 @@ from renderers.base import (
     RenderedTokens,
     ToolSpec,
     reject_assistant_in_extension,
+    should_preserve_past_thinking,
 )
 from renderers.parsing import parse_glm
 
@@ -114,6 +115,8 @@ class GLM45Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> RenderedTokens:
         if not messages:
             raise ValueError("No messages provided.")
@@ -163,11 +166,18 @@ class GLM45Renderer:
                 emit_text(user_text, i)
 
             elif role == "assistant":
+                preserve_thinking = should_preserve_past_thinking(
+                    messages,
+                    i,
+                    preserve_all_thinking=preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+                )
                 self._render_assistant(
                     msg,
                     i,
                     content,
                     last_ui,
+                    preserve_thinking=preserve_thinking,
                     emit_special=emit_special,
                     emit_text=emit_text,
                 )
@@ -193,9 +203,15 @@ class GLM45Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> list[int]:
         return self.render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
         ).token_ids
 
     def parse_response(self, token_ids: list[int]) -> ParsedResponse:
@@ -284,7 +300,15 @@ class GLM45Renderer:
         return previous_ids + ext
 
     def _render_assistant(
-        self, msg, msg_idx, content, last_user_index, *, emit_special, emit_text
+        self,
+        msg,
+        msg_idx,
+        content,
+        last_user_index,
+        *,
+        preserve_thinking: bool = False,
+        emit_special,
+        emit_text,
     ):
         reasoning_content = ""
         if isinstance(msg.get("reasoning_content"), str):
@@ -300,7 +324,7 @@ class GLM45Renderer:
 
         emit_special(self._assistant, msg_idx)
 
-        if msg_idx > last_user_index and reasoning_content:
+        if (msg_idx > last_user_index or preserve_thinking) and reasoning_content:
             emit_text("\n", msg_idx)
             emit_special(self._think, msg_idx)
             emit_text(reasoning_content.strip(), msg_idx)

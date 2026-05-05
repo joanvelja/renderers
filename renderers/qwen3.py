@@ -19,6 +19,7 @@ from renderers.base import (
     RenderedTokens,
     ToolSpec,
     reject_assistant_in_extension,
+    should_preserve_past_thinking,
     trim_to_turn_close,
 )
 from renderers.parsing import parse_qwen3
@@ -94,6 +95,8 @@ class Qwen3Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> RenderedTokens:
         if not messages:
             raise ValueError("No messages provided.")
@@ -158,12 +161,19 @@ class Qwen3Renderer:
                 emit_text("\n", i)
 
             elif role == "assistant":
+                preserve_thinking = should_preserve_past_thinking(
+                    messages,
+                    i,
+                    preserve_all_thinking=preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+                )
                 self._render_assistant(
                     msg,
                     i,
                     content,
                     last_qi,
                     i == num_messages - 1,
+                    preserve_thinking=preserve_thinking,
                     emit_special=emit_special,
                     emit_text=emit_text,
                 )
@@ -188,9 +198,15 @@ class Qwen3Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> list[int]:
         return self.render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
         ).token_ids
 
     def parse_response(self, token_ids: list[int]) -> ParsedResponse:
@@ -281,6 +297,7 @@ class Qwen3Renderer:
         last_query_index,
         is_last,
         *,
+        preserve_thinking: bool = False,
         emit_special,
         emit_text,
     ):
@@ -303,7 +320,11 @@ class Qwen3Renderer:
         # preserve BPE merges (e.g., ".\n" is a single token in Qwen3).
         tool_calls = msg.get("tool_calls") or []
 
-        if msg_idx > last_query_index and (is_last or reasoning_content):
+        emit_in_template_window = msg_idx > last_query_index and (
+            is_last or reasoning_content
+        )
+        emit_via_override = preserve_thinking and bool(reasoning_content)
+        if emit_in_template_window or emit_via_override:
             prefix = (
                 "assistant\n<think>\n"
                 + reasoning_content.strip("\n")

@@ -25,6 +25,7 @@ from renderers.base import (
     RenderedTokens,
     ToolSpec,
     reject_assistant_in_extension,
+    should_preserve_past_thinking,
     trim_to_turn_close,
 )
 from renderers.parsing import parse_qwen35
@@ -214,10 +215,13 @@ class Nemotron3Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> RenderedTokens:
         if not messages:
             raise ValueError("No messages provided.")
 
+        original_messages = list(messages)
         # Always ensure an empty system message is present.
         messages, auto_system_injected = self._normalize_messages(messages)
         # Offset to map indices in the normalized list back to the caller's
@@ -318,11 +322,18 @@ class Nemotron3Renderer:
 
             elif role == "assistant":
                 is_last_turn = i >= last_plain_assistant_idx
+                preserve_thinking = msg_orig_idx >= 0 and should_preserve_past_thinking(
+                    original_messages,
+                    msg_orig_idx,
+                    preserve_all_thinking=preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+                )
                 self._render_assistant(
                     msg,
                     msg_orig_idx,
                     content,
                     is_last_turn=is_last_turn,
+                    preserve_thinking=preserve_thinking,
                     emit_special=emit_special,
                     emit_text=emit_text,
                     emit_ids=emit_ids,
@@ -362,9 +373,15 @@ class Nemotron3Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> list[int]:
         return self.render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
         ).token_ids
 
     def parse_response(self, token_ids: list[int]) -> ParsedResponse:
@@ -473,6 +490,7 @@ class Nemotron3Renderer:
         content: str,
         *,
         is_last_turn: bool,
+        preserve_thinking: bool = False,
         emit_special,
         emit_text,
         emit_ids,
@@ -507,7 +525,7 @@ class Nemotron3Renderer:
         # <tool_call>, whether the content is empty or not.
         content_suffix = "\n" if tool_calls else ""
 
-        if reasoning_content and is_last_turn:
+        if reasoning_content and (is_last_turn or preserve_thinking):
             emit_special(self._think, msg_idx)
             emit_text("\n" + reasoning_content + "\n", msg_idx)
             emit_special(self._think_end, msg_idx)

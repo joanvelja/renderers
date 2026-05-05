@@ -22,6 +22,7 @@ from renderers.base import (
     RenderedTokens,
     ToolSpec,
     reject_assistant_in_extension,
+    should_preserve_past_thinking,
     trim_to_turn_close,
 )
 from renderers.parsing import parse_minimax
@@ -105,6 +106,8 @@ class MiniMaxM2Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> RenderedTokens:
         if not messages:
             raise ValueError("No messages provided.")
@@ -168,11 +171,18 @@ class MiniMaxM2Renderer:
                 emit_text("\n", orig_idx)
 
             elif role == "assistant":
+                preserve_thinking = should_preserve_past_thinking(
+                    messages,
+                    orig_idx,
+                    preserve_all_thinking=preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+                )
                 self._render_assistant(
                     msg,
                     orig_idx,
                     ci,
                     last_ui,
+                    preserve_thinking=preserve_thinking,
                     emit_special=emit_special,
                     emit_text=emit_text,
                 )
@@ -202,9 +212,15 @@ class MiniMaxM2Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> list[int]:
         return self.render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
         ).token_ids
 
     def parse_response(self, token_ids: list[int]) -> ParsedResponse:
@@ -290,7 +306,15 @@ class MiniMaxM2Renderer:
         return previous_ids + ext
 
     def _render_assistant(
-        self, msg, orig_idx, conv_idx, last_user_index, *, emit_special, emit_text
+        self,
+        msg,
+        orig_idx,
+        conv_idx,
+        last_user_index,
+        *,
+        preserve_thinking: bool = False,
+        emit_special,
+        emit_text,
     ):
         content = self._visible_text(msg.get("content"))
 
@@ -311,7 +335,7 @@ class MiniMaxM2Renderer:
         # interspersed. Keep text segments contiguous to preserve BPE merges.
         tool_calls = msg.get("tool_calls") or []
 
-        if reasoning_content and conv_idx > last_user_index:
+        if reasoning_content and (conv_idx > last_user_index or preserve_thinking):
             emit_text("ai\n", orig_idx)
             emit_special(self._think, orig_idx)
             emit_text("\n" + reasoning_content + "\n", orig_idx)

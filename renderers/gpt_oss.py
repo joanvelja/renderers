@@ -57,6 +57,7 @@ from renderers.base import (
     RenderedTokens,
     ToolSpec,
     reject_assistant_in_extension,
+    should_preserve_past_thinking,
     trim_to_turn_close,
 )
 from renderers.parsing import parse_gpt_oss
@@ -185,6 +186,8 @@ class GptOssRenderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> RenderedTokens:
         if not messages:
             raise ValueError("No messages provided.")
@@ -249,7 +252,17 @@ class GptOssRenderer:
         for i, msg in enumerate(messages):
             if i == first_system_idx:
                 continue  # already emitted as developer
-            for hm in self._to_harmony_messages(msg):
+            preserve_thinking = msg.get("role") == "assistant" and (
+                should_preserve_past_thinking(
+                    messages,
+                    i,
+                    preserve_all_thinking=preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+                )
+            )
+            for hm in self._to_harmony_messages(
+                msg, preserve_thinking=preserve_thinking
+            ):
                 emit(self._enc.render(hm), i)
 
         # When the conversation ends on an assistant final-channel turn,
@@ -283,9 +296,15 @@ class GptOssRenderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> list[int]:
         return self.render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
         ).token_ids
 
     def parse_response(self, token_ids: list[int]) -> ParsedResponse:
@@ -353,7 +372,9 @@ class GptOssRenderer:
 
     # ── message conversion ───────────────────────────────────────────────────
 
-    def _to_harmony_messages(self, msg: Message) -> list[HarmonyMessage]:
+    def _to_harmony_messages(
+        self, msg: Message, *, preserve_thinking: bool = False
+    ) -> list[HarmonyMessage]:
         """Convert a single RendererMessage to one or more harmony messages.
 
         Splits in two cases:
@@ -396,7 +417,7 @@ class GptOssRenderer:
             return [tm]
 
         if role == "assistant":
-            return self._assistant_to_harmony(msg)
+            return self._assistant_to_harmony(msg, preserve_thinking=preserve_thinking)
 
         # Unknown role: render as developer with the raw content.
         dev = DeveloperContent.new().with_instructions(
@@ -404,7 +425,9 @@ class GptOssRenderer:
         )
         return [HarmonyMessage.from_role_and_content(Role.DEVELOPER, dev)]
 
-    def _assistant_to_harmony(self, msg: Message) -> list[HarmonyMessage]:
+    def _assistant_to_harmony(
+        self, msg: Message, *, preserve_thinking: bool = False
+    ) -> list[HarmonyMessage]:
         """Convert an assistant message to harmony messages.
 
         Layout:
@@ -412,14 +435,24 @@ class GptOssRenderer:
           - each tool_call             → commentary channel,
                                          recipient=functions.<name>
 
-        ``reasoning_content`` is intentionally NOT emitted: harmony strips
-        analysis-channel messages from history-style rendering (verified
-        against ``HarmonyEncoding.render_conversation`` /
-        ``render_conversation_for_training``). Per-turn thinking is only
-        relevant for live generation; once a turn closes, its analysis
-        block is dropped from context.
+        Default: ``reasoning_content`` is NOT emitted — harmony strips
+        analysis-channel messages from history-style rendering. Per-turn
+        thinking is only relevant for live generation; once a turn closes,
+        its analysis block is dropped from context.
+
+        ``preserve_thinking=True``: prepend an analysis-channel message
+        carrying ``reasoning_content`` so callers that want the trace in
+        history (e.g. tool-call-chain training) see it surface.
         """
         out: list[HarmonyMessage] = []
+
+        if preserve_thinking:
+            reasoning = msg.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                analysis = HarmonyMessage.from_role_and_content(
+                    Role.ASSISTANT, reasoning
+                )
+                out.append(analysis.with_channel("analysis"))
 
         content = msg.get("content")
         text_parts: list[str] = []

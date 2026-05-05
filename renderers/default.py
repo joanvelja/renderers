@@ -112,7 +112,15 @@ class DefaultRenderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> RenderedTokens:
+        if preserve_all_thinking or preserve_thinking_between_tool_calls:
+            raise NotImplementedError(
+                "DefaultRenderer falls back to apply_chat_template and can't "
+                "selectively re-emit dropped reasoning_content. Configure a "
+                "model-specific renderer if you need preserve_*_thinking."
+            )
         # Incremental rendering to get per-token message attribution
         token_ids: list[int] = []
         message_indices: list[int] = []
@@ -150,7 +158,15 @@ class DefaultRenderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> list[int]:
+        if preserve_all_thinking or preserve_thinking_between_tool_calls:
+            raise NotImplementedError(
+                "DefaultRenderer falls back to apply_chat_template and can't "
+                "selectively re-emit dropped reasoning_content. Configure a "
+                "model-specific renderer if you need preserve_*_thinking."
+            )
         return self._apply(
             messages, tools=tools, add_generation_prompt=add_generation_prompt
         )

@@ -90,7 +90,13 @@ class Qwen3VLRenderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> RenderedTokens:
+        # Qwen3-VL chat template doesn't render <think> blocks for past
+        # assistant messages, so the override flags are no-ops here. We
+        # accept them for Protocol parity.
+        del preserve_all_thinking, preserve_thinking_between_tool_calls
         if not messages:
             raise ValueError("No messages provided.")
 
@@ -174,9 +180,15 @@ class Qwen3VLRenderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> list[int]:
         return self.render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
         ).token_ids
 
     def parse_response(self, token_ids: list[int]) -> ParsedResponse:

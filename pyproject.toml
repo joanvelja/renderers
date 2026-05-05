@@ -25,6 +25,7 @@ packages = ["renderers"]
 
 [dependency-groups]
 dev = [
+    "pre-commit",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "ruff",

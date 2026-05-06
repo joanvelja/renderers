@@ -343,6 +343,8 @@ def create_renderer_pool(
     *,
     tool_parser: str | None = None,
     reasoning_parser: str | None = None,
+    preserve_all_thinking: bool = False,
+    preserve_thinking_between_tool_calls: bool = False,
 ) -> RendererPool:
     """Create a RendererPool with *size* independent tokenizer copies.
 
@@ -352,6 +354,11 @@ def create_renderer_pool(
 
     ``tool_parser`` and ``reasoning_parser`` are forwarded to
     ``create_renderer`` when the pool falls back to ``DefaultRenderer``.
+
+    ``preserve_all_thinking`` and ``preserve_thinking_between_tool_calls``
+    are forwarded to ``create_renderer`` and bound as defaults on each
+    pooled instance — every ``render`` / ``render_ids`` call uses them
+    unless an explicit kwarg overrides at the call site.
     """
 
     def factory() -> Renderer:
@@ -365,6 +372,8 @@ def create_renderer_pool(
             renderer=renderer,
             tool_parser=tool_parser,
             reasoning_parser=reasoning_parser,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
         )
 
     return RendererPool(factory, size=size)
@@ -376,6 +385,8 @@ def create_renderer(
     *,
     tool_parser: str | None = None,
     reasoning_parser: str | None = None,
+    preserve_all_thinking: bool = False,
+    preserve_thinking_between_tool_calls: bool = False,
 ) -> Renderer:
     """Create a Renderer by name, or auto-detect from the tokenizer's model name.
 
@@ -389,6 +400,15 @@ def create_renderer(
                   have their own parsing wired in.
         reasoning_parser: Name of a reasoning parser registered in
                   ``renderers.parsers``. Only consumed by DefaultRenderer.
+        preserve_all_thinking: Bind as default for every ``render`` /
+                  ``render_ids`` call on the returned instance. Same
+                  semantics as the call-site kwarg of the same name —
+                  see ``Renderer.render`` and
+                  ``should_preserve_past_thinking``. Off by default
+                  (zero behaviour change).
+        preserve_thinking_between_tool_calls: Bind as default for every
+                  ``render`` / ``render_ids`` call on the returned
+                  instance. See ``Renderer.render`` for semantics.
     """
     _populate_registry()
 
@@ -405,15 +425,21 @@ def create_renderer(
                 f"Unknown renderer {renderer!r}. Available: {', '.join(sorted(RENDERER_REGISTRY))}"
             )
         if renderer == "default":
-            return cls(tokenizer, **default_kwargs)
-        if default_kwargs:
-            logger.info(
-                "tool_parser / reasoning_parser are only consumed by "
-                "DefaultRenderer; ignoring for renderer=%r which has "
-                "built-in behavior.",
-                renderer,
-            )
-        return cls(tokenizer)
+            instance = cls(tokenizer, **default_kwargs)
+        else:
+            if default_kwargs:
+                logger.info(
+                    "tool_parser / reasoning_parser are only consumed by "
+                    "DefaultRenderer; ignoring for renderer=%r which has "
+                    "built-in behavior.",
+                    renderer,
+                )
+            instance = cls(tokenizer)
+        return _bind_preserve_defaults(
+            instance,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+        )
 
     # Auto-detect from model name via exact match on the canonical HF id.
     # Fine-tunes and renamed checkpoints miss on purpose — their chat
@@ -423,7 +449,11 @@ def create_renderer(
     model_name = getattr(tokenizer, "name_or_path", "")
     renderer_name = MODEL_RENDERER_MAP.get(model_name)
     if renderer_name is not None:
-        return RENDERER_REGISTRY[renderer_name](tokenizer)
+        return _bind_preserve_defaults(
+            RENDERER_REGISTRY[renderer_name](tokenizer),
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+        )
 
     # No match — fall back to default (apply_chat_template). For fine-tunes
     # with customized chat templates this is the *correct* choice, so we don't
@@ -434,7 +464,76 @@ def create_renderer(
         "reasoning_parser=<name> to enable structured output parsing.",
         model_name or "<unnamed tokenizer>",
     )
-    return RENDERER_REGISTRY["default"](tokenizer, **default_kwargs)
+    return _bind_preserve_defaults(
+        RENDERER_REGISTRY["default"](tokenizer, **default_kwargs),
+        preserve_all_thinking=preserve_all_thinking,
+        preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+    )
+
+
+def _bind_preserve_defaults(
+    renderer: Renderer,
+    *,
+    preserve_all_thinking: bool,
+    preserve_thinking_between_tool_calls: bool,
+) -> Renderer:
+    """Bind ``preserve_*_thinking`` defaults onto a renderer instance.
+
+    When neither flag is set, returns ``renderer`` unchanged — zero-cost
+    no-op for the common path. Otherwise wraps ``render`` and
+    ``render_ids`` so every call defaults the kwargs to the bound values
+    while still letting an explicit call-site kwarg of ``True`` override
+    upward (the flags only ever add thinking, never strip it).
+
+    The two flags also become introspectable on the instance as
+    ``_preserve_all_thinking`` / ``_preserve_thinking_between_tool_calls``
+    so tests and downstream code can confirm what was bound.
+    """
+    renderer._preserve_all_thinking = preserve_all_thinking  # type: ignore[attr-defined]
+    renderer._preserve_thinking_between_tool_calls = (  # type: ignore[attr-defined]
+        preserve_thinking_between_tool_calls
+    )
+    if not (preserve_all_thinking or preserve_thinking_between_tool_calls):
+        return renderer
+
+    orig_render = renderer.render
+    orig_render_ids = renderer.render_ids
+
+    def render(
+        messages: list[Message],
+        *,
+        tools: list[ToolSpec] | None = None,
+        add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = preserve_all_thinking,
+        preserve_thinking_between_tool_calls: bool = preserve_thinking_between_tool_calls,
+    ) -> RenderedTokens:
+        return orig_render(
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+        )
+
+    def render_ids(
+        messages: list[Message],
+        *,
+        tools: list[ToolSpec] | None = None,
+        add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = preserve_all_thinking,
+        preserve_thinking_between_tool_calls: bool = preserve_thinking_between_tool_calls,
+    ) -> list[int]:
+        return orig_render_ids(
+            messages,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            preserve_all_thinking=preserve_all_thinking,
+            preserve_thinking_between_tool_calls=preserve_thinking_between_tool_calls,
+        )
+
+    renderer.render = render  # type: ignore[method-assign]
+    renderer.render_ids = render_ids  # type: ignore[method-assign]
+    return renderer
 
 
 # ---------------------------------------------------------------------------

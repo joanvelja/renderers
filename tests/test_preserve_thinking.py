@@ -362,3 +362,75 @@ def test_default_renderer_raises_on_flags():
         renderer.render_ids(CONVERSATION, preserve_all_thinking=True)
     with pytest.raises(NotImplementedError):
         renderer.render_ids(CONVERSATION, preserve_thinking_between_tool_calls=True)
+
+
+# ---------------------------------------------------------------------------
+# Construction-time defaults via create_renderer(...) kwargs
+# ---------------------------------------------------------------------------
+
+
+def test_create_renderer_binds_preserve_all_thinking_default(
+    model_name, renderer_name, tokenizer
+):
+    """``create_renderer(..., preserve_all_thinking=True)`` should make a
+    bare ``render_ids`` call behave as if the flag were passed explicitly."""
+    from renderers import create_renderer
+    from renderers.default import DefaultRenderer
+
+    bound = create_renderer(
+        tokenizer,
+        renderer=renderer_name,
+        preserve_all_thinking=True,
+    )
+    if isinstance(bound, DefaultRenderer):
+        with pytest.raises(NotImplementedError):
+            bound.render_ids(CONVERSATION)
+        return
+
+    bound_ids = bound.render_ids(CONVERSATION)
+    unbound = create_renderer(tokenizer, renderer=renderer_name)
+    explicit_ids = unbound.render_ids(CONVERSATION, preserve_all_thinking=True)
+    assert bound_ids == explicit_ids, (
+        f"{model_name}: bound default must equal explicit kwarg "
+        f"(bound={len(bound_ids)}, explicit={len(explicit_ids)})"
+    )
+    assert bound._preserve_all_thinking is True
+    assert bound._preserve_thinking_between_tool_calls is False
+
+
+def test_create_renderer_no_flags_is_zero_cost(renderer_name, tokenizer):
+    """When no flags are bound, attributes record the False bindings and
+    ``render_ids`` is unchanged from the underlying impl."""
+    from renderers import create_renderer
+
+    r = create_renderer(tokenizer, renderer=renderer_name)
+    assert r._preserve_all_thinking is False
+    assert r._preserve_thinking_between_tool_calls is False
+
+
+def test_create_renderer_btc_default_matches_explicit(
+    model_name, renderer_name, tokenizer
+):
+    """``preserve_thinking_between_tool_calls`` bound at construction
+    must match the explicit-kwarg call."""
+    from renderers import create_renderer
+    from renderers.default import DefaultRenderer
+
+    bound = create_renderer(
+        tokenizer,
+        renderer=renderer_name,
+        preserve_thinking_between_tool_calls=True,
+    )
+    if isinstance(bound, DefaultRenderer):
+        with pytest.raises(NotImplementedError):
+            bound.render_ids(CONVERSATION)
+        return
+
+    bound_ids = bound.render_ids(CONVERSATION)
+    unbound = create_renderer(tokenizer, renderer=renderer_name)
+    explicit_ids = unbound.render_ids(
+        CONVERSATION, preserve_thinking_between_tool_calls=True
+    )
+    assert bound_ids == explicit_ids, (
+        f"{model_name}: bound btc default must equal explicit kwarg"
+    )

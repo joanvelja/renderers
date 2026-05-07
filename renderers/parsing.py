@@ -782,3 +782,47 @@ def _gptoss_extract_after_token(
     after = _decode(tokenizer, header_ids[pos + 1 :]).strip()
     # Take first whitespace-delimited word (channel name)
     return after.split()[0] if after else None
+
+
+# ── Llama-3: single JSON tool call {"name": "...", "parameters": {...}} ─
+
+
+def parse_llama_3(
+    tokenizer,
+    token_ids: list[int],
+    *,
+    stop_ids: set[int],
+) -> ParsedResponse:
+    """Parse Llama-3 completion tokens.
+
+    The Llama-3 chat template emits tool calls as a single JSON blob in
+    the assistant body — ``{"name": "...", "parameters": {...}}`` — with
+    no surrounding XML tags or special tokens. Plain replies are just
+    text. We detect the tool-call shape with a strict starts-with-``{``
+    + parses-as-dict-with-name-key check; anything else is treated as
+    content. Llama-3 doesn't have a built-in reasoning channel, so
+    ``reasoning_content`` is always ``None``.
+    """
+    ids = _strip_stop_tokens(token_ids, stop_ids)
+    text = _decode(tokenizer, ids).strip()
+
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and "name" in parsed:
+            arguments = parsed.get("parameters", parsed.get("arguments", {}))
+            tool_call = {
+                "function": {
+                    "name": parsed.get("name", ""),
+                    "arguments": arguments,
+                }
+            }
+            return ParsedResponse(
+                content="",
+                reasoning_content=None,
+                tool_calls=[tool_call],
+            )
+
+    return ParsedResponse(content=text, reasoning_content=None, tool_calls=None)

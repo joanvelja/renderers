@@ -26,6 +26,7 @@ from renderers.glm45 import GLM45Renderer
 from renderers.gpt_oss import GptOssRenderer
 from renderers.kimi_k2 import KimiK2Renderer
 from renderers.kimi_k25 import KimiK25Renderer
+from renderers.llama_3 import Llama3Renderer
 from renderers.minimax_m2 import MiniMaxM2Renderer
 from renderers.nemotron3 import Nemotron3Renderer
 from renderers.qwen3 import Qwen3Renderer
@@ -43,6 +44,7 @@ __all__ = [
     "GptOssRenderer",
     "KimiK2Renderer",
     "KimiK25Renderer",
+    "Llama3Renderer",
     "Message",
     "MiniMaxM2Renderer",
     "Nemotron3Renderer",

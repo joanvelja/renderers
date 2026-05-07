@@ -293,6 +293,14 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     # Nemotron 3.
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "nemotron3",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "nemotron3",
+    # Llama 3.2 (Instruct). Tested against the gated meta-llama repos and
+    # the unrestricted unsloth/... mirror, which ships a byte-identical
+    # chat template. ``Llama3Renderer`` defaults ``date_string`` to
+    # "26 Jul 2024" — matching the chat template's strftime fallback —
+    # so the renderer is reproducible. Pass ``date_string=...`` at
+    # construction to pin a different date.
+    "meta-llama/Llama-3.2-1B-Instruct": "llama_3",
+    "meta-llama/Llama-3.2-3B-Instruct": "llama_3",
     # GPT-OSS.
     "openai/gpt-oss-20b": "gpt_oss",
     "openai/gpt-oss-120b": "gpt_oss",
@@ -360,6 +368,7 @@ def _populate_registry():
     from renderers.gpt_oss import GptOssRenderer
     from renderers.kimi_k2 import KimiK2Renderer
     from renderers.kimi_k25 import KimiK25Renderer
+    from renderers.llama_3 import Llama3Renderer
     from renderers.minimax_m2 import MiniMaxM2Renderer
     from renderers.nemotron3 import Nemotron3Renderer
     from renderers.qwen3 import Qwen3Renderer
@@ -381,6 +390,7 @@ def _populate_registry():
             "deepseek_v3": DeepSeekV3Renderer,
             "kimi_k2": KimiK2Renderer,
             "kimi_k25": KimiK25Renderer,
+            "llama_3": Llama3Renderer,
             "nemotron3": Nemotron3Renderer,
             "gpt_oss": GptOssRenderer,
         }
@@ -444,8 +454,9 @@ def create_renderer(
     Args:
         tokenizer: HuggingFace tokenizer instance.
         renderer: Renderer name ('qwen3', 'qwen3_vl', 'qwen3.5', 'glm5', 'glm4.5',
-                  'minimax-m2', 'deepseek_v3', 'kimi_k2', 'kimi_k25', 'nemotron3',
-                  'gpt_oss', 'default') or 'auto' to detect from model name.
+                  'minimax-m2', 'deepseek_v3', 'kimi_k2', 'kimi_k25', 'llama_3',
+                  'nemotron3', 'gpt_oss', 'default') or 'auto' to detect from
+                  model name.
         tool_parser: Name of a tool parser registered in ``renderers.parsers``.
                   Only consumed by DefaultRenderer. Model-specific renderers
                   have their own parsing wired in.

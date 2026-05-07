@@ -317,37 +317,108 @@ TRUSTED_REVISIONS: dict[str, str] = {
 }
 
 
-def load_tokenizer(model_name_or_path: str):
-    """Load a tokenizer with the renderers-package security policy.
+# Models for which ``fastokens`` is known to diverge from vanilla
+# ``transformers.AutoTokenizer`` and therefore must NOT be patched.
+# Empirical audit (2026-05-07) ran each entry of ``MODEL_RENDERER_MAP``
+# through both backends on a representative encoding probe; 31/35 passed
+# byte-identical, the four below either fail to load under fastokens or
+# silently produce different tokens for content containing literal
+# special-token text. Renderer parity tests would not catch the latter
+# case (real-world content rarely embeds ``<|im_start|>`` literally),
+# but if it ever happens we'd diverge silently — denylist is the
+# conservative choice.
+FASTOKENS_INCOMPATIBLE: frozenset[str] = frozenset(
+    {
+        # fastokens 0.1.1: ``ValueError: pre-tokenizer error: unsupported
+        # pre-tokenizer type: Metaspace`` — DeepSeek's tokenizer uses
+        # SentencePiece-style Metaspace pretokenization which fastokens
+        # doesn't yet implement.
+        "deepseek-ai/DeepSeek-V3",
+        "deepseek-ai/DeepSeek-V3-Base",
+        # MiniMax tokenizers: encode literal ``<|im_start|>``-like text in
+        # plain content as a special token id under fastokens, vs
+        # character-by-character bytes under vanilla. Diverges on
+        # ``encode("... <|im_start|> ...", add_special_tokens=False)``.
+        "MiniMaxAI/MiniMax-M2",
+        "MiniMaxAI/MiniMax-M2.5",
+    }
+)
 
-    Default: ``trust_remote_code=False`` — the safe choice for every
-    model in ``MODEL_RENDERER_MAP`` *except* the Kimi-K2 family.
 
-    Models listed in ``TRUSTED_REVISIONS`` load with
-    ``trust_remote_code=True`` AND ``revision=<pinned sha>`` — required
-    because their tokenizer config has an ``auto_map.AutoTokenizer``
-    entry pointing at a repo-supplied Python class
-    (``tokenization_kimi.TikTokenTokenizer``). Pinning the revision
-    means transformers executes only the reviewed commit's code, not
-    whatever ``HEAD`` points at when the call fires.
+def _patched_load(model_name_or_path: str, **kwargs):
+    """Run ``AutoTokenizer.from_pretrained`` with fastokens patched in
+    process-locally — patch around the load, unpatch right after.
+
+    fastokens captures the loaded backend on a per-tokenizer basis, so
+    after we unpatch the returned tokenizer object continues to use
+    fastokens for ``encode``/``decode`` while subsequent
+    ``AutoTokenizer.from_pretrained`` calls (outside our control) go
+    back to vanilla. This keeps the global side effect minimal.
+    """
+    import fastokens
+    from transformers import AutoTokenizer
+
+    fastokens.patch_transformers()
+    try:
+        return AutoTokenizer.from_pretrained(model_name_or_path, **kwargs)
+    finally:
+        fastokens.unpatch_transformers()
+
+
+def load_tokenizer(
+    model_name_or_path: str,
+    *,
+    use_fastokens: bool = True,
+):
+    """Load a tokenizer with the renderers-package security + perf policy.
+
+    **Security** — default ``trust_remote_code=False``. Models listed in
+    ``TRUSTED_REVISIONS`` (Moonshot Kimi-K2 family) load with
+    ``trust_remote_code=True`` AND a pinned ``revision=<sha>`` so
+    transformers only executes the reviewed commit's tokenizer Python.
+
+    **Performance** — ``use_fastokens=True`` (default) routes the load
+    through ``fastokens.patch_transformers()`` so the resulting tokenizer
+    encodes ~10x faster than vanilla ``tokenizers``. The patch is
+    bracketed: it's applied before ``from_pretrained`` and removed
+    immediately after, so global ``AutoTokenizer.from_pretrained`` calls
+    elsewhere in the user's process are not affected.
+
+    Models in ``FASTOKENS_INCOMPATIBLE`` (DeepSeek-V3 family, MiniMax-M2
+    family) skip the patch — fastokens 0.1.1 either fails to load them
+    or produces token-divergent output. Pass ``use_fastokens=False`` to
+    force the vanilla backend for any other model.
 
     Unknown / fine-tuned model paths fall through to
-    ``trust_remote_code=False``. Callers who legitimately need to load
-    a custom-code tokenizer outside this allow-list should call
-    ``AutoTokenizer.from_pretrained`` themselves and pass the result to
-    ``create_renderer`` (which doesn't load tokenizers — only
-    ``create_renderer_pool`` does).
+    ``trust_remote_code=False`` and the patched-load fast path. If
+    fastokens raises during the patched load (e.g. an unknown
+    pre-tokenizer type), we automatically retry with the vanilla
+    backend and emit an INFO log.
     """
     from transformers import AutoTokenizer
 
+    kwargs: dict[str, Any] = {}
     revision = TRUSTED_REVISIONS.get(model_name_or_path)
     if revision is not None:
-        return AutoTokenizer.from_pretrained(
+        kwargs = {"trust_remote_code": True, "revision": revision}
+    else:
+        kwargs = {"trust_remote_code": False}
+
+    if not use_fastokens or model_name_or_path in FASTOKENS_INCOMPATIBLE:
+        return AutoTokenizer.from_pretrained(model_name_or_path, **kwargs)
+
+    try:
+        return _patched_load(model_name_or_path, **kwargs)
+    except Exception as exc:
+        logger.info(
+            "fastokens could not load %r (%s: %s); falling back to vanilla "
+            "AutoTokenizer. Add this model to FASTOKENS_INCOMPATIBLE in "
+            "renderers.base to suppress the retry.",
             model_name_or_path,
-            trust_remote_code=True,
-            revision=revision,
+            type(exc).__name__,
+            str(exc)[:160],
         )
-    return AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=False)
+        return AutoTokenizer.from_pretrained(model_name_or_path, **kwargs)
 
 
 def _populate_registry():

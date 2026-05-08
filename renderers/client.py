@@ -14,12 +14,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 from openai import AsyncOpenAI, BadRequestError
 
 from renderers.base import Message, Renderer, RendererPool, ToolSpec
+
+RendererTransport = Literal["prime_vllm_generate", "dynamo_chat_nvext"]
 
 _request_logger = logging.getLogger("renderers.client")
 
@@ -44,8 +46,9 @@ async def generate(
     cache_salt: str | None = None,
     priority: int | None = None,
     extra_headers: dict[str, str] | None = None,
+    transport: RendererTransport = "prime_vllm_generate",
 ) -> dict[str, Any]:
-    """Tokenize messages, call vLLM /inference/v1/generate, parse the response.
+    """Tokenize messages, call the selected token-in backend, parse response.
 
     ``sampling_params`` is forwarded to vLLM verbatim. Two fields are always
     set by us and override caller values: ``stop_token_ids`` (from the
@@ -82,24 +85,57 @@ async def generate(
     sp["logprobs"] = 1
     sp.setdefault("skip_special_tokens", False)
 
-    body: dict[str, Any] = {
-        "model": model,
-        "token_ids": prompt_ids,
-        "sampling_params": sp,
-    }
-    if cache_salt is not None:
-        body["cache_salt"] = cache_salt
-    if priority is not None:
-        body["priority"] = priority
+    if transport == "prime_vllm_generate":
+        body: dict[str, Any] = {
+            "model": model,
+            "token_ids": prompt_ids,
+            "sampling_params": sp,
+        }
+        if cache_salt is not None:
+            body["cache_salt"] = cache_salt
+        if priority is not None:
+            body["priority"] = priority
 
-    # /inference/v1/generate is mounted at the server root, not under /v1
-    # like the OpenAI-compatible endpoints. Build an absolute URL so the
-    # AsyncOpenAI client doesn't prepend its automatic /v1.
-    base = str(client.base_url).rstrip("/").removesuffix("/v1")
-    endpoint = f"{base}/inference/v1/generate"
+        # /inference/v1/generate is mounted at the server root, not under /v1
+        # like the OpenAI-compatible endpoints. Build an absolute URL so the
+        # AsyncOpenAI client doesn't prepend its automatic /v1.
+        base = str(client.base_url).rstrip("/").removesuffix("/v1")
+        endpoint = f"{base}/inference/v1/generate"
+    elif transport == "dynamo_chat_nvext":
+        nvext: dict[str, Any] = {
+            "token_data": prompt_ids,
+            "extra_fields": ["completion_token_ids"],
+        }
+        if priority is not None:
+            nvext["agent_hints"] = {"priority": priority}
+
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": "(token-in mode)"}],
+            "stream": False,
+            "logprobs": True,
+            "stop_token_ids": stop_token_ids,
+            "nvext": nvext,
+        }
+        if cache_salt is not None:
+            body["cache_salt"] = cache_salt
+
+        passthrough = dict(sp)
+        passthrough.pop("stop_token_ids", None)
+        passthrough.pop("logprobs", None)
+        passthrough.pop("skip_special_tokens", None)
+        max_tokens = passthrough.pop("max_tokens", None)
+        if max_tokens is not None:
+            body["max_completion_tokens"] = max_tokens
+        body.update({k: v for k, v in passthrough.items() if v is not None})
+        endpoint = "/chat/completions"
+    else:
+        raise ValueError(f"Unsupported renderer transport: {transport}")
+
     _request_logger.debug(
-        "POST %s prompt_len=%d max_tokens=%s",
+        "POST %s transport=%s prompt_len=%d max_tokens=%s",
         endpoint,
+        transport,
         len(prompt_ids),
         sp.get("max_tokens"),
     )
@@ -121,7 +157,23 @@ async def generate(
         raise
 
     choice = (data.get("choices") or [{}])[0]
-    completion_ids = choice.get("token_ids") or []
+    if transport == "dynamo_chat_nvext":
+        completion_ids = (
+            choice.get("token_ids")
+            or choice.get("nvext", {}).get("completion_token_ids")
+            or data.get("nvext", {}).get("completion_token_ids")
+            or []
+        )
+        raw_re = (
+            choice.get("routed_experts")
+            or choice.get("nvext", {}).get("routed_experts")
+            or data.get("nvext", {}).get("routed_experts")
+        )
+        request_id = data.get("id") or data.get("request_id") or ""
+    else:
+        completion_ids = choice.get("token_ids") or []
+        raw_re = choice.get("routed_experts")
+        request_id = data.get("request_id") or ""
 
     if pool is not None:
         parsed = await _run_pooled(pool, lambda r: r.parse_response(completion_ids))
@@ -134,7 +186,6 @@ async def generate(
     completion_logprobs = [float(c.get("logprob") or 0.0) for c in content_lp or []]
 
     routed_experts = None
-    raw_re = choice.get("routed_experts")
     if isinstance(raw_re, dict) and "data" in raw_re and "shape" in raw_re:
         routed_experts = (
             np.frombuffer(base64.b85decode(raw_re["data"]), dtype=np.int32)
@@ -152,7 +203,7 @@ async def generate(
         finish_reason = "tool_calls"
 
     return {
-        "request_id": data.get("request_id") or "",
+        "request_id": request_id,
         "prompt_ids": list(prompt_ids),
         "completion_ids": list(completion_ids),
         "completion_logprobs": completion_logprobs,

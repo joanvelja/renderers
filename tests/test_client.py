@@ -178,7 +178,7 @@ def test_generate_can_use_dynamo_chat_nvext_transport():
             renderer=_FakeRenderer(),
             messages=[{"role": "user", "content": "hi"}],
             model="test-model",
-            tools=[{"name": "echo", "description": "", "parameters": {}}],
+            tools=[{"type": "function", "function": {"name": "echo"}}],
             sampling_params={"temperature": 0.3, "max_tokens": 7, "min_tokens": 2},
             priority=4,
             cache_salt="ckpt-42",

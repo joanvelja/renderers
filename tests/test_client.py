@@ -177,7 +177,6 @@ def test_generate_serializes_multimodal_features_for_qwen3_vl():
     from renderers.base import (
         MultiModalData,
         PlaceholderRange,
-        RenderedTokens,
         load_tokenizer,
     )
     from renderers.qwen3_vl import Qwen3VLRenderer

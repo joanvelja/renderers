@@ -87,12 +87,27 @@ _CASES = _modality_cases()
 _loaded: dict[str, tuple] = {}
 
 
+# Models whose processors need ``trust_remote_code=True`` (custom Python
+# in the repo) AND a pinned revision for security. Mirrors the
+# ``TRUSTED_REVISIONS`` policy in ``renderers.base`` for tokenizers.
+_PROCESSOR_TRUSTED_REVISIONS: dict[str, str] = {
+    "moonshotai/Kimi-K2.5": "4d01dfe0332d63057c186e0b262165819efb6611",
+    "moonshotai/Kimi-K2.6": "2755962d07cb42aa2d988a35bcb65cd4a9c2de82",
+}
+
+
 def _load_processor_and_renderer(model_name: str):
     if model_name not in _loaded:
         from transformers import AutoProcessor
 
         tokenizer = load_tokenizer(model_name)
-        processor = AutoProcessor.from_pretrained(model_name)
+        revision = _PROCESSOR_TRUSTED_REVISIONS.get(model_name)
+        if revision is not None:
+            processor = AutoProcessor.from_pretrained(
+                model_name, trust_remote_code=True, revision=revision
+            )
+        else:
+            processor = AutoProcessor.from_pretrained(model_name)
         renderer = create_renderer(tokenizer, renderer="auto")
         # Inject processor so the renderer doesn't try to fetch it lazily.
         if hasattr(renderer, "_processor") and renderer._processor is None:
@@ -118,12 +133,83 @@ def _image_content_part(img):
     return {"type": "image", "image": img}
 
 
-def _modality_kit(modality: str):
+def _kimi_image_content_part(img):
+    # Kimi K2.5's ``KimiK25Processor._extract_medias_from_messages`` hard-
+    # reads ``content_part['image_url']`` (even when ``type == 'image'``).
+    # Use the OpenAI-ish ``image_url`` shape so the same messages feed both
+    # our renderer (which accepts both shapes) and Kimi's processor.
+    return {"type": "image_url", "image_url": img}
+
+
+def _detect_family(model_name: str) -> str:
+    """Map a HF model id to a coarse family for per-family processor dispatch.
+
+    Families differ in (a) the chat-template / vision-token format and (b)
+    the processor's ``__call__`` signature. Today:
+    - ``qwen_vl``: ``processor(images=..., text=..., return_tensors=...)``,
+      content parts shaped ``{"type": "image", "image": <PIL>}``.
+    - ``kimi_k25``: ``processor(messages=..., return_tensors=...)`` (does
+      template + image preprocessing in one call), content parts shaped
+      ``{"type": "image_url", "image_url": <PIL>}``.
+    """
+    if model_name.startswith("moonshotai/Kimi-K2.5") or model_name.startswith(
+        "moonshotai/Kimi-K2.6"
+    ):
+        return "kimi_k25"
+    return "qwen_vl"
+
+
+def _qwen_vl_processor_input_ids(processor, messages, add_gp):
+    """Run the Qwen-VL family processor pipeline on ``messages``.
+
+    Two-step: ``apply_chat_template`` → text; collect images from messages;
+    ``processor(images=, text=)`` to get expanded ``input_ids``.
+    """
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=add_gp
+    )
+    images = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in ("image", "image_url") or "image" in item or "image_url" in item:
+                if "image" in item and not isinstance(item["image"], dict):
+                    images.append(item["image"])
+    return processor(images=images, text=text, return_tensors="pt")["input_ids"][0].tolist()
+
+
+def _kimi_processor_input_ids(processor, messages, add_gp):
+    """Run Kimi K2.5's processor on ``messages`` (one-shot template+vision).
+
+    Kimi's ``__call__`` takes ``messages=`` directly and emits the template-
+    rendered ``input_ids`` along with ``pixel_values`` / ``grid_thws``. The
+    template puts ONE ``<|media_pad|>`` per image in ``input_ids``; per-patch
+    expansion lives in ``pixel_values`` and is handled inside the model.
+    """
+    out = processor(
+        messages=messages, add_generation_prompt=add_gp, return_tensors="pt"
+    )
+    return out["input_ids"][0].tolist()
+
+
+def _modality_kit(modality: str, model_name: str):
+    family = _detect_family(model_name)
     if modality == "image":
+        if family == "kimi_k25":
+            return {
+                "make_part": _kimi_image_content_part,
+                "placeholder_token": "<|media_pad|>",
+                "processor_input_ids": _kimi_processor_input_ids,
+            }
+        # Default: Qwen-VL family (Qwen3-VL, Qwen3.5, Qwen3.6).
         return {
             "make_part": _image_content_part,
             "placeholder_token": "<|image_pad|>",
-            "processor_kwarg": "images",
+            "processor_input_ids": _qwen_vl_processor_input_ids,
         }
     raise NotImplementedError(f"Test kit for modality {modality!r} not implemented yet.")
 
@@ -218,7 +304,7 @@ def test_multimodal_byte_parity_vs_processor(mm_model_name, modality, tiny_image
     if not _hf_snapshot_cached(mm_model_name):
         pytest.skip(f"{mm_model_name}: HF snapshot not cached locally")
 
-    kit = _modality_kit(modality)
+    kit = _modality_kit(modality, mm_model_name)
     tokenizer, processor, renderer = _load_processor_and_renderer(mm_model_name)
 
     for case in _build_cases(kit["make_part"], tiny_image):
@@ -227,27 +313,10 @@ def test_multimodal_byte_parity_vs_processor(mm_model_name, modality, tiny_image
         # Ours.
         ours = renderer.render_ids(messages, add_generation_prompt=add_gp)
 
-        # Theirs: apply_chat_template (string) → processor(text=, images=).
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=add_gp
-        )
-        images = []
-        for msg in messages:
-            content = msg.get("content")
-            if isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and (
-                        item.get("type") in ("image", "image_url")
-                        or "image" in item
-                        or "image_url" in item
-                    ):
-                        if "image" in item and not isinstance(item["image"], dict):
-                            images.append(item["image"])
-        theirs = processor(
-            **{kit["processor_kwarg"]: images},
-            text=text,
-            return_tensors="pt",
-        )["input_ids"][0].tolist()
+        # Theirs: family-specific processor call. Qwen-VL is a two-step
+        # (apply_chat_template + processor(images=, text=)); Kimi K2.5 is
+        # a one-shot processor(messages=).
+        theirs = kit["processor_input_ids"](processor, messages, add_gp)
 
         assert ours == theirs, (
             f"{mm_model_name} / {modality} / case={case.id}: "
@@ -263,7 +332,7 @@ def test_multimodal_placeholders_match_pad_runs(mm_model_name, modality, tiny_im
     if not _hf_snapshot_cached(mm_model_name):
         pytest.skip(f"{mm_model_name}: HF snapshot not cached locally")
 
-    kit = _modality_kit(modality)
+    kit = _modality_kit(modality, mm_model_name)
     tokenizer, _, renderer = _load_processor_and_renderer(mm_model_name)
     pad_id = tokenizer.convert_tokens_to_ids(kit["placeholder_token"])
 
@@ -317,7 +386,7 @@ def test_multimodal_bridge_matches_full_render(mm_model_name, modality, tiny_ima
     if not _hf_snapshot_cached(mm_model_name):
         pytest.skip(f"{mm_model_name}: HF snapshot not cached locally")
 
-    kit = _modality_kit(modality)
+    kit = _modality_kit(modality, mm_model_name)
     tokenizer, _, renderer = _load_processor_and_renderer(mm_model_name)
 
     if _gen_prompt_injects_tokens_after_role(renderer):

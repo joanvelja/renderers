@@ -94,7 +94,11 @@ async def generate(
         "token_ids": prompt_ids,
         "sampling_params": sp,
     }
-    features = _build_mm_features(renderer, mm_data) if mm_data and not mm_data.is_empty() else None
+    features = (
+        _build_mm_features(renderer, mm_data)
+        if mm_data and not mm_data.is_empty()
+        else None
+    )
     if features is not None:
         body["features"] = features
     if cache_salt is not None:

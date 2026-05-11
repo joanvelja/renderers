@@ -38,7 +38,12 @@ from renderers.base import (
     should_preserve_past_thinking,
     trim_to_turn_close,
 )
-from renderers.qwen3_vl import _image_hash, _is_image_part, _is_video_part, _load_pil_image
+from renderers.qwen3_vl import (
+    _image_hash,
+    _is_image_part,
+    _is_video_part,
+    _load_pil_image,
+)
 
 # ---------------------------------------------------------------------------
 # Constants

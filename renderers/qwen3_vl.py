@@ -442,9 +442,7 @@ class Qwen3VLRenderer:
         elif first_is_system:
             em.set_msg_idx(0)
             em.special(self._im_start)
-            em.text(
-                "system\n" + self._render_text_content(messages[0].get("content"))
-            )
+            em.text("system\n" + self._render_text_content(messages[0].get("content")))
             em.special(self._im_end)
             em.text("\n")
 
@@ -694,9 +692,7 @@ class Qwen3VLRenderer:
                 )
 
                 em.special(self._tool_call)
-                em.text(
-                    '\n{"name": "' + name + '", "arguments": ' + args_str + "}\n"
-                )
+                em.text('\n{"name": "' + name + '", "arguments": ' + args_str + "}\n")
                 em.special(self._tool_call_end)
 
         em.special(self._im_end)

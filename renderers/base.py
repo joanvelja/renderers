@@ -902,6 +902,9 @@ def build_trajectory_step(
         "completion_logprobs": [0.0] * len(completion_ids),
         "routed_experts": None,
     }
-    if full_rendered.multi_modal_data is not None and not full_rendered.multi_modal_data.is_empty():
+    if (
+        full_rendered.multi_modal_data is not None
+        and not full_rendered.multi_modal_data.is_empty()
+    ):
         out["multi_modal_data"] = full_rendered.multi_modal_data
     return out

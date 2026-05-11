@@ -31,7 +31,12 @@ from renderers.base import (
     trim_to_turn_close,
 )
 from renderers.parsing import parse_qwen35
-from renderers.qwen3_vl import _image_hash, _is_image_part, _is_video_part, _load_pil_image
+from renderers.qwen3_vl import (
+    _image_hash,
+    _is_image_part,
+    _is_video_part,
+    _load_pil_image,
+)
 
 # ---------------------------------------------------------------------------
 # Tool system prompt constants (must match the Jinja template exactly)

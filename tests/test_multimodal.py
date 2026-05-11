@@ -54,7 +54,10 @@ def _hf_snapshot_cached(model_name: str) -> bool:
     Mirrors the convention used elsewhere in this repo (test_qwen35_size_coverage)
     of relying on the user having pre-fetched relevant models.
     """
-    cache = Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface") / "hub"
+    cache = (
+        Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface")
+        / "hub"
+    )
     safe = "models--" + model_name.replace("/", "--")
     snapshots = cache / safe / "snapshots"
     if not snapshots.is_dir():
@@ -176,10 +179,16 @@ def _qwen_vl_processor_input_ids(processor, messages, add_gp):
         for item in content:
             if not isinstance(item, dict):
                 continue
-            if item.get("type") in ("image", "image_url") or "image" in item or "image_url" in item:
+            if (
+                item.get("type") in ("image", "image_url")
+                or "image" in item
+                or "image_url" in item
+            ):
                 if "image" in item and not isinstance(item["image"], dict):
                     images.append(item["image"])
-    return processor(images=images, text=text, return_tensors="pt")["input_ids"][0].tolist()
+    return processor(images=images, text=text, return_tensors="pt")["input_ids"][
+        0
+    ].tolist()
 
 
 def _kimi_processor_input_ids(processor, messages, add_gp):
@@ -211,7 +220,9 @@ def _modality_kit(modality: str, model_name: str):
             "placeholder_token": "<|image_pad|>",
             "processor_input_ids": _qwen_vl_processor_input_ids,
         }
-    raise NotImplementedError(f"Test kit for modality {modality!r} not implemented yet.")
+    raise NotImplementedError(
+        f"Test kit for modality {modality!r} not implemented yet."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +304,9 @@ def _build_cases(make_part, image):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES])
+@pytest.mark.parametrize(
+    "mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES]
+)
 def test_multimodal_byte_parity_vs_processor(mm_model_name, modality, tiny_image):
     """Token byte-parity with ``processor.apply_chat_template`` + ``processor(...)``.
 
@@ -326,7 +339,9 @@ def test_multimodal_byte_parity_vs_processor(mm_model_name, modality, tiny_image
         )
 
 
-@pytest.mark.parametrize("mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES])
+@pytest.mark.parametrize(
+    "mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES]
+)
 def test_multimodal_placeholders_match_pad_runs(mm_model_name, modality, tiny_image):
     """``mm_placeholders`` exactly cover the runs of the modality's pad token."""
     if not _hf_snapshot_cached(mm_model_name):
@@ -366,8 +381,12 @@ def test_multimodal_placeholders_match_pad_runs(mm_model_name, modality, tiny_im
         )
 
 
-@pytest.mark.parametrize("mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES])
-def test_multimodal_bridge_extends_and_carries_mm_data(mm_model_name, modality, tiny_image):
+@pytest.mark.parametrize(
+    "mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES]
+)
+def test_multimodal_bridge_extends_and_carries_mm_data(
+    mm_model_name, modality, tiny_image
+):
     """Bridge-to-next-turn invariants for the multimodal case.
 
     Asserts three properties that should hold for every renderer
@@ -435,7 +454,9 @@ def test_multimodal_bridge_extends_and_carries_mm_data(mm_model_name, modality, 
     # historically expected ``list[int]``; the per-renderer return
     # type splits on whether ``mm_data`` is non-empty).
     bridged_ids = (
-        bridged_raw.token_ids if hasattr(bridged_raw, "token_ids") else list(bridged_raw)
+        bridged_raw.token_ids
+        if hasattr(bridged_raw, "token_ids")
+        else list(bridged_raw)
     )
     bridged_mm = getattr(bridged_raw, "multi_modal_data", None)
 
@@ -465,7 +486,7 @@ def test_multimodal_bridge_extends_and_carries_mm_data(mm_model_name, modality, 
     # (3) Extension contains the new turn's pad run, and its
     # placeholder offset lands inside the extension region.
     pad_id = tokenizer.convert_tokens_to_ids(kit["placeholder_token"])
-    extension = bridged_ids[len(prev):]
+    extension = bridged_ids[len(prev) :]
     assert pad_id in extension, (
         f"{mm_model_name} / {modality}: new turn's placeholder pad missing from extension"
     )

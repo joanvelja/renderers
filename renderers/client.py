@@ -81,7 +81,11 @@ async def generate(
         if prompt_ids is not None:
             return list(prompt_ids), renderer.get_stop_token_ids(), multi_modal_data
         rendered = renderer.render(messages, tools=tools, add_generation_prompt=True)
-        return rendered.token_ids, renderer.get_stop_token_ids(), rendered.multi_modal_data
+        return (
+            rendered.token_ids,
+            renderer.get_stop_token_ids(),
+            rendered.multi_modal_data,
+        )
 
     prompt_ids, stop_token_ids, mm_data = await _maybe_offload(renderer, _prepare)
 
@@ -138,7 +142,9 @@ async def generate(
     choice = (data.get("choices") or [{}])[0]
     completion_ids = choice.get("token_ids") or []
 
-    parsed = await _maybe_offload(renderer, lambda: renderer.parse_response(completion_ids))
+    parsed = await _maybe_offload(
+        renderer, lambda: renderer.parse_response(completion_ids)
+    )
 
     # ChatCompletionLogProbs flatten: {"content": [{"logprob": ...}, ...]}
     raw_logprobs = choice.get("logprobs") or {}

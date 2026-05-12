@@ -467,9 +467,7 @@ class RendererPool:
         with self.checkout() as r:
             return r.get_stop_token_ids()
 
-    def bridge_to_next_turn(
-        self, *args: Any, **kwargs: Any
-    ) -> "RenderedTokens | None":
+    def bridge_to_next_turn(self, *args: Any, **kwargs: Any) -> "RenderedTokens | None":
         with self.checkout() as r:
             return r.bridge_to_next_turn(*args, **kwargs)
 

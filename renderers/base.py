@@ -410,11 +410,17 @@ class RendererPool:
         self._renderer_cls: type[Renderer] = type(sample)
         self.supports_tools: bool = getattr(sample, "supports_tools", True)
         self.is_multimodal: bool = is_multimodal(sample)
-        self._mm_token_type_id_map: dict[int, int] | None = (
-            sample.mm_token_type_id_map
-            if isinstance(sample, MultimodalRenderer)
-            else None
-        )
+        # ``mm_token_type_id_map`` is set ONLY on pools wrapping a
+        # ``MultimodalRenderer``. We deliberately don't expose this as a
+        # class-level property: ``runtime_checkable`` Protocol's
+        # isinstance check uses ``inspect.getattr_static``, which finds
+        # property descriptors on the class regardless of whether their
+        # fget raises. Conditional instance attributes (present in
+        # ``self.__dict__`` only when applicable) are the only way to
+        # make ``isinstance(pool, MultimodalRenderer)`` reflect the
+        # inner renderer's actual protocol conformance.
+        if isinstance(sample, MultimodalRenderer):
+            self.mm_token_type_id_map: dict[int, int] = sample.mm_token_type_id_map
 
     @contextmanager
     def checkout(self):
@@ -467,19 +473,9 @@ class RendererPool:
         with self.checkout() as r:
             return r.bridge_to_next_turn(*args, **kwargs)
 
-    # ── MultimodalRenderer protocol attribute ──────────────────────────
-    # Only resolves on pools wrapping multimodal renderers. AttributeError
-    # for text-only pools, which ``runtime_checkable`` Protocol's
-    # ``hasattr`` check correctly interprets as "not a MultimodalRenderer".
-
-    @property
-    def mm_token_type_id_map(self) -> dict[int, int]:
-        if self._mm_token_type_id_map is None:
-            raise AttributeError(
-                f"{type(self).__name__} wrapping {self._renderer_cls.__name__} "
-                "is not a MultimodalRenderer; mm_token_type_id_map is undefined"
-            )
-        return self._mm_token_type_id_map
+    # ``mm_token_type_id_map`` (the MultimodalRenderer protocol attribute)
+    # is set in ``__init__`` only for pools wrapping multimodal renderers;
+    # see the comment there for why this isn't a class-level property.
 
 
 RENDERER_REGISTRY: dict[str, type] = {}

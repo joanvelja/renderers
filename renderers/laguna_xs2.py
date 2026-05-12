@@ -76,8 +76,6 @@ _TOOLS_FOOTER_NO_THINKING = (
 
 
 class LagunaXS2Renderer:
-    """Deterministic message → token renderer for Poolside's Laguna-XS.2 model."""
-
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,

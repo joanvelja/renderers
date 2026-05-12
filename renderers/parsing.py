@@ -310,6 +310,123 @@ def _parse_glm_tool_calls(
     return tool_calls
 
 
+# ── Laguna-XS.2: <tool_call> name\n<arg_key>k</arg_key>\n<arg_value>v</arg_value> </tool_call>
+# Same outer skeleton as parse_glm, but <arg_key>/<arg_value> are plain text
+# (multi-token BPE), not single special tokens — so the inner block is decoded
+# to text and the key/value pairs are pulled out by regex.
+
+
+def parse_laguna_xs2(
+    tokenizer,
+    token_ids: list[int],
+    *,
+    stop_ids: set[int],
+    think_id: int,
+    think_end_id: int,
+    tool_call_id: int,
+    tool_call_end_id: int,
+) -> ParsedResponse:
+    """Parse Laguna-XS.2 completion tokens.
+
+    Thinking uses single-token ``<think>`` / ``</think>`` (ids found by
+    scan). Tool calls are delimited by single-token ``<tool_call>`` /
+    ``</tool_call>``, but ``<arg_key>`` / ``<arg_value>`` inside are
+    plain text — regex-extracted from the decoded inner block.
+    """
+    ids = _strip_stop_tokens(token_ids, stop_ids)
+
+    # The template wraps reasoning with ``\n`` on both sides
+    # (``<think>\n{r}\n</think>``) and brackets post-think content with ``\n``
+    # too (``</think>\n{c}\n``). Strip exactly those newlines from each
+    # decoded segment — never a bare ``.strip()``, which would also eat
+    # whitespace the model emitted intentionally.
+    reasoning = None
+    think_end = _find(ids, think_end_id)
+    if think_end != -1:
+        reasoning_ids = ids[:think_end]
+        reasoning_ids = [t for t in reasoning_ids if t != think_id]
+        reasoning = _decode(tokenizer, reasoning_ids).strip("\n")
+        ids = ids[think_end + 1 :]
+    elif (think_start := _find(ids, think_id)) != -1:
+        reasoning = _decode(tokenizer, ids[think_start + 1 :]).strip("\n")
+        return ParsedResponse(
+            content="", reasoning_content=reasoning or None, tool_calls=None
+        )
+
+    tc_start = _find(ids, tool_call_id)
+    if tc_start != -1:
+        content_text = _decode(tokenizer, ids[:tc_start]).strip("\n")
+        tool_calls = _parse_laguna_xs2_tool_calls(
+            tokenizer, ids[tc_start:], tool_call_id, tool_call_end_id
+        )
+    else:
+        content_text = _decode(tokenizer, ids).strip("\n")
+        tool_calls = None
+
+    return ParsedResponse(
+        content=content_text,
+        reasoning_content=reasoning or None,
+        tool_calls=tool_calls or None,
+    )
+
+
+def _parse_laguna_xs2_tool_calls(
+    tokenizer,
+    ids: list[int],
+    tc_id: int,
+    tc_end_id: int,
+) -> list[dict]:
+    """Parse Laguna-XS.2 tool calls.
+
+    Inside each ``<tool_call>...</tool_call>`` block, the format is::
+
+        {name}\\n
+        <arg_key>{k1}</arg_key>\\n<arg_value>{v1}</arg_value>\\n
+        ...
+        <arg_key>{kn}</arg_key>\\n<arg_value>{vn}</arg_value>\\n
+
+    The function name is everything before the first ``<arg_key>`` literal
+    in the decoded block.
+    """
+    import re
+
+    tool_calls: list[dict] = []
+    i = 0
+    while i < len(ids):
+        if ids[i] == tc_id:
+            tc_end = _find(ids, tc_end_id, i + 1)
+            if tc_end == -1:
+                break
+            block_text = _decode(tokenizer, ids[i + 1 : tc_end])
+
+            ak_pos = block_text.find("<arg_key>")
+            if ak_pos != -1:
+                name = block_text[:ak_pos].strip()
+                args_section = block_text[ak_pos:]
+            else:
+                name = block_text.strip()
+                args_section = ""
+
+            arguments: dict = {}
+            for m in re.finditer(
+                r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+                args_section,
+                re.DOTALL,
+            ):
+                k = m.group(1).strip()
+                v = m.group(2).strip()
+                try:
+                    arguments[k] = json.loads(v)
+                except (json.JSONDecodeError, ValueError):
+                    arguments[k] = v
+
+            tool_calls.append({"function": {"name": name, "arguments": arguments}})
+            i = tc_end + 1
+        else:
+            i += 1
+    return tool_calls
+
+
 # ── DeepSeek V3: <｜tool▁calls▁begin｜>...<｜tool▁calls▁end｜> + text <think> tags ──
 
 

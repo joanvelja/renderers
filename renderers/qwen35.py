@@ -2,6 +2,14 @@
 
 Produces token-for-token identical output to tokenizer.apply_chat_template() while
 also tracking which message produced each token (for per-token loss masks).
+
+Multimodal: the Qwen3.5 family is itself a VLM (HF tag ``image-text-to-text``;
+processor class ``Qwen3VLProcessor``). When a user/tool message carries an
+``ImagePart``, the renderer emits the same ``<|vision_start|>``+N×``<|image_pad|>``
++``<|vision_end|>`` expansion as the HF chat template (``N =
+image_grid_thw.prod() // merge_size**2``) and ships processed pixel_values via
+``RenderedTokens.multi_modal_data``. Text-only inputs take the original fast
+path and remain byte-identical to ``apply_chat_template``.
 """
 
 from __future__ import annotations
@@ -13,7 +21,9 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 
 from renderers.base import (
     Message,
+    MultiModalData,
     ParsedResponse,
+    PlaceholderRange,
     RenderedTokens,
     ToolSpec,
     reject_assistant_in_extension,
@@ -21,6 +31,12 @@ from renderers.base import (
     trim_to_turn_close,
 )
 from renderers.parsing import parse_qwen35
+from renderers.qwen3_vl import (
+    _image_hash,
+    _is_image_part,
+    _is_video_part,
+    _load_pil_image,
+)
 
 # ---------------------------------------------------------------------------
 # Tool system prompt constants (must match the Jinja template exactly)
@@ -90,11 +106,14 @@ class Qwen35Renderer:
         self,
         tokenizer: PreTrainedTokenizer,
         *,
+        processor: Any = None,
         enable_thinking: bool | None = None,
         preserve_all_thinking: bool = False,
         preserve_thinking_between_tool_calls: bool = False,
+        image_cache_max: int = 256,
     ):
         self._tokenizer = tokenizer
+        self._processor = processor
         if enable_thinking is None:
             enable_thinking = _detect_enable_thinking_default(tokenizer)
         self._enable_thinking = enable_thinking
@@ -113,6 +132,74 @@ class Qwen35Renderer:
         self._tool_call_end = self._token_id("</tool_call>")
         self._tool_response = self._token_id("<tool_response>")
         self._tool_response_end = self._token_id("</tool_response>")
+        self._vision_start = self._token_id("<|vision_start|>")
+        self._vision_end = self._token_id("<|vision_end|>")
+        self._image_pad = self._token_id("<|image_pad|>")
+        self._video_pad = self._token_id("<|video_pad|>")
+
+        # Per-instance image-processor cache; see Qwen3VLRenderer for the
+        # rationale (FIFO-bounded; same image seen across rollouts /
+        # bridge re-renders).
+        self._image_cache: dict[str, tuple[Any, int]] = {}
+        self._image_cache_max = image_cache_max
+
+    @property
+    def mm_token_type_id_map(self) -> dict[int, int]:
+        """Token-id → modality marker (1 = image, 2 = video) used by the
+        trainer to build ``mm_token_type_ids``. Same convention as
+        ``Qwen3VLRenderer``.
+        """
+        return {self._image_pad: 1, self._video_pad: 2}
+
+    def _get_processor(self):
+        if self._processor is not None:
+            return self._processor
+        from transformers import AutoProcessor
+
+        name = getattr(self._tokenizer, "name_or_path", None)
+        if not name:
+            raise RuntimeError(
+                "Qwen35Renderer needs a processor to render image / video parts. "
+                "Pass `processor=AutoProcessor.from_pretrained(...)` to the "
+                "constructor, or load the tokenizer with a known name_or_path "
+                "so the processor can be auto-loaded."
+            )
+        self._processor = AutoProcessor.from_pretrained(name)
+        return self._processor
+
+    def _process_image(self, part: dict[str, Any]):
+        """Resolve, process, and characterize a single image part.
+
+        Returns ``(pil, processor_out, num_image_tokens, image_hash)``.
+        Mirrors ``Qwen3VLRenderer._process_image``: hashes the loaded PIL,
+        consults ``self._image_cache``, runs the HF image processor on
+        miss, FIFO-evicts on overflow.
+        """
+        pil = _load_pil_image(part)
+        h = _image_hash(pil)
+        cached = self._image_cache.get(h)
+        if cached is not None:
+            out, num_image_tokens = cached
+            return pil, out, num_image_tokens, h
+        proc = self._get_processor()
+        out = proc.image_processor(images=[pil], return_tensors="pt")
+        grid_thw = out["image_grid_thw"][0]
+        merge_size = proc.image_processor.merge_size
+        num_image_tokens = int(grid_thw.prod()) // (merge_size * merge_size)
+        if len(self._image_cache) >= self._image_cache_max:
+            self._image_cache.pop(next(iter(self._image_cache)))
+        self._image_cache[h] = (out, num_image_tokens)
+        return pil, out, num_image_tokens, h
+
+    @staticmethod
+    def _content_has_media(content: Any) -> bool:
+        """True when ``content`` is a structured list containing image / video parts."""
+        if not isinstance(content, list):
+            return False
+        return any(
+            isinstance(item, dict) and (_is_image_part(item) or _is_video_part(item))
+            for item in content
+        )
 
     def _token_id(self, token: str) -> int:
         tid = self._tokenizer.convert_tokens_to_ids(token)
@@ -134,7 +221,12 @@ class Qwen35Renderer:
     def _render_content(content: Any) -> str:
         """Render message content to a text string (before tokenization).
 
-        Handles string, list of text parts, and None.
+        Handles string, list of text parts, and None. Image / video parts
+        are silently skipped — callers that need the per-message text
+        view (e.g. ``_last_query_index``, system / assistant / tool
+        rendering) just want the text. The user branch detects media
+        separately via ``_content_has_media`` and emits an
+        image-interleaved stream that doesn't go through this helper.
         """
         if content is None:
             return ""
@@ -146,6 +238,8 @@ class Qwen35Renderer:
                 if isinstance(item, str):
                     parts.append(item)
                 elif isinstance(item, dict):
+                    if _is_image_part(item) or _is_video_part(item):
+                        continue
                     if "text" in item:
                         parts.append(item["text"])
                     else:
@@ -196,6 +290,9 @@ class Qwen35Renderer:
 
         tokens: list[int] = []
         indices: list[int] = []
+        mm_hashes: dict[str, list[str]] = {}
+        mm_placeholders: dict[str, list[PlaceholderRange]] = {}
+        mm_items: dict[str, list[dict[str, Any]]] = {}
 
         def emit_ids(ids: list[int], msg_idx: int) -> None:
             tokens.extend(ids)
@@ -207,6 +304,62 @@ class Qwen35Renderer:
 
         def emit_text(text: str, msg_idx: int) -> None:
             emit_ids(self._encode(text), msg_idx)
+
+        def emit_image(part: dict[str, Any], msg_idx: int) -> None:
+            _, out, n, h = self._process_image(part)
+            emit_special(self._vision_start, msg_idx)
+            offset = len(tokens)
+            for _ in range(n):
+                emit_special(self._image_pad, msg_idx)
+            emit_special(self._vision_end, msg_idx)
+            mm_hashes.setdefault("image", []).append(h)
+            mm_placeholders.setdefault("image", []).append(
+                PlaceholderRange(offset=offset, length=n)
+            )
+            mm_items.setdefault("image", []).append(
+                {
+                    "pixel_values": out["pixel_values"],
+                    "image_grid_thw": out["image_grid_thw"],
+                }
+            )
+
+        def emit_user_with_media(content_list: list[Any], msg_idx: int) -> None:
+            """Emit a user message whose content list contains image parts.
+
+            Buffers text segments and flushes them as single ``encode()``
+            calls on special-token boundaries (``<|vision_start|>``,
+            ``<|im_end|>``), matching how Jinja's ``render_content`` macro
+            concatenates strings before tokenization. This preserves BPE
+            byte-parity against ``apply_chat_template``.
+            """
+            emit_special(self._im_start, msg_idx)
+            buf: list[str] = ["user\n"]
+
+            def flush_buf() -> None:
+                if buf:
+                    emit_text("".join(buf), msg_idx)
+                    buf.clear()
+
+            for item in content_list:
+                if isinstance(item, str):
+                    buf.append(item)
+                elif isinstance(item, dict):
+                    if _is_image_part(item):
+                        flush_buf()
+                        emit_image(item, msg_idx)
+                    elif _is_video_part(item):
+                        raise NotImplementedError(
+                            "Video parts are not yet supported by Qwen35Renderer."
+                        )
+                    elif "text" in item:
+                        buf.append(item["text"])
+                    else:
+                        raise ValueError(f"Unexpected content item: {item}")
+                else:
+                    raise ValueError(f"Unexpected content item: {item}")
+            flush_buf()
+            emit_special(self._im_end, msg_idx)
+            emit_text("\n", msg_idx)
 
         # ── 1. System message + optional tools ──────────────────────
         first_is_system = messages[0].get("role") == "system"
@@ -255,10 +408,14 @@ class Qwen35Renderer:
                 continue  # Already handled above
 
             elif role == "user":
-                emit_special(self._im_start, i)
-                emit_text("user\n" + content, i)
-                emit_special(self._im_end, i)
-                emit_text("\n", i)
+                raw_content = msg.get("content")
+                if self._content_has_media(raw_content):
+                    emit_user_with_media(raw_content, i)
+                else:
+                    emit_special(self._im_start, i)
+                    emit_text("user\n" + content, i)
+                    emit_special(self._im_end, i)
+                    emit_text("\n", i)
 
             elif role == "assistant":
                 preserve_thinking = should_preserve_past_thinking(
@@ -303,7 +460,19 @@ class Qwen35Renderer:
                 emit_special(self._think_end, -1)
                 emit_text("\n\n", -1)
 
-        return RenderedTokens(token_ids=tokens, message_indices=indices)
+        mm_data: MultiModalData | None = None
+        if mm_hashes or mm_placeholders or mm_items:
+            mm_data = MultiModalData(
+                mm_hashes=mm_hashes,
+                mm_placeholders=mm_placeholders,
+                mm_items=mm_items,
+            )
+
+        return RenderedTokens(
+            token_ids=tokens,
+            message_indices=indices,
+            multi_modal_data=mm_data,
+        )
 
     def render_ids(
         self,
@@ -339,7 +508,8 @@ class Qwen35Renderer:
         new_messages: list[Message],
         *,
         tools: list[ToolSpec] | None = None,
-    ) -> list[int] | None:
+        previous_multi_modal_data: MultiModalData | None = None,
+    ) -> "RenderedTokens | None":
         if (
             not previous_prompt_ids
             or not new_messages
@@ -356,16 +526,66 @@ class Qwen35Renderer:
         if previous_ids is None:
             return None
 
-        ext: list[int] = []
+        # Seed combined-token list with prior turn so placeholder offsets
+        # are absolute in the bridged sequence (matching ``render()``).
+        tokens: list[int] = list(previous_ids)
+        new_hashes: dict[str, list[str]] = {}
+        new_placeholders: dict[str, list[PlaceholderRange]] = {}
+        new_items: dict[str, list[dict[str, Any]]] = {}
 
         def emit_special(token_id: int, _msg_idx: int = -1) -> None:
-            ext.append(token_id)
+            tokens.append(token_id)
 
         def emit_text(text: str, _msg_idx: int = -1) -> None:
-            ext.extend(self._encode(text))
+            tokens.extend(self._encode(text))
 
-        def emit_ids(ids: list[int], _msg_idx: int = -1) -> None:
-            ext.extend(ids)
+        def emit_image(part: dict[str, Any]) -> None:
+            _, out, n, h = self._process_image(part)
+            emit_special(self._vision_start)
+            offset = len(tokens)
+            for _ in range(n):
+                emit_special(self._image_pad)
+            emit_special(self._vision_end)
+            new_hashes.setdefault("image", []).append(h)
+            new_placeholders.setdefault("image", []).append(
+                PlaceholderRange(offset=offset, length=n)
+            )
+            new_items.setdefault("image", []).append(
+                {
+                    "pixel_values": out["pixel_values"],
+                    "image_grid_thw": out["image_grid_thw"],
+                }
+            )
+
+        def emit_user_with_media(content_list: list[Any]) -> None:
+            emit_special(self._im_start)
+            buf: list[str] = ["user\n"]
+
+            def flush_buf() -> None:
+                if buf:
+                    emit_text("".join(buf))
+                    buf.clear()
+
+            for item in content_list:
+                if isinstance(item, str):
+                    buf.append(item)
+                elif isinstance(item, dict):
+                    if _is_image_part(item):
+                        flush_buf()
+                        emit_image(item)
+                    elif _is_video_part(item):
+                        raise NotImplementedError(
+                            "Video parts are not yet supported by Qwen35Renderer."
+                        )
+                    elif "text" in item:
+                        buf.append(item["text"])
+                    else:
+                        raise ValueError(f"Unexpected content item: {item}")
+                else:
+                    raise ValueError(f"Unexpected content item: {item}")
+            flush_buf()
+            emit_special(self._im_end)
+            emit_text("\n")
 
         # Trailing ``\n`` after ``<|im_end|>`` — ``render()`` emits it as
         # part of the prior turn, but vLLM stops on ``<|im_end|>`` so the
@@ -374,12 +594,16 @@ class Qwen35Renderer:
 
         for i, msg in enumerate(new_messages):
             role = msg.get("role")
-            content = self._render_content(msg.get("content")).strip()
+            raw_content = msg.get("content")
+            content = self._render_content(raw_content).strip()
             if role == "user":
-                emit_special(self._im_start, i)
-                emit_text("user\n" + content, i)
-                emit_special(self._im_end, i)
-                emit_text("\n", i)
+                if self._content_has_media(raw_content):
+                    emit_user_with_media(raw_content)
+                else:
+                    emit_special(self._im_start, i)
+                    emit_text("user\n" + content, i)
+                    emit_special(self._im_end, i)
+                    emit_text("\n", i)
             elif role == "system":
                 emit_special(self._im_start, i)
                 emit_text("system\n" + content, i)
@@ -408,7 +632,42 @@ class Qwen35Renderer:
             emit_special(self._think_end, -1)
             emit_text("\n\n", -1)
 
-        return previous_ids + ext
+        # Merge prev mm_data (images from earlier turns) with the new turn's.
+        merged_hashes: dict[str, list[str]] = (
+            dict(previous_multi_modal_data.mm_hashes)
+            if previous_multi_modal_data
+            else {}
+        )
+        merged_placeholders: dict[str, list[PlaceholderRange]] = (
+            dict(previous_multi_modal_data.mm_placeholders)
+            if previous_multi_modal_data
+            else {}
+        )
+        merged_items: dict[str, list[dict[str, Any]]] = (
+            dict(previous_multi_modal_data.mm_items)
+            if previous_multi_modal_data
+            else {}
+        )
+        for modality, vals in new_hashes.items():
+            merged_hashes.setdefault(modality, []).extend(vals)
+        for modality, vals in new_placeholders.items():
+            merged_placeholders.setdefault(modality, []).extend(vals)
+        for modality, vals in new_items.items():
+            merged_items.setdefault(modality, []).extend(vals)
+
+        if not (merged_hashes or merged_placeholders or merged_items):
+            return RenderedTokens(token_ids=tokens)
+
+        mm_data = MultiModalData(
+            mm_hashes=merged_hashes,
+            mm_placeholders=merged_placeholders,
+            mm_items=merged_items,
+        )
+        return RenderedTokens(
+            token_ids=tokens,
+            message_indices=[-1] * len(tokens),
+            multi_modal_data=mm_data,
+        )
 
     # ------------------------------------------------------------------
     # Assistant message rendering

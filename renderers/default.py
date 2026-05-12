@@ -226,7 +226,7 @@ class DefaultRenderer:
         new_messages: list[Message],
         *,
         tools: list[ToolSpec] | None = None,
-    ) -> list[int] | None:
+    ) -> RenderedTokens | None:
         """DefaultRenderer wraps an unknown Jinja template — it has no
         hand-coded extension logic to emit. Return ``None`` so the caller
         falls back to a full re-render; that's correct whenever the

@@ -29,12 +29,20 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 
 from renderers.base import (
     Message,
+    MultiModalData,
     ParsedResponse,
+    PlaceholderRange,
     RenderedTokens,
     ToolSpec,
     reject_assistant_in_extension,
     should_preserve_past_thinking,
     trim_to_turn_close,
+)
+from renderers.qwen3_vl import (
+    _image_hash,
+    _is_image_part,
+    _is_video_part,
+    _load_pil_image,
 )
 
 # ---------------------------------------------------------------------------
@@ -512,11 +520,14 @@ class KimiK25Renderer:
         self,
         tokenizer: PreTrainedTokenizer,
         *,
+        processor: Any = None,
         enable_thinking: bool = True,
         preserve_all_thinking: bool = False,
         preserve_thinking_between_tool_calls: bool = False,
+        image_cache_max: int = 256,
     ):
         self._tokenizer = tokenizer
+        self._processor = processor
         self._enable_thinking = enable_thinking
         self._preserve_all_thinking = preserve_all_thinking
         self._preserve_thinking_between_tool_calls = (
@@ -537,6 +548,17 @@ class KimiK25Renderer:
         self._tool_call_argument_begin = self._token_id("<|tool_call_argument_begin|>")
         self._tool_call_end = self._token_id("<|tool_call_end|>")
 
+        # Media tokens for vision support. The K2.5 chat template wraps each
+        # image with ``<|media_begin|>image<|media_content|><|media_pad|><|media_end|>``
+        # (literal text "image" between the two specials). Unlike Qwen-VL,
+        # only ONE ``<|media_pad|>`` lands in ``input_ids`` per image — the
+        # model expands per-patch internally from ``pixel_values`` /
+        # ``grid_thws``. ``mm_placeholders.length`` is therefore 1 per image.
+        self._media_begin = self._token_id("<|media_begin|>")
+        self._media_content = self._token_id("<|media_content|>")
+        self._media_pad = self._token_id("<|media_pad|>")
+        self._media_end = self._token_id("<|media_end|>")
+
         # <think> / </think> may be multi-token in K2.5; we encode them as text.
         # We cache the encoded IDs for use in _normalize_response_tokens.
         self._think_open_ids: list[int] = self._encode("<think>")
@@ -544,6 +566,69 @@ class KimiK25Renderer:
 
         # The stop token for generation
         self._endoftext: int | None = self._try_token_id("<|endoftext|>")
+
+        # Per-instance image-processor cache (FIFO-bounded). Same shape as
+        # ``Qwen3VLRenderer._image_cache`` — keyed by content hash, value is
+        # ``(processor_out, num_patches)``. ``num_patches`` is informational
+        # for Kimi (we emit a single placeholder regardless), but kept for
+        # consistency / debugging.
+        self._image_cache: dict[str, tuple[Any, int]] = {}
+        self._image_cache_max = image_cache_max
+
+    @property
+    def mm_token_type_id_map(self) -> dict[int, int]:
+        """Token-id → modality marker. For Kimi K2.5 only ``<|media_pad|>``
+        carries an image marker (1); the model expands per-patch attention
+        internally from ``pixel_values``."""
+        return {self._media_pad: 1}
+
+    def _get_processor(self):
+        if self._processor is not None:
+            return self._processor
+        from transformers import AutoProcessor
+
+        name = getattr(self._tokenizer, "name_or_path", None)
+        if not name:
+            raise RuntimeError(
+                "KimiK25Renderer needs a processor to render image content. "
+                "Pass `processor=AutoProcessor.from_pretrained(name, trust_remote_code=True, "
+                "revision=<pinned sha>)` to the constructor, or load the tokenizer with a "
+                "known name_or_path so the processor can be auto-loaded."
+            )
+        # Kimi's processor is custom Python in the model repo and requires
+        # trust_remote_code=True. Callers using ``create_renderer_pool`` go
+        # through ``load_tokenizer`` which already pins the revision; for
+        # auto-load here, we delegate to AutoProcessor with the same flag.
+        self._processor = AutoProcessor.from_pretrained(name, trust_remote_code=True)
+        return self._processor
+
+    def _process_image(self, part: dict[str, Any]):
+        """Resolve, process, and characterize a single image part for Kimi K2.5.
+
+        Returns ``(pil, processor_out, num_patches, image_hash)`` where
+        ``processor_out`` contains ``pixel_values`` and ``grid_thws``
+        (Kimi's keys; differ from Qwen-VL's ``image_grid_thw``). Single
+        ``<|media_pad|>`` per image in the token stream; the patch count
+        is informational only.
+        """
+        pil = _load_pil_image(part)
+        h = _image_hash(pil)
+        cached = self._image_cache.get(h)
+        if cached is not None:
+            out, num_patches = cached
+            return pil, out, num_patches, h
+        proc = self._get_processor()
+        img_proc = proc.image_processor
+        # Kimi's vision processor takes a media-dict shape, not raw PIL.
+        media_item = {"type": "image", "image": pil}
+        out = img_proc.preprocess([media_item], return_tensors="pt")
+        # Patch count via the processor's own calculator (matches the
+        # model's per-patch attention count); kept for debugging.
+        num_patches = int(img_proc.media_tokens_calculator(media_item))
+        if len(self._image_cache) >= self._image_cache_max:
+            self._image_cache.pop(next(iter(self._image_cache)))
+        self._image_cache[h] = (out, num_patches)
+        return pil, out, num_patches, h
 
     # ------------------------------------------------------------------
     # Token helpers
@@ -607,6 +692,9 @@ class KimiK25Renderer:
 
         tokens: list[int] = []
         indices: list[int] = []
+        mm_hashes: dict[str, list[str]] = {}
+        mm_placeholders: dict[str, list[PlaceholderRange]] = {}
+        mm_items: dict[str, list[dict[str, Any]]] = {}
 
         def emit_ids(ids: list[int], msg_idx: int) -> None:
             tokens.extend(ids)
@@ -618,6 +706,43 @@ class KimiK25Renderer:
 
         def emit_text(text: str, msg_idx: int) -> None:
             emit_ids(self._encode(text), msg_idx)
+
+        def emit_image(part: dict[str, Any], msg_idx: int) -> None:
+            """Emit Kimi K2.5's image wrap and accumulate ``mm_data``.
+
+            Template-equivalent expansion per image:
+                ``<|media_begin|>image<|media_content|><|media_pad|><|media_end|>\\n``
+
+            Only one ``<|media_pad|>`` lands in ``input_ids`` (the model
+            handles per-patch attention internally from ``pixel_values`` +
+            ``grid_thws``), so ``mm_placeholders.length`` is 1 per image.
+            The trailing ``\\n`` after ``<|media_end|>`` is emitted by
+            Kimi's chat template after every image — kept here verbatim
+            for byte-parity, regardless of what follows (more images,
+            text, or the ``<|im_end|>`` close).
+            """
+            _, out, _num_patches, h = self._process_image(part)
+            emit_special(self._media_begin, msg_idx)
+            emit_text("image", msg_idx)
+            emit_special(self._media_content, msg_idx)
+            offset = len(tokens)
+            emit_special(self._media_pad, msg_idx)
+            emit_special(self._media_end, msg_idx)
+            emit_text("\n", msg_idx)
+            mm_hashes.setdefault("image", []).append(h)
+            mm_placeholders.setdefault("image", []).append(
+                PlaceholderRange(offset=offset, length=1)
+            )
+            # ``grid_thws`` (Kimi) is the per-image equivalent of Qwen-VL's
+            # ``image_grid_thw``. Ship under Kimi's native key so the
+            # orchestrator's generic ``torch.cat``-based packer routes it
+            # directly into the model's forward kwargs.
+            mm_items.setdefault("image", []).append(
+                {
+                    "pixel_values": out["pixel_values"],
+                    "grid_thws": out["grid_thws"],
+                }
+            )
 
         # ── Tool declaration prefix (comes first) ──
         # K2.5/K2.6's tokenizer auto-computes ``tools_ts_str`` and threads
@@ -672,8 +797,14 @@ class KimiK25Renderer:
                     emit_ids=emit_ids,
                 )
             elif msg.get("content") is not None:
+                # User / other content branches — images allowed.
                 self._emit_content(
-                    msg.get("content"), i, emit_special, emit_text, emit_ids
+                    msg.get("content"),
+                    i,
+                    emit_special,
+                    emit_text,
+                    emit_ids,
+                    emit_image=emit_image,
                 )
 
             emit_special(self._im_end, i)
@@ -690,7 +821,19 @@ class KimiK25Renderer:
                 # Empty <think></think> to disable thinking
                 emit_text("<think></think>", -1)
 
-        return RenderedTokens(token_ids=tokens, message_indices=indices)
+        mm_data: MultiModalData | None = None
+        if mm_hashes or mm_placeholders or mm_items:
+            mm_data = MultiModalData(
+                mm_hashes=mm_hashes,
+                mm_placeholders=mm_placeholders,
+                mm_items=mm_items,
+            )
+
+        return RenderedTokens(
+            token_ids=tokens,
+            message_indices=indices,
+            multi_modal_data=mm_data,
+        )
 
     def render_ids(
         self,
@@ -734,7 +877,8 @@ class KimiK25Renderer:
         new_messages: list[Message],
         *,
         tools: list[ToolSpec] | None = None,
-    ) -> list[int] | None:
+        previous_multi_modal_data: MultiModalData | None = None,
+    ) -> "RenderedTokens | None":
         if (
             not previous_prompt_ids
             or not new_messages
@@ -754,16 +898,41 @@ class KimiK25Renderer:
         if previous_ids is None:
             return None
 
-        ext: list[int] = []
+        # Seed combined-token list with prior turn so placeholder offsets
+        # are absolute in the bridged sequence.
+        tokens: list[int] = list(previous_ids)
+        new_hashes: dict[str, list[str]] = {}
+        new_placeholders: dict[str, list[PlaceholderRange]] = {}
+        new_items: dict[str, list[dict[str, Any]]] = {}
 
         def emit_special(token_id: int, _msg_idx: int = -1) -> None:
-            ext.append(token_id)
+            tokens.append(token_id)
 
         def emit_text(text: str, _msg_idx: int = -1) -> None:
-            ext.extend(self._encode(text))
+            tokens.extend(self._encode(text))
 
         def emit_ids(ids: list[int], _msg_idx: int = -1) -> None:
-            ext.extend(ids)
+            tokens.extend(ids)
+
+        def emit_image(part: dict[str, Any], _msg_idx: int = -1) -> None:
+            _, out, _num_patches, h = self._process_image(part)
+            emit_special(self._media_begin)
+            emit_text("image")
+            emit_special(self._media_content)
+            offset = len(tokens)
+            emit_special(self._media_pad)
+            emit_special(self._media_end)
+            emit_text("\n")
+            new_hashes.setdefault("image", []).append(h)
+            new_placeholders.setdefault("image", []).append(
+                PlaceholderRange(offset=offset, length=1)
+            )
+            new_items.setdefault("image", []).append(
+                {
+                    "pixel_values": out["pixel_values"],
+                    "grid_thws": out["grid_thws"],
+                }
+            )
 
         # Bridge handles user/system/tool only (reject_assistant_in_extension
         # blocks assistants), so no hist/suffix split needed.
@@ -790,7 +959,12 @@ class KimiK25Renderer:
                 )
             elif msg.get("content") is not None:
                 self._emit_content(
-                    msg.get("content"), i, emit_special, emit_text, emit_ids
+                    msg.get("content"),
+                    i,
+                    emit_special,
+                    emit_text,
+                    emit_ids,
+                    emit_image=emit_image,
                 )
 
             emit_special(self._im_end, i)
@@ -804,7 +978,42 @@ class KimiK25Renderer:
         else:
             emit_text("<think></think>", -1)
 
-        return previous_ids + ext
+        # Merge prev mm_data (earlier-turn images) with the new turn's items.
+        merged_hashes: dict[str, list[str]] = (
+            dict(previous_multi_modal_data.mm_hashes)
+            if previous_multi_modal_data
+            else {}
+        )
+        merged_placeholders: dict[str, list[PlaceholderRange]] = (
+            dict(previous_multi_modal_data.mm_placeholders)
+            if previous_multi_modal_data
+            else {}
+        )
+        merged_items: dict[str, list[dict[str, Any]]] = (
+            dict(previous_multi_modal_data.mm_items)
+            if previous_multi_modal_data
+            else {}
+        )
+        for modality, vals in new_hashes.items():
+            merged_hashes.setdefault(modality, []).extend(vals)
+        for modality, vals in new_placeholders.items():
+            merged_placeholders.setdefault(modality, []).extend(vals)
+        for modality, vals in new_items.items():
+            merged_items.setdefault(modality, []).extend(vals)
+
+        if not (merged_hashes or merged_placeholders or merged_items):
+            return RenderedTokens(token_ids=tokens)
+
+        mm_data = MultiModalData(
+            mm_hashes=merged_hashes,
+            mm_placeholders=merged_placeholders,
+            mm_items=merged_items,
+        )
+        return RenderedTokens(
+            token_ids=tokens,
+            message_indices=[-1] * len(tokens),
+            multi_modal_data=mm_data,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -817,8 +1026,23 @@ class KimiK25Renderer:
         emit_special,
         emit_text,
         emit_ids,
+        *,
+        emit_image=None,
     ) -> None:
-        """Emit message content, handling both plain strings and multipart lists."""
+        """Emit message content, handling strings, multipart lists, and (when
+        ``emit_image`` is supplied) image parts.
+
+        The image-emission callback is opt-in so non-multimodal callers
+        (assistant body rewriting, etc.) don't need to know about it. User
+        / tool message branches in ``render()`` and ``bridge_to_next_turn``
+        pass it in to thread image patches into the accumulator state.
+
+        Note: each image emits its own trailing ``\\n`` after
+        ``<|media_end|>`` (see ``emit_image`` closure in ``render`` /
+        ``bridge_to_next_turn``), so consecutive images naturally
+        produce the template's ``...<|media_end|>\\n<|media_begin|>...``
+        pattern without an inter-image separator here.
+        """
         if content is None:
             return
         if isinstance(content, str):
@@ -829,6 +1053,18 @@ class KimiK25Renderer:
                 if not isinstance(part, dict):
                     continue
                 ptype = part.get("type")
+                is_image = _is_image_part(part)
+                is_video = _is_video_part(part)
+                if is_image:
+                    if emit_image is None:
+                        # Silently drop — caller didn't opt into multimodal.
+                        continue
+                    emit_image(part, msg_idx)
+                    continue
+                if is_video:
+                    raise NotImplementedError(
+                        "Video parts are not yet supported by KimiK25Renderer."
+                    )
                 if ptype == "text":
                     emit_text(part.get("text", ""), msg_idx)
                 elif ptype == "thinking":

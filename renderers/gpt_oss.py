@@ -330,7 +330,7 @@ class GptOssRenderer:
         new_messages: list[Message],
         *,
         tools: list[ToolSpec] | None = None,
-    ) -> list[int] | None:
+    ) -> RenderedTokens | None:
         """Per-message harmony bridge.
 
         Each new message is rendered in isolation via ``enc.render(m)`` —
@@ -368,7 +368,7 @@ class GptOssRenderer:
         ext.extend(self._encode("analysis"))
         ext.append(self._message)
 
-        return previous_ids + ext
+        return RenderedTokens(token_ids=previous_ids + ext)
 
     # ── message conversion ───────────────────────────────────────────────────
 

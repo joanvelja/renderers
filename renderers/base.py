@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Protocol, TypedDict, runtime_checkable
@@ -28,7 +29,37 @@ class ThinkingPart(TypedDict):
     thinking: str
 
 
-ContentPart = TextPart | ThinkingPart
+class ImagePart(TypedDict, total=False):
+    """An image attached to a message.
+
+    Accepts several source shapes so callers can pass whatever they have
+    on hand — a pre-loaded PIL Image, a filesystem path, a URL, or the
+    OpenAI ``image_url`` content part verbatim. The renderer resolves
+    these to a PIL Image at render time.
+    """
+
+    type: Literal["image", "image_url"]
+    image: Any
+    url: str
+    path: str
+    image_url: dict[str, Any]
+
+
+class VideoPart(TypedDict, total=False):
+    """A video attached to a message.
+
+    Mirrors :class:`ImagePart`; the renderer turns frames into the
+    model's video placeholder sequence at render time.
+    """
+
+    type: Literal["video", "video_url"]
+    video: Any
+    url: str
+    path: str
+    video_url: dict[str, Any]
+
+
+ContentPart = TextPart | ThinkingPart | ImagePart | VideoPart
 
 # Content is either a plain string or a list of structured parts.
 Content = str | list[ContentPart]
@@ -78,16 +109,55 @@ class Message(TypedDict, total=False):
 
 
 @dataclass
+class PlaceholderRange:
+    """Where a single multimodal item's placeholder tokens sit in the stream.
+
+    ``offset`` is the 0-based index into ``RenderedTokens.token_ids`` of the
+    first placeholder token; ``length`` is the count of consecutive
+    placeholder tokens. Wraps the vLLM-style ``mm_placeholders`` shape
+    without depending on vLLM types.
+    """
+
+    offset: int
+    length: int
+
+
+@dataclass
+class MultiModalData:
+    """Multimodal sidecar produced alongside the token stream.
+
+    Renderer output is framework-agnostic: ``mm_items[modality][i]`` is a
+    plain ``dict`` mirroring the per-item output of a HuggingFace processor
+    (e.g. ``{"pixel_values": Tensor, "image_grid_thw": Tensor}`` for
+    Qwen3-VL images). Translation to engine-specific wire formats — vLLM's
+    ``MultiModalKwargsItem``, SGLang's payload, etc. — happens in the
+    inference glue layer (see ``renderers.client``).
+    """
+
+    mm_hashes: dict[str, list[str]] = field(default_factory=dict)
+    mm_placeholders: dict[str, list[PlaceholderRange]] = field(default_factory=dict)
+    mm_items: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    def is_empty(self) -> bool:
+        return not (self.mm_hashes or self.mm_placeholders or self.mm_items)
+
+
+@dataclass
 class RenderedTokens:
     """Result of rendering messages to tokens.
 
     Each token carries an index into the original message list so callers can
     build per-token loss masks without re-rendering.  Tokens from structural
     scaffolding (generation prompt, im_start/im_end wrapping) carry index -1.
+
+    ``multi_modal_data`` is populated by multimodal renderers (e.g.
+    ``Qwen3VLRenderer``) when image / video content parts are present;
+    text-only renderers leave it as ``None``.
     """
 
     token_ids: list[int] = field(default_factory=list)
     message_indices: list[int] = field(default_factory=list)
+    multi_modal_data: "MultiModalData | None" = None
 
 
 @dataclass
@@ -180,16 +250,25 @@ class Renderer(Protocol):
         new_messages: list[Message],
         *,
         tools: list[ToolSpec] | None = None,
-    ) -> list[int] | None:
+    ) -> "RenderedTokens | None":
         """Extend ``prev_prompt_ids + prev_completion_ids`` with the tokens
         the next turn adds, without re-rendering the sampled tokens.
 
-        Contract: if the return value ``B`` is not None, then
+        Contract: if the return value's ``token_ids`` sequence ``B`` is
+        not None, then
         ``B[: len(prev_prompt) + len(prev_completion)] == prev_prompt + prev_completion``
-        and ``B`` ends at the position where the next assistant turn begins
-        generating (i.e. equivalent to rendering the full message list so far
-        with ``add_generation_prompt=True`` — except prev sampled tokens are
-        kept verbatim rather than re-rendered).
+        and ``B`` ends at the position where the next assistant turn
+        begins generating (i.e. equivalent to rendering the full message
+        list so far with ``add_generation_prompt=True`` — except prev
+        sampled tokens are kept verbatim rather than re-rendered).
+
+        Text-only renderers return :class:`RenderedTokens` with
+        ``multi_modal_data=None``. Multimodal renderers (see
+        :class:`MultimodalRenderer`) populate ``multi_modal_data`` so
+        the caller can recover placeholder offsets + per-item processed
+        tensors for the new full prompt; they also accept a
+        ``previous_multi_modal_data`` kwarg via the
+        :class:`MultimodalRenderer` Protocol override.
 
         Return ``None`` whenever the renderer can't prove that contract
         holds — the caller falls back to a full re-render. In particular,
@@ -202,34 +281,155 @@ class Renderer(Protocol):
         ...
 
 
+@runtime_checkable
+class MultimodalRenderer(Renderer, Protocol):
+    """A :class:`Renderer` that supports multimodal inputs (images, video).
+
+    Concrete classes (``Qwen3VLRenderer``, ``Qwen35Renderer``,
+    ``Qwen36Renderer``, ``KimiK25Renderer``) implement this Protocol
+    structurally — no explicit inheritance required. Callers that need
+    to drive vLLM's ``multi_modal_data`` features field or carry images
+    forward across turns should dispatch on ``isinstance(r,
+    MultimodalRenderer)`` and use the extended ``bridge_to_next_turn``
+    signature below.
+    """
+
+    @property
+    def mm_token_type_id_map(self) -> dict[int, int]:
+        """Map from special-token IDs to per-token modality markers.
+
+        Convention: ``1`` = image placeholder (e.g. ``<|image_pad|>``),
+        ``2`` = video placeholder (e.g. ``<|video_pad|>``). The
+        orchestrator stamps these onto each rendered token to drive
+        the trainer's vision-encoder slicing logic.
+        """
+        ...
+
+    def bridge_to_next_turn(
+        self,
+        previous_prompt_ids: list[int],
+        previous_completion_ids: list[int],
+        new_messages: list[Message],
+        *,
+        tools: list[ToolSpec] | None = None,
+        previous_multi_modal_data: "MultiModalData | None" = None,
+    ) -> "RenderedTokens | None":
+        """Same contract as :meth:`Renderer.bridge_to_next_turn`, plus:
+
+        - accepts ``previous_multi_modal_data`` so prior-turn images
+          carry forward into the new prompt's ``mm_placeholders``;
+          without this, vLLM sees placeholder counts that don't match
+          the combined token sequence and silently falls back to
+          hash-cache lookup (or errors)
+        - returns :class:`RenderedTokens` (not ``list[int]``) so the
+          caller can recover the placeholder offsets + per-item
+          processed tensors for the new full prompt
+        """
+        ...
+
+
+# Per-type cache for ``is_multimodal``. The ``runtime_checkable`` Protocol
+# isinstance check walks every protocol member via ``hasattr`` on each
+# call; per-type caching collapses that to a single dict lookup on the
+# hot path (e.g. per-bridge dispatch). Pools expose ``is_multimodal``
+# directly as a snapshot attribute (different pools share a class but
+# wrap different renderer types), so we don't need to special-case them.
+_IS_MULTIMODAL_BY_TYPE: dict[type, bool] = {}
+
+
+def is_multimodal(r: object) -> bool:
+    """True iff ``r`` satisfies the :class:`MultimodalRenderer` protocol.
+
+    Equivalent to ``isinstance(r, MultimodalRenderer)`` but cached. Use
+    this on hot paths (per-rollout, per-bridge dispatch) instead of
+    re-running the runtime_checkable Protocol walk on every call.
+    """
+    direct = getattr(r, "is_multimodal", None)
+    if isinstance(direct, bool):
+        return direct
+    cls = type(r)
+    cached = _IS_MULTIMODAL_BY_TYPE.get(cls)
+    if cached is None:
+        cached = isinstance(r, MultimodalRenderer)
+        _IS_MULTIMODAL_BY_TYPE[cls] = cached
+    return cached
+
+
 class RendererPool:
-    """Thread-safe pool of Renderer instances for parallel pretokenization.
+    """Pool of Renderer instances that itself satisfies the Renderer protocol.
 
-    Each Renderer wraps its own tokenizer copy, avoiding contention.
+    Callers treat a pool like a single renderer — ``pool.render_ids(...)``,
+    ``pool.bridge_to_next_turn(...)``, ``isinstance(pool, MultimodalRenderer)``
+    all work via structural delegation. The pool internally serializes
+    access to its inner renderers (each wraps its own tokenizer copy).
 
-    Construction parallelism matters: ``AutoTokenizer.from_pretrained`` takes
-    hundreds of ms per call (JSON parse + Rust tokenizer build + HF cache
-    lookup), so populating a 32-slot pool serially costs ~10-15s on startup
-    and shows up directly as a step-0 stall. We fan the factory out across a
-    short-lived thread pool; since HF fast tokenizers release the GIL during
-    the Rust build phase, this parallelizes well.
+    Concurrency model:
+    - ``size == 1``: a single inner renderer guarded by a ``threading.Lock``.
+      Avoids the queue's per-call overhead on the common default config.
+    - ``size > 1``: a ``queue.Queue`` of independent renderers, checked out
+      one at a time. HuggingFace fast tokenizers release the GIL during
+      Rust encoding, so threads achieve real parallelism.
+
+    Construction parallelism for ``size > 1``: ``AutoTokenizer.from_pretrained``
+    takes hundreds of ms per call (JSON parse + Rust tokenizer build + HF
+    cache lookup), so populating a 32-slot pool serially costs ~10-15s on
+    startup and shows up directly as a step-0 stall. We fan the factory out
+    across a short-lived thread pool; the GIL-bound Python portion stops
+    scaling past ~8 workers, so we clamp there.
     """
 
     def __init__(self, factory: Callable[[], Renderer], size: int):
         from concurrent.futures import ThreadPoolExecutor
 
         self._factory = factory
-        self._pool: queue.Queue[Renderer] = queue.Queue(maxsize=size)
-        # Cap workers so we don't spawn an oversized thread pool just to init
-        # a small pool; clamp to 8 because past that the GIL-bound Python
-        # portion of from_pretrained stops scaling.
-        workers = min(size, 8)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            for renderer in executor.map(lambda _: factory(), range(size)):
-                self._pool.put(renderer)
+        self._size = size
+
+        if size == 1:
+            renderer = factory()
+            self._sole: Renderer | None = renderer
+            self._lock: threading.Lock | None = threading.Lock()
+            self._pool: queue.Queue[Renderer] | None = None
+            sample: Renderer = renderer
+        else:
+            self._sole = None
+            self._lock = None
+            self._pool = queue.Queue(maxsize=size)
+            workers = min(size, 8)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for renderer in executor.map(lambda _: factory(), range(size)):
+                    self._pool.put(renderer)
+            # Peek without removing — safe at construction time before any
+            # checkout has been served.
+            sample = self._pool.queue[0]
+
+        # Snapshot the protocol-shaped attributes from a sample renderer.
+        # They are constant per renderer class, so resolving them once at
+        # construction (a) eliminates per-call ``getattr``/``isinstance``
+        # overhead and (b) lets a future out-of-process pool variant skip
+        # holding a live tokenizer in the parent process.
+        self._renderer_cls: type[Renderer] = type(sample)
+        self.supports_tools: bool = getattr(sample, "supports_tools", True)
+        self.is_multimodal: bool = is_multimodal(sample)
+        # ``mm_token_type_id_map`` is set ONLY on pools wrapping a
+        # ``MultimodalRenderer``. We deliberately don't expose this as a
+        # class-level property: ``runtime_checkable`` Protocol's
+        # isinstance check uses ``inspect.getattr_static``, which finds
+        # property descriptors on the class regardless of whether their
+        # fget raises. Conditional instance attributes (present in
+        # ``self.__dict__`` only when applicable) are the only way to
+        # make ``isinstance(pool, MultimodalRenderer)`` reflect the
+        # inner renderer's actual protocol conformance.
+        if isinstance(sample, MultimodalRenderer):
+            self.mm_token_type_id_map: dict[int, int] = sample.mm_token_type_id_map
 
     @contextmanager
     def checkout(self):
+        if self._sole is not None:
+            assert self._lock is not None
+            with self._lock:
+                yield self._sole
+            return
+        assert self._pool is not None
         renderer = self._pool.get()
         try:
             yield renderer
@@ -238,7 +438,42 @@ class RendererPool:
 
     @property
     def size(self) -> int:
-        return self._pool.maxsize
+        return self._size
+
+    @property
+    def renderer_cls(self) -> type[Renderer]:
+        """Class of the renderers in this pool (uniform across all slots)."""
+        return self._renderer_cls
+
+    # ── Renderer protocol delegation ────────────────────────────────────
+    # Pool structurally satisfies ``Renderer`` (and ``MultimodalRenderer``
+    # when its slots wrap multimodal renderers). Callers can call methods
+    # directly and dispatch with ``isinstance(pool, MultimodalRenderer)``
+    # without reaching into ``checkout()``.
+
+    def render(self, *args: Any, **kwargs: Any) -> "RenderedTokens":
+        with self.checkout() as r:
+            return r.render(*args, **kwargs)
+
+    def render_ids(self, *args: Any, **kwargs: Any) -> list[int]:
+        with self.checkout() as r:
+            return r.render_ids(*args, **kwargs)
+
+    def parse_response(self, *args: Any, **kwargs: Any) -> "ParsedResponse":
+        with self.checkout() as r:
+            return r.parse_response(*args, **kwargs)
+
+    def get_stop_token_ids(self) -> list[int]:
+        with self.checkout() as r:
+            return r.get_stop_token_ids()
+
+    def bridge_to_next_turn(self, *args: Any, **kwargs: Any) -> "RenderedTokens | None":
+        with self.checkout() as r:
+            return r.bridge_to_next_turn(*args, **kwargs)
+
+    # ``mm_token_type_id_map`` (the MultimodalRenderer protocol attribute)
+    # is set in ``__init__`` only for pools wrapping multimodal renderers;
+    # see the comment there for why this isn't a class-level property.
 
 
 RENDERER_REGISTRY: dict[str, type] = {}
@@ -310,6 +545,75 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     "openai/gpt-oss-20b": "gpt-oss",
     "openai/gpt-oss-120b": "gpt-oss",
 }
+
+
+# Per-model declaration of supported non-text modalities. Drives the
+# multimodal parity test matrix in ``tests/test_multimodal.py`` — each
+# ``(model, modality)`` pair gets a parity test against
+# ``processor.apply_chat_template`` + ``processor(...)``. Add a model
+# here when its renderer supports a new modality; the test matrix
+# picks it up automatically.
+#
+# Modality values: ``"image"``, ``"video"``, ``"audio"``. Text is implicit
+# (every model supports it), so it doesn't appear in the set.
+MULTIMODAL_MODELS: dict[str, set[str]] = {
+    "Qwen/Qwen3-VL-4B-Instruct": {"image"},
+    "Qwen/Qwen3-VL-8B-Instruct": {"image"},
+    "Qwen/Qwen3-VL-30B-A3B-Instruct": {"image"},
+    # Qwen3.5 is itself a VLM family (HF tag ``image-text-to-text``,
+    # processor class ``Qwen3VLProcessor``) — same vision tokens and
+    # image-processor as Qwen3-VL, with a different tool-call format.
+    "Qwen/Qwen3.5-0.8B": {"image"},
+    "Qwen/Qwen3.5-2B": {"image"},
+    "Qwen/Qwen3.5-4B": {"image"},
+    "Qwen/Qwen3.5-9B": {"image"},
+    "Qwen/Qwen3.5-35B-A3B": {"image"},
+    "Qwen/Qwen3.5-122B-A10B": {"image"},
+    "Qwen/Qwen3.5-397B-A17B": {"image"},
+    # Qwen3.6 extends Qwen3.5's chat template; same VL bits, only
+    # tool-call argument serialization differs.
+    "Qwen/Qwen3.6-35B-A3B": {"image"},
+    # Kimi K2.5 / K2.6 are unified VLMs (HF tag ``image-text-to-text``)
+    # with custom processor (``KimiK25Processor`` + ``KimiK25VisionProcessor``).
+    # Vision wrap is different from Qwen-VL:
+    # ``<|media_begin|>image<|media_content|><|media_pad|><|media_end|>`` —
+    # only ONE ``<|media_pad|>`` per image in ``input_ids``; per-patch
+    # expansion happens internally in the model from ``pixel_values`` /
+    # ``grid_thws``.
+    "moonshotai/Kimi-K2.5": {"image"},
+    "moonshotai/Kimi-K2.6": {"image"},
+}
+
+
+def _model_has_vision_config(model_name: str) -> bool:
+    """Return True if the HF config for ``model_name`` declares vision inputs.
+
+    Used by ``create_renderer`` to fail loudly on VLMs that miss the
+    ``MODEL_RENDERER_MAP`` exact-match lookup. DefaultRenderer silently
+    drops images (it only knows ``apply_chat_template`` + text tokens),
+    so a VLM falling back to it would produce token streams that don't
+    match what the trainer reconstructs — a class of bug the renderer
+    abstraction exists to prevent.
+
+    Returns False on any AutoConfig failure (offline, gated, missing) so
+    a flaky HF probe never blocks a legitimate text-only fine-tune.
+    """
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=False)
+    except Exception:
+        return False
+    # Most VLM configs nest a vision tower as ``vision_config`` (Qwen-VL,
+    # Llava, Gemma3, Idefics, MiniCPM-V, ...). A few use ``vision_tower``
+    # or expose a top-level ``image_token_id``; check those too.
+    if getattr(cfg, "vision_config", None) is not None:
+        return True
+    if getattr(cfg, "vision_tower", None) is not None:
+        return True
+    if getattr(cfg, "image_token_id", None) is not None:
+        return True
+    return False
 
 
 # Models whose tokenizer requires ``trust_remote_code=True`` AND a pinned
@@ -518,7 +822,23 @@ def create_renderer(
     if renderer_name is not None:
         return RENDERER_REGISTRY[renderer_name](tokenizer, **preserve_kwargs)
 
-    # No match — fall back to default (apply_chat_template). For fine-tunes
+    # No match. For VLMs this must be fatal: DefaultRenderer only knows
+    # ``apply_chat_template`` + text tokens, so it would silently drop
+    # images and produce a token stream the trainer can't reconstruct.
+    # Catch this at the renderer-selection seam — well before any
+    # rollout — so the failure mode is "config error at startup," not
+    # "mysterious KL divergence after 100 steps."
+    if model_name in MULTIMODAL_MODELS or _model_has_vision_config(model_name):
+        supported_vlms = sorted(MULTIMODAL_MODELS)
+        raise ValueError(
+            f"No multimodal renderer registered for {model_name!r}, and "
+            f"DefaultRenderer would silently drop images. Register a "
+            f"renderer in MODEL_RENDERER_MAP (currently supported VLMs: "
+            f"{supported_vlms}), or pass ``renderer='<name>'`` explicitly "
+            f"if you know what you're doing."
+        )
+
+    # Text-only fall back to default (apply_chat_template). For fine-tunes
     # with customized chat templates this is the *correct* choice, so we don't
     # warn. Note the pick at INFO and advertise the parser knobs.
     logger.info(
@@ -669,17 +989,23 @@ def build_trajectory_step(
     Uses common_prefix_len to find the split point because generation prompts
     may diverge from the full sequence at token boundaries (e.g., ``\\n`` vs
     ``\\n\\n`` when thinking content is empty in Qwen3.5).
+
+    For multimodal renderers, attaches ``multi_modal_data`` keyed on the
+    full message sequence (assistant text doesn't carry placeholders, so
+    the full-render's mm sidecar covers every image up to and including
+    the completion).
     """
     has_completion = len(completion_messages) > 0
     prompt_ids = renderer.render_ids(
         prompt_messages, tools=tools, add_generation_prompt=has_completion
     )
-    full_ids = renderer.render_ids(prompt_messages + completion_messages, tools=tools)
+    full_rendered = renderer.render(prompt_messages + completion_messages, tools=tools)
+    full_ids = full_rendered.token_ids
 
     split_idx = _common_prefix_len(prompt_ids, full_ids)
     completion_ids = full_ids[split_idx:]
 
-    return {
+    out: dict[str, Any] = {
         "prompt_ids": full_ids[:split_idx],
         "prompt_mask": [False] * split_idx,
         "completion_ids": completion_ids,
@@ -687,3 +1013,9 @@ def build_trajectory_step(
         "completion_logprobs": [0.0] * len(completion_ids),
         "routed_experts": None,
     }
+    if (
+        full_rendered.multi_modal_data is not None
+        and not full_rendered.multi_modal_data.is_empty()
+    ):
+        out["multi_modal_data"] = full_rendered.multi_modal_data
+    return out

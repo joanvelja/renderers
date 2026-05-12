@@ -251,7 +251,7 @@ class GLM5Renderer:
         new_messages: list[Message],
         *,
         tools: list[ToolSpec] | None = None,
-    ) -> list[int] | None:
+    ) -> RenderedTokens | None:
         if (
             not previous_prompt_ids
             or not new_messages
@@ -314,7 +314,7 @@ class GLM5Renderer:
         else:
             emit_special(self._think_end, -1)
 
-        return previous_ids + ext
+        return RenderedTokens(token_ids=previous_ids + ext)
 
     def _render_assistant(
         self,

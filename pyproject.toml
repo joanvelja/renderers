@@ -25,10 +25,13 @@ packages = ["renderers"]
 
 [dependency-groups]
 dev = [
+    "pillow>=12.2.0",
     "pre-commit",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "ruff",
+    "torch>=2.11.0",
+    "torchvision>=0.26.0",
     "ty>=0.0.1a29,<0.0.22",
 ]
 

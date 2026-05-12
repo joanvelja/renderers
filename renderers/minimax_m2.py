@@ -244,7 +244,7 @@ class MiniMaxM2Renderer:
         new_messages: list[Message],
         *,
         tools: list[ToolSpec] | None = None,
-    ) -> list[int] | None:
+    ) -> RenderedTokens | None:
         if (
             not previous_prompt_ids
             or not new_messages
@@ -303,7 +303,7 @@ class MiniMaxM2Renderer:
         emit_special(self._think, -1)
         emit_text("\n", -1)
 
-        return previous_ids + ext
+        return RenderedTokens(token_ids=previous_ids + ext)
 
     def _render_assistant(
         self,

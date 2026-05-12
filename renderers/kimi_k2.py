@@ -301,7 +301,7 @@ class KimiK2Renderer:
         new_messages: list[Message],
         *,
         tools: list[ToolSpec] | None = None,
-    ) -> list[int] | None:
+    ) -> RenderedTokens | None:
         if (
             not previous_prompt_ids
             or not new_messages
@@ -367,7 +367,7 @@ class KimiK2Renderer:
         emit_text("assistant", -1)
         emit_special(self._im_middle, -1)
 
-        return previous_ids + ext
+        return RenderedTokens(token_ids=previous_ids + ext)
 
     def _render_assistant(
         self,

@@ -51,6 +51,7 @@ from renderers.qwen3_vl import Qwen3VLRenderer
 from renderers.qwen35 import Qwen35Renderer
 from renderers.qwen36 import Qwen36Renderer
 from renderers.streams import (
+    CompletedResponse,
     PreparedTurn,
     RenderedStream,
     StreamBridgeUnavailable,
@@ -61,6 +62,7 @@ from renderers.streams import (
 __all__ = [
     "Content",
     "ContentPart",
+    "CompletedResponse",
     "DeepSeekV3Renderer",
     "DefaultRenderer",
     "GLM45Renderer",

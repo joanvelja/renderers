@@ -17,6 +17,7 @@ from renderers.base import (
     RenderedTokens,
     Renderer,
     ToolSpec,
+    ToolCallParseStatus,
     is_multimodal,
 )
 
@@ -46,6 +47,23 @@ class StreamBridgeUnavailable(RuntimeError):
     def __init__(self, stream_id: Hashable):
         self.stream_id = stream_id
         super().__init__(f"{stream_id}: renderer could not bridge committed stream")
+
+
+@dataclass(frozen=True)
+class CompletedResponse:
+    """Completion data needed to append a prepared turn to a stream."""
+
+    completion_ids: Sequence[int]
+    parsed: ParsedResponse
+    completion_logprobs: Sequence[float] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "completion_ids", tuple(self.completion_ids))
+        object.__setattr__(
+            self,
+            "completion_logprobs",
+            tuple(self.completion_logprobs),
+        )
 
 
 @dataclass(frozen=True)
@@ -147,6 +165,14 @@ class StreamSet:
     ) -> "StreamSet":
         """Return a new set with ``prepared`` and its assistant completion committed."""
 
+        if (
+            completion_logprobs is not None
+            and len(completion_logprobs) > 0
+            and len(completion_logprobs) != len(completion_ids)
+        ):
+            raise ValueError(
+                "completion_logprobs must be empty or have one item per completion id"
+            )
         next_streams = dict(self.streams)
         next_streams[stream_id] = RenderedStream(
             messages=prepared.messages + _snapshot_messages([assistant_message]),
@@ -158,6 +184,23 @@ class StreamSet:
             parsed_completion=parsed_completion,
         )
         return StreamSet(next_streams)
+
+    def commit_response(
+        self,
+        stream_id: Hashable,
+        prepared: PreparedTurn,
+        response: CompletedResponse,
+    ) -> "StreamSet":
+        """Commit a parsed completion for a previously prepared model call."""
+
+        return self.commit(
+            stream_id,
+            prepared,
+            completion_ids=response.completion_ids,
+            assistant_message=_assistant_message(response.parsed),
+            completion_logprobs=response.completion_logprobs,
+            parsed_completion=response.parsed,
+        )
 
 
 def _bridge(
@@ -210,7 +253,30 @@ def _snapshot_messages(messages: Sequence[Message]) -> tuple[Message, ...]:
     return tuple(dict(message) for message in messages)
 
 
+def _assistant_message(parsed: ParsedResponse) -> Message:
+    message: Message = {"role": "assistant", "content": parsed.content}
+    if parsed.reasoning_content is not None:
+        message["reasoning_content"] = parsed.reasoning_content
+
+    tool_calls = [
+        {
+            "type": "function",
+            "id": tc.id or "",
+            "function": {
+                "name": tc.name,
+                "arguments": tc.arguments if tc.arguments is not None else {},
+            },
+        }
+        for tc in parsed.tool_calls
+        if tc.status == ToolCallParseStatus.OK and tc.name is not None
+    ]
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
+
+
 __all__ = [
+    "CompletedResponse",
     "PreparedTurn",
     "RenderedStream",
     "StreamBridgeUnavailable",

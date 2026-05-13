@@ -1,5 +1,17 @@
-from renderers.base import ParsedResponse, RenderedTokens
-from renderers.streams import StreamBridgeUnavailable, StreamDivergence, StreamSet
+from renderers.base import (
+    MultiModalData,
+    ParsedResponse,
+    ParsedToolCall,
+    RenderedTokens,
+    ToolCallParseStatus,
+)
+from renderers.streams import (
+    CompletedResponse,
+    PreparedTurn,
+    StreamBridgeUnavailable,
+    StreamDivergence,
+    StreamSet,
+)
 
 
 class _FakeRenderer:
@@ -110,6 +122,106 @@ def test_commit_returns_new_stream_set_with_completion_tape():
         {"role": "user", "content": "solve"},
         {"role": "assistant", "content": "answer"},
     )
+
+
+def test_commit_response_builds_assistant_message_from_parsed_response():
+    prepared = StreamSet().prepare_append(
+        "prover",
+        [{"role": "user", "content": "solve"}],
+        _FakeRenderer(),
+    )
+    parsed = ParsedResponse(
+        content="answer",
+        reasoning_content="work",
+        tool_calls=[
+            ParsedToolCall(
+                raw='{"name": "lookup", "arguments": {"x": 1}}',
+                name="lookup",
+                arguments={"x": 1},
+                status=ToolCallParseStatus.OK,
+                id="call_1",
+            ),
+            ParsedToolCall(
+                raw="{bad json",
+                status=ToolCallParseStatus.INVALID_JSON,
+            ),
+        ],
+    )
+
+    streams = StreamSet().commit_response(
+        "prover",
+        prepared,
+        CompletedResponse(
+            completion_ids=[7, 8],
+            completion_logprobs=[-0.1, -0.2],
+            parsed=parsed,
+        ),
+    )
+
+    stream = streams.get("prover")
+    assert stream is not None
+    assert stream.parsed_completion is parsed
+    assert stream.messages[-1] == {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "work",
+        "tool_calls": [
+            {
+                "type": "function",
+                "id": "call_1",
+                "function": {"name": "lookup", "arguments": {"x": 1}},
+            }
+        ],
+    }
+
+
+def test_commit_response_preserves_prompt_state_from_prepared_turn():
+    multi_modal_data = MultiModalData(mm_hashes={"image": ["hash"]})
+    prepared = PreparedTurn(
+        messages=({"role": "user", "content": "solve"},),
+        prompt_ids=(1, 2, 3),
+        message_indices=(0, 0, -1),
+        multi_modal_data=multi_modal_data,
+    )
+
+    streams = StreamSet().commit_response(
+        "prover",
+        prepared,
+        CompletedResponse(
+            completion_ids=[4],
+            completion_logprobs=[-0.3],
+            parsed=ParsedResponse(content="answer"),
+        ),
+    )
+
+    stream = streams.get("prover")
+    assert stream is not None
+    assert stream.prompt_ids == (1, 2, 3)
+    assert stream.prompt_message_indices == (0, 0, -1)
+    assert stream.multi_modal_data is multi_modal_data
+
+
+def test_commit_response_rejects_logprob_length_mismatch():
+    prepared = StreamSet().prepare_append(
+        "prover",
+        [{"role": "user", "content": "solve"}],
+        _FakeRenderer(),
+    )
+
+    try:
+        StreamSet().commit_response(
+            "prover",
+            prepared,
+            CompletedResponse(
+                completion_ids=[7, 8],
+                completion_logprobs=[-0.1],
+                parsed=ParsedResponse(content="answer"),
+            ),
+        )
+    except ValueError as exc:
+        assert "completion_logprobs" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
 
 
 def test_two_streams_bridge_independently_from_shared_prefix():

@@ -50,11 +50,11 @@ def test_trusted_revisions_are_full_shas():
 
 @patch("transformers.AutoTokenizer.from_pretrained")
 def test_unlisted_model_loads_without_remote_code(mock_from_pretrained):
-    """Default path: trust_remote_code=False, no revision pin."""
+    """Default path: trust_remote_code=False, use_fast=True, no revision pin."""
     load_tokenizer("Qwen/Qwen3-0.6B")
     args, kwargs = mock_from_pretrained.call_args
     assert args == ("Qwen/Qwen3-0.6B",)
-    assert kwargs == {"trust_remote_code": False}
+    assert kwargs == {"trust_remote_code": False, "use_fast": True}
 
 
 @patch("transformers.AutoTokenizer.from_pretrained")
@@ -87,8 +87,9 @@ def test_unknown_path_falls_through_to_no_remote_code(mock_from_pretrained):
         load_tokenizer(name)
         args, kwargs = mock_from_pretrained.call_args
         assert args == (name,)
-        assert kwargs == {"trust_remote_code": False}, (
-            f"{name}: unlisted path leaked trust_remote_code=True"
+        assert kwargs == {"trust_remote_code": False, "use_fast": True}, (
+            f"{name}: unlisted path leaked trust_remote_code=True "
+            f"or dropped use_fast=True"
         )
 
 

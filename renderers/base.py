@@ -297,8 +297,23 @@ class Renderer(Protocol):
         """Render messages to token IDs (without attribution metadata)."""
         ...
 
-    def parse_response(self, token_ids: list[int]) -> ParsedResponse:
-        """Parse completion tokens back into a structured message."""
+    def parse_response(
+        self,
+        token_ids: list[int],
+        *,
+        tools: list[ToolSpec] | None = None,
+    ) -> ParsedResponse:
+        """Parse completion tokens back into a structured message.
+
+        ``tools`` is the same list passed to ``render`` for this turn.
+        XML-style formats (Qwen3.5, GLM, MiniMax, Laguna) render argument
+        values verbatim inside ``<arg_value>`` tags with no quoting, so
+        a value like ``true`` is ambiguous between bool and the string
+        ``"true"``. When ``tools`` is supplied, the parser consults each
+        parameter's declared JSON-schema type to preserve string args
+        verbatim. Without ``tools``, parsers fall back to the historical
+        ``json.loads``-with-text-fallback behavior.
+        """
         ...
 
     def get_stop_token_ids(self) -> list[int]:
@@ -603,6 +618,8 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     # Nemotron 3.
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "nemotron-3",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "nemotron-3",
+    # Poolside Laguna.
+    "poolside/Laguna-XS.2": "laguna-xs.2",
     # GPT-OSS.
     "openai/gpt-oss-20b": "gpt-oss",
     "openai/gpt-oss-120b": "gpt-oss",
@@ -739,6 +756,7 @@ def _populate_registry():
     from renderers.gpt_oss import GptOssRenderer
     from renderers.kimi_k2 import KimiK2Renderer
     from renderers.kimi_k25 import KimiK25Renderer
+    from renderers.laguna_xs2 import LagunaXS2Renderer
     from renderers.minimax_m2 import MiniMaxM2Renderer
     from renderers.nemotron3 import Nemotron3Renderer
     from renderers.qwen3 import Qwen3Renderer
@@ -760,6 +778,7 @@ def _populate_registry():
             "deepseek-v3": DeepSeekV3Renderer,
             "kimi-k2": KimiK2Renderer,
             "kimi-k2.5": KimiK25Renderer,
+            "laguna-xs.2": LagunaXS2Renderer,
             "nemotron-3": Nemotron3Renderer,
             "gpt-oss": GptOssRenderer,
         }
@@ -824,8 +843,8 @@ def create_renderer(
         tokenizer: HuggingFace tokenizer instance.
         renderer: Renderer name ('qwen3', 'qwen3-vl', 'qwen3.5', 'qwen3.6',
                   'glm-5', 'glm-5.1', 'glm-4.5', 'minimax-m2', 'deepseek-v3',
-                  'kimi-k2', 'kimi-k2.5', 'nemotron-3', 'gpt-oss', 'default')
-                  or 'auto' to detect from model name.
+                  'kimi-k2', 'kimi-k2.5', 'laguna-xs.2', 'nemotron-3',
+                  'gpt-oss', 'default') or 'auto' to detect from model name.
         tool_parser: Name of a tool parser registered in ``renderers.parsers``.
                   Only consumed by DefaultRenderer. Model-specific renderers
                   have their own parsing wired in.

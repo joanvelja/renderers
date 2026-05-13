@@ -664,7 +664,11 @@ def load_tokenizer(model_name_or_path: str):
             trust_remote_code=True,
             revision=revision,
         )
-    return AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=False)
+    return AutoTokenizer.from_pretrained(
+        model_name_or_path,
+        trust_remote_code=False,
+        use_fast=True,
+    )
 
 
 def _populate_registry():

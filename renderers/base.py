@@ -663,6 +663,7 @@ def load_tokenizer(model_name_or_path: str):
             model_name_or_path,
             trust_remote_code=True,
             revision=revision,
+            use_fast=True,
         )
     return AutoTokenizer.from_pretrained(
         model_name_or_path,

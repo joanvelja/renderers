@@ -67,6 +67,7 @@ def test_kimi_loads_with_pinned_revision(mock_from_pretrained):
     assert kwargs == {
         "trust_remote_code": True,
         "revision": TRUSTED_REVISIONS["moonshotai/Kimi-K2.5"],
+        "use_fast": True,
     }
 
 

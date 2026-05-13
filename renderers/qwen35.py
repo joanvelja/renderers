@@ -439,9 +439,9 @@ class Qwen35Renderer:
                 self._render_tool(
                     messages,
                     i,
-                    content,
                     emit_special=emit_special,
                     emit_text=emit_text,
+                    emit_image=emit_image,
                 )
 
             else:
@@ -545,7 +545,7 @@ class Qwen35Renderer:
         def emit_text(text: str, _msg_idx: int = -1) -> None:
             tokens.extend(self._encode(text))
 
-        def emit_image(part: dict[str, Any]) -> None:
+        def emit_image(part: dict[str, Any], _msg_idx: int = -1) -> None:
             _, out, n, h = self._process_image(part)
             emit_special(self._vision_start)
             offset = len(tokens)
@@ -619,9 +619,9 @@ class Qwen35Renderer:
                 self._render_tool(
                     new_messages,
                     i,
-                    content,
                     emit_special=emit_special,
                     emit_text=emit_text,
+                    emit_image=emit_image,
                 )
             else:
                 return None
@@ -799,16 +799,20 @@ class Qwen35Renderer:
         self,
         messages: list[Message],
         msg_idx: int,
-        content: str,
         *,
         emit_special,
         emit_text,
+        emit_image,
     ) -> None:
-        # Consecutive tool messages are grouped under a single <|im_start|>user block
+        # Consecutive tool messages share a single <|im_start|>user ... <|im_end|>
+        # envelope. Whether to open and close the envelope depends only on the
+        # neighbouring roles, never on the content type of this or any other
+        # tool message — keep this predicate text/media-agnostic.
         prev_is_tool = msg_idx > 0 and messages[msg_idx - 1]["role"] == "tool"
         next_is_tool = (
             msg_idx + 1 < len(messages) and messages[msg_idx + 1]["role"] == "tool"
         )
+        raw_content = messages[msg_idx].get("content")
 
         if not prev_is_tool:
             emit_special(self._im_start, msg_idx)
@@ -816,7 +820,45 @@ class Qwen35Renderer:
 
         emit_text("\n", msg_idx)
         emit_special(self._tool_response, msg_idx)
-        emit_text("\n" + content + "\n", msg_idx)
+
+        if self._content_has_media(raw_content):
+            # Mirror the chat template's ``render_content`` macro for list
+            # content: text segments BPE-encode together up to a media
+            # boundary, then each image emits ``<|vision_start|>`` + N×
+            # ``<|image_pad|>`` + ``<|vision_end|>`` inline.
+            # ``_content_has_media`` returns False unless content is a list,
+            # but the type checker can't follow that through the call.
+            assert isinstance(raw_content, list)
+            buf: list[str] = ["\n"]
+
+            def flush_buf() -> None:
+                if buf:
+                    emit_text("".join(buf), msg_idx)
+                    buf.clear()
+
+            for item in raw_content:
+                if isinstance(item, str):
+                    buf.append(item)
+                elif isinstance(item, dict):
+                    if _is_image_part(item):
+                        flush_buf()
+                        emit_image(item, msg_idx)
+                    elif _is_video_part(item):
+                        raise NotImplementedError(
+                            "Video parts are not yet supported by Qwen35Renderer."
+                        )
+                    elif "text" in item:
+                        buf.append(item["text"])
+                    else:
+                        raise ValueError(f"Unexpected content item: {item}")
+                else:
+                    raise ValueError(f"Unexpected content item: {item}")
+            flush_buf()
+            emit_text("\n", msg_idx)
+        else:
+            content = self._render_content(raw_content).strip()
+            emit_text("\n" + content + "\n", msg_idx)
+
         emit_special(self._tool_response_end, msg_idx)
 
         if not next_is_tool:

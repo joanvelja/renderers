@@ -851,6 +851,7 @@ class KimiK25Renderer:
                     emit_special=emit_special,
                     emit_text=emit_text,
                     emit_ids=emit_ids,
+                    emit_image=emit_image,
                 )
             elif msg.get("content") is not None:
                 # User / other content branches — images allowed.
@@ -1034,6 +1035,7 @@ class KimiK25Renderer:
                     emit_special=emit_special,
                     emit_text=emit_text,
                     emit_ids=emit_ids,
+                    emit_image=emit_image,
                 )
             elif msg.get("content") is not None:
                 self._emit_content(
@@ -1246,6 +1248,7 @@ class KimiK25Renderer:
         emit_special,
         emit_text,
         emit_ids,
+        emit_image=None,
     ) -> None:
         """Emit tool-result body (after the role tag): ``## Return of {id}\\n``
         + content. No ``<|im_end|>``; caller emits that.
@@ -1253,12 +1256,24 @@ class KimiK25Renderer:
         The K2.5 template emits the ``## Return of …`` header unconditionally
         — when ``tool_call_id`` is missing the interpolation yields empty
         string and you get ``## Return of \\n``. We mirror that.
+
+        ``emit_image`` is threaded through to ``_emit_content`` so image parts
+        inside ``content`` lists (browser-agent screenshots, etc.) render as
+        ``<|media_begin|>image<|media_content|><|media_pad|><|media_end|>``
+        inline. Without it those parts are silently dropped.
         """
         tool_call_id = msg.get("tool_call_id") or ""
         emit_text(f"## Return of {tool_call_id}\n", msg_idx)
         content = msg.get("content")
         if content is not None:
-            self._emit_content(content, msg_idx, emit_special, emit_text, emit_ids)
+            self._emit_content(
+                content,
+                msg_idx,
+                emit_special,
+                emit_text,
+                emit_ids,
+                emit_image=emit_image,
+            )
 
     def _normalize_response_tokens(self, response: list[int]) -> list[int]:
         """Restore the synthetic ``<think>`` prefill if the sampler stripped it.

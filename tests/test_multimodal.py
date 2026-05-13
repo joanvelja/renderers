@@ -299,9 +299,140 @@ def _build_cases(make_part, image):
     ]
 
 
+def _build_tool_image_cases(make_part, image):
+    """Tool-message image scenarios. Targets renderers that emit image
+    placeholders inside ``<tool_response>`` blocks. Browser-agent style
+    trajectories produce post-action screenshots as tool responses, so
+    handling images here is load-bearing for that workload."""
+    return [
+        pytest.param(
+            [
+                {"role": "user", "content": "Take a screenshot."},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "screenshot", "arguments": {}},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "c1",
+                    "content": [
+                        {"type": "text", "text": "Screenshot captured."},
+                        make_part(image),
+                    ],
+                },
+            ],
+            False,
+            id="tool_response_with_image",
+        ),
+        pytest.param(
+            [
+                {"role": "user", "content": "Screenshot then describe."},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "screenshot", "arguments": {}},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "c1",
+                    "content": [
+                        {"type": "text", "text": "Done:"},
+                        make_part(image),
+                    ],
+                },
+                {"role": "assistant", "content": "A square."},
+                {"role": "user", "content": "Now show me the next page."},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c2",
+                            "type": "function",
+                            "function": {"name": "screenshot", "arguments": {}},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "c2",
+                    "content": [
+                        {"type": "text", "text": "Next page:"},
+                        make_part(image),
+                    ],
+                },
+            ],
+            False,
+            id="multi_turn_tool_response_images",
+        ),
+        pytest.param(
+            [
+                {"role": "user", "content": "Run a few tools."},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "ping", "arguments": {}},
+                        },
+                        {
+                            "id": "c2",
+                            "type": "function",
+                            "function": {"name": "screenshot", "arguments": {}},
+                        },
+                        {
+                            "id": "c3",
+                            "type": "function",
+                            "function": {"name": "ping", "arguments": {}},
+                        },
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "pong"},
+                {
+                    "role": "tool",
+                    "tool_call_id": "c2",
+                    "content": [
+                        {"type": "text", "text": "Screenshot:"},
+                        make_part(image),
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c3", "content": "pong"},
+            ],
+            False,
+            id="consecutive_tools_mixed_media",
+        ),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Tests.
 # ---------------------------------------------------------------------------
+
+
+def _supports_tool_message_images(renderer) -> bool:
+    """True iff this renderer emits image placeholders inside tool-response
+    content. Renderers without the feature silently drop image parts in tool
+    content; as they grow the feature they get added here and the test starts
+    asserting against them."""
+    from renderers.kimi_k25 import KimiK25Renderer
+    from renderers.qwen35 import Qwen35Renderer
+
+    return isinstance(renderer, (Qwen35Renderer, KimiK25Renderer))
 
 
 @pytest.mark.parametrize(
@@ -510,6 +641,44 @@ def test_modality_registry_models_route_to_renderer():
         assert not type(renderer).__name__.startswith("Default"), (
             f"{model_name} routed to DefaultRenderer despite being in "
             f"MULTIMODAL_MODELS — add it to MODEL_RENDERER_MAP."
+        )
+
+
+@pytest.mark.parametrize(
+    "mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES]
+)
+def test_tool_response_image_byte_parity(mm_model_name, modality, tiny_image):
+    """Tool-message image parity vs ``processor.apply_chat_template`` + ``processor(...)``.
+
+    Browser-agent SFT traces carry post-action screenshots as ``tool``
+    responses. Renderers that drop those image parts silently — historically
+    every Qwen-VL family renderer did — produce token streams that diverge
+    from the HF processor and lose most of the visual learning signal.
+    Skipped for renderers that haven't grown the feature yet; flips to a
+    real assertion as they do.
+    """
+    if modality != "image":
+        pytest.skip("Tool-response media path is image-only for now.")
+    if not _hf_snapshot_cached(mm_model_name):
+        pytest.skip(f"{mm_model_name}: HF snapshot not cached locally")
+
+    kit = _modality_kit(modality, mm_model_name)
+    tokenizer, processor, renderer = _load_processor_and_renderer(mm_model_name)
+
+    if not _supports_tool_message_images(renderer):
+        pytest.skip(
+            f"{type(renderer).__name__} does not yet emit images inside tool responses"
+        )
+
+    for case in _build_tool_image_cases(kit["make_part"], tiny_image):
+        messages, add_gp = case.values
+        ours = renderer.render_ids(messages, add_generation_prompt=add_gp)
+        theirs = kit["processor_input_ids"](processor, messages, add_gp)
+        assert ours == theirs, (
+            f"{mm_model_name} / tool / case={case.id}: "
+            f"renderer diverges from processor.\n"
+            f"  len(ours)={len(ours)} len(theirs)={len(theirs)}\n"
+            f"  ours[:60]={ours[:60]}\n  theirs[:60]={theirs[:60]}"
         )
 
 

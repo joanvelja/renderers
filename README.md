@@ -140,6 +140,13 @@ uv sync --group dev
 uv run pytest
 ```
 
+For quick local checks that do not need model fixtures or the full dev group:
+
+```bash
+UV_PROJECT_ENVIRONMENT=/tmp/renderers-no-dev-venv \
+  uv run --frozen --no-dev --with pytest python -m pytest tests/test_streams.py
+```
+
 Round-trip parity (render → parse → original) and token-level parity against `apply_chat_template` are tested per renderer. End-to-end validation runs against Reverse-Text, Wordle, OpenCode-Math, and RLM-SWE environments.
 
 ## License

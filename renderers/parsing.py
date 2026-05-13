@@ -455,32 +455,38 @@ def parse_laguna_xs2(
     # decoded segment — never a bare ``.strip()``, which would also eat
     # whitespace the model emitted intentionally.
     reasoning = None
+    parse_offset = 0
     think_end = _find(ids, think_end_id)
     if think_end != -1:
         reasoning_ids = ids[:think_end]
         reasoning_ids = [t for t in reasoning_ids if t != think_id]
         reasoning = _decode(tokenizer, reasoning_ids).strip("\n")
         ids = ids[think_end + 1 :]
+        parse_offset = think_end + 1
     elif (think_start := _find(ids, think_id)) != -1:
         reasoning = _decode(tokenizer, ids[think_start + 1 :]).strip("\n")
         return ParsedResponse(
-            content="", reasoning_content=reasoning or None, tool_calls=None
+            content="", reasoning_content=reasoning or None, tool_calls=[]
         )
 
     tc_start = _find(ids, tool_call_id)
+    tool_calls: list[ParsedToolCall] = []
     if tc_start != -1:
         content_text = _decode(tokenizer, ids[:tc_start]).strip("\n")
         tool_calls = _parse_laguna_xs2_tool_calls(
-            tokenizer, ids[tc_start:], tool_call_id, tool_call_end_id
+            tokenizer,
+            ids[tc_start:],
+            tool_call_id,
+            tool_call_end_id,
+            section_offset=parse_offset + tc_start,
         )
     else:
         content_text = _decode(tokenizer, ids).strip("\n")
-        tool_calls = None
 
     return ParsedResponse(
         content=content_text,
         reasoning_content=reasoning or None,
-        tool_calls=tool_calls or None,
+        tool_calls=tool_calls,
     )
 
 
@@ -489,7 +495,9 @@ def _parse_laguna_xs2_tool_calls(
     ids: list[int],
     tc_id: int,
     tc_end_id: int,
-) -> list[dict]:
+    *,
+    section_offset: int,
+) -> list[ParsedToolCall]:
     """Parse Laguna-XS.2 tool calls.
 
     Inside each ``<tool_call>...</tool_call>`` block, the format is::
@@ -504,14 +512,23 @@ def _parse_laguna_xs2_tool_calls(
     """
     import re
 
-    tool_calls: list[dict] = []
+    tool_calls: list[ParsedToolCall] = []
     i = 0
     while i < len(ids):
         if ids[i] == tc_id:
             tc_end = _find(ids, tc_end_id, i + 1)
             if tc_end == -1:
+                raw = _decode(tokenizer, ids[i + 1 :])
+                tool_calls.append(
+                    ParsedToolCall(
+                        raw=raw,
+                        token_span=(section_offset + i, section_offset + len(ids)),
+                        status=ToolCallParseStatus.UNCLOSED_BLOCK,
+                    )
+                )
                 break
             block_text = _decode(tokenizer, ids[i + 1 : tc_end])
+            span = (section_offset + i, section_offset + tc_end + 1)
 
             ak_pos = block_text.find("<arg_key>")
             if ak_pos != -1:
@@ -522,6 +539,7 @@ def _parse_laguna_xs2_tool_calls(
                 args_section = ""
 
             arguments: dict = {}
+            any_json_fallback = False
             for m in re.finditer(
                 r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
                 args_section,
@@ -533,8 +551,24 @@ def _parse_laguna_xs2_tool_calls(
                     arguments[k] = json.loads(v)
                 except (json.JSONDecodeError, ValueError):
                     arguments[k] = v
+                    any_json_fallback = True
 
-            tool_calls.append({"function": {"name": name, "arguments": arguments}})
+            if not name:
+                status = ToolCallParseStatus.MISSING_NAME
+            elif any_json_fallback:
+                status = ToolCallParseStatus.INVALID_JSON
+            else:
+                status = ToolCallParseStatus.OK
+
+            tool_calls.append(
+                ParsedToolCall(
+                    raw=block_text,
+                    name=name or None,
+                    arguments=arguments,
+                    token_span=span,
+                    status=status,
+                )
+            )
             i = tc_end + 1
         else:
             i += 1

@@ -148,8 +148,26 @@ class RenderedTokens:
     """Result of rendering messages to tokens.
 
     Each token carries an index into the original message list so callers can
-    build per-token loss masks without re-rendering.  Tokens from structural
-    scaffolding (generation prompt, im_start/im_end wrapping) carry index -1.
+    build per-token loss masks without re-rendering. Tokens from structural
+    scaffolding the renderer adds outside any single message (e.g. the
+    trailing generation prompt) carry index ``-1``.
+
+    ``sampled_mask`` is a separate per-token signal: ``True`` if the model
+    would have produced this token at inference time (i.e. it appears in
+    the sampled completion), ``False`` if it is template-injected
+    scaffolding the model never emits (``<|im_start|>role\\n`` openers,
+    inter-turn ``\\n`` separators, system / user / tool content from
+    conversation history, etc.). This is distinct from
+    ``message_indices``: a token can belong to an assistant message
+    (``message_indices[k] >= 0``) and still be scaffolding the template
+    adds around the model's actual completion. SFT loss masks should AND
+    both: train on tokens whose role is trainable AND that the model
+    would actually sample.
+
+    Empty ``sampled_mask`` (``[]``) means the renderer doesn't provide
+    this signal — consumers should fall back to attribution-only
+    masking. ``DefaultRenderer`` leaves it empty because the Jinja
+    template is opaque; hand-coded renderers populate it.
 
     ``multi_modal_data`` is populated by multimodal renderers (e.g.
     ``Qwen3VLRenderer``) when image / video content parts are present;
@@ -158,7 +176,162 @@ class RenderedTokens:
 
     token_ids: list[int] = field(default_factory=list)
     message_indices: list[int] = field(default_factory=list)
+    sampled_mask: list[bool] = field(default_factory=list)
+    message_roles: list[str] = field(default_factory=list)
     multi_modal_data: "MultiModalData | None" = None
+
+    def tokens_per_message(
+        self, n_messages: int | None = None, *, sampled_only: bool = False
+    ) -> list[int]:
+        """Count rendered tokens attributed to each caller-relative message.
+
+        ``out[i]`` is the number of tokens with ``message_indices[k] == i``,
+        i.e. tokens the renderer attributed to ``messages[i]``. This
+        includes template scaffolding the renderer wraps around the
+        message — the ``<|im_start|>role\\n`` opener, the closing
+        ``<|im_end|>\\n``, etc. — because those are the renderer's own
+        attribution decision and are preserved verbatim here. Tokens with
+        ``message_indices[k] == -1`` (scaffolding outside any single
+        message, e.g. the trailing generation prompt) are not counted.
+
+        With ``sampled_only=True``, counts only tokens the model would
+        have emitted at inference (``sampled_mask[k] is True``). For
+        example, length-penalty signals in RL: the template wraps each
+        assistant turn in scaffolding tokens (e.g. ``<|im_start|>assistant\\n``,
+        ``<|im_end|>\\n``) that are constant-size and not chosen by the
+        model, so they shouldn't enter the penalty. For roles the model
+        never samples (``user``, ``tool``, ``system``), the
+        ``sampled_only`` count is zero by construction. Renderers that
+        don't populate ``sampled_mask`` (``DefaultRenderer`` — the Jinja
+        template is opaque) return all zeros under ``sampled_only=True``.
+
+        ``n_messages`` defaults to ``len(self.message_roles)``, which
+        every Renderer populates with the caller-relative message list
+        (caller's ``messages`` for ``render()``; ``new_messages`` for
+        ``bridge_to_next_turn()``). Pass it explicitly only to truncate
+        — indices outside ``[0, n_messages)`` are ignored, so passing a
+        smaller value won't raise; it just drops the tail. Values larger
+        than ``len(self.message_roles)`` are clamped, so the returned
+        list never claims more messages than the renderer attributed.
+
+        Works on results from both :meth:`Renderer.render` and
+        :meth:`Renderer.bridge_to_next_turn`. For a bridge result the
+        indices are relative to the new messages the bridge added, not
+        the full conversation history; the prior portion is uniformly
+        ``-1`` (and ``sampled_mask`` uniformly ``False``), so it
+        contributes nothing to either count.
+        """
+        if n_messages is None:
+            n_messages = len(self.message_roles)
+        else:
+            n_messages = min(n_messages, len(self.message_roles))
+        out = [0] * n_messages
+        if sampled_only:
+            if len(self.sampled_mask) != len(self.token_ids):
+                return out
+            for idx, sampled in zip(self.message_indices, self.sampled_mask):
+                if sampled and 0 <= idx < n_messages:
+                    out[idx] += 1
+        else:
+            for idx in self.message_indices:
+                if 0 <= idx < n_messages:
+                    out[idx] += 1
+        return out
+
+    def message_token_spans(self) -> list[tuple[int, int] | None]:
+        """Per-message ``(start, end)`` slices into :attr:`token_ids`.
+
+        ``out[i]`` is the half-open span ``[start, end)`` such that
+        ``token_ids[start:end]`` are the tokens attributed to
+        ``messages[i]`` (or ``new_messages[i]`` for a bridge result).
+        Messages that contributed no tokens get ``None``. Renderer
+        scaffolding outside any message (``message_indices[k] == -1``)
+        is not represented.
+
+        Hand-coded renderers emit each message's tokens contiguously,
+        so the span is well-defined. The implementation tolerates
+        non-contiguous attribution by returning the outer span
+        ``(first_k, last_k + 1)``; if you suspect interleaving, slice
+        ``message_indices`` yourself to verify.
+
+        Returns ``len(self.message_roles)`` entries when ``message_roles``
+        is populated. Otherwise infers the count from
+        ``max(message_indices) + 1`` — useful for manually-constructed
+        ``RenderedTokens`` in tests but only correct when the last
+        message contributed at least one token.
+
+        Cheap to call: single pass over ``message_indices``. Re-call
+        rather than caching the result if you mutate the dataclass.
+        """
+        if self.message_roles:
+            n_messages = len(self.message_roles)
+        else:
+            max_idx = -1
+            for idx in self.message_indices:
+                if idx > max_idx:
+                    max_idx = idx
+            n_messages = max_idx + 1
+
+        firsts: list[int] = [-1] * n_messages
+        lasts: list[int] = [-1] * n_messages
+        for k, idx in enumerate(self.message_indices):
+            if 0 <= idx < n_messages:
+                if firsts[idx] == -1:
+                    firsts[idx] = k
+                lasts[idx] = k
+
+        out: list[tuple[int, int] | None] = []
+        for i in range(n_messages):
+            if firsts[i] == -1:
+                out.append(None)
+            else:
+                out.append((firsts[i], lasts[i] + 1))
+        return out
+
+    def role_token_spans(self) -> dict[str, list[tuple[int, int]]]:
+        """:meth:`message_token_spans` regrouped by ``message_roles``.
+
+        Maps each role appearing in :attr:`message_roles` to a list of
+        ``(start, end)`` spans — one per occurrence of that role, in
+        message order. Messages with no contributed tokens are skipped.
+        Returns an empty dict if :attr:`message_roles` is empty.
+
+        Intended for per-role statistics that operate on per-token
+        signals — e.g. ``logprobs[start:end]`` for each assistant span
+        to compute per-turn perplexity, or
+        ``attention[start:end]`` for tool-response attention analysis.
+        """
+        spans = self.message_token_spans()
+        out: dict[str, list[tuple[int, int]]] = {}
+        for role, span in zip(self.message_roles, spans):
+            if span is None:
+                out.setdefault(role, [])
+                continue
+            out.setdefault(role, []).append(span)
+        return out
+
+    def tokens_by_role(self, *, sampled_only: bool = False) -> dict[str, int]:
+        """Sum :meth:`tokens_per_message` grouped by ``message_roles``.
+
+        Convenience for length-penalty bookkeeping in RL trainers:
+        ``rendered.tokens_by_role(sampled_only=True)["assistant"]`` is
+        the count of tokens the model actually emitted across all
+        assistant turns — template scaffolding excluded.
+        ``rendered.tokens_by_role()["tool"]`` is the raw count of
+        tool-response tokens (``sampled_only`` is zero for ``tool`` by
+        construction since the model never samples those).
+
+        Roles present in :attr:`message_roles` always appear in the
+        returned dict, even with post-filter count ``0``, so callers
+        can index directly without ``KeyError`` on conversations that
+        happen to lack a role. Returns an empty dict if
+        :attr:`message_roles` is empty.
+        """
+        counts = self.tokens_per_message(sampled_only=sampled_only)
+        out: dict[str, int] = {}
+        for role, n in zip(self.message_roles, counts):
+            out[role] = out.get(role, 0) + n
+        return out
 
 
 class ToolCallParseStatus(str, enum.Enum):
@@ -297,8 +470,23 @@ class Renderer(Protocol):
         """Render messages to token IDs (without attribution metadata)."""
         ...
 
-    def parse_response(self, token_ids: list[int]) -> ParsedResponse:
-        """Parse completion tokens back into a structured message."""
+    def parse_response(
+        self,
+        token_ids: list[int],
+        *,
+        tools: list[ToolSpec] | None = None,
+    ) -> ParsedResponse:
+        """Parse completion tokens back into a structured message.
+
+        ``tools`` is the same list passed to ``render`` for this turn.
+        XML-style formats (Qwen3.5, GLM, MiniMax, Laguna) render argument
+        values verbatim inside ``<arg_value>`` tags with no quoting, so
+        a value like ``true`` is ambiguous between bool and the string
+        ``"true"``. When ``tools`` is supplied, the parser consults each
+        parameter's declared JSON-schema type to preserve string args
+        verbatim. Without ``tools``, parsers fall back to the historical
+        ``json.loads``-with-text-fallback behavior.
+        """
         ...
 
     def get_stop_token_ids(self) -> list[int]:
@@ -323,6 +511,25 @@ class Renderer(Protocol):
         begins generating (i.e. equivalent to rendering the full message
         list so far with ``add_generation_prompt=True`` — except prev
         sampled tokens are kept verbatim rather than re-rendered).
+
+        Attribution on the returned ``RenderedTokens``:
+
+        - ``message_indices`` is ``-1`` over the entire prior portion
+          (length ``len(previous_ids)`` after :func:`trim_to_turn_close`)
+          because the bridge gets the prior as raw token lists with no
+          attribution. Over the bridge-added portion, indices are
+          relative to ``new_messages``: a token rendered as part of
+          ``new_messages[i]`` carries ``i``, and inter-turn separators /
+          the trailing generation prompt carry ``-1``. So
+          ``bridge.tokens_per_message(len(new_messages))`` gives the
+          per-new-message token count for length-penalty bookkeeping.
+        - ``sampled_mask`` is uniformly ``False`` across the entire
+          returned sequence. The bridge output is consumed as the next
+          turn's prompt; nothing it emits was model-sampled, and the
+          bridge has no way to recover which prior tokens were. If the
+          caller needs that distinction for the prior portion, they
+          have it directly: every token in ``prev_completion_ids`` was
+          sampled; every token in ``prev_prompt_ids`` was not.
 
         Text-only renderers return :class:`RenderedTokens` with
         ``multi_modal_data=None``. Multimodal renderers (see
@@ -603,6 +810,8 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     # Nemotron 3.
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "nemotron-3",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "nemotron-3",
+    # Poolside Laguna.
+    "poolside/Laguna-XS.2": "laguna-xs.2",
     # GPT-OSS.
     "openai/gpt-oss-20b": "gpt-oss",
     "openai/gpt-oss-120b": "gpt-oss",
@@ -696,37 +905,108 @@ TRUSTED_REVISIONS: dict[str, str] = {
 }
 
 
-def load_tokenizer(model_name_or_path: str):
-    """Load a tokenizer with the renderers-package security policy.
+# Models for which ``fastokens`` is known to diverge from vanilla
+# ``transformers.AutoTokenizer`` and therefore must NOT be patched.
+# Empirical audit ran each entry of ``MODEL_RENDERER_MAP`` through both
+# backends; 31/35 passed byte-identical. The four below either fail to
+# load under fastokens (DeepSeek-V3 family — Metaspace pretokenizer not
+# yet implemented) or are kept defensively pending an upstream fastokens
+# fix (MiniMax-M2 family — see per-entry comments).
+FASTOKENS_INCOMPATIBLE: frozenset[str] = frozenset(
+    {
+        # fastokens 0.1.1: ``ValueError: pre-tokenizer error: unsupported
+        # pre-tokenizer type: Metaspace`` — DeepSeek's tokenizer uses
+        # SentencePiece-style Metaspace pretokenization which fastokens
+        # doesn't yet implement.
+        "deepseek-ai/DeepSeek-V3",
+        "deepseek-ai/DeepSeek-V3-Base",
+        # MiniMax: kept defensive pending upstream fastokens fix
+        # https://github.com/crusoecloud/fastokens/pull/32 — that PR
+        # removes a stray attribute leaked by ``unpatch_transformers``
+        # which steers MiniMax (declared ``tokenizer_class =
+        # 'GPT2Tokenizer'`` → slow→fast conversion path) down a different
+        # load path on subsequent vanilla loads. Once the upstream fix
+        # is released, these two entries can be dropped after re-audit.
+        "MiniMaxAI/MiniMax-M2",
+        "MiniMaxAI/MiniMax-M2.5",
+    }
+)
 
-    Default: ``trust_remote_code=False`` — the safe choice for every
-    model in ``MODEL_RENDERER_MAP`` *except* the Kimi-K2 family.
 
-    Models listed in ``TRUSTED_REVISIONS`` load with
-    ``trust_remote_code=True`` AND ``revision=<pinned sha>`` — required
-    because their tokenizer config has an ``auto_map.AutoTokenizer``
-    entry pointing at a repo-supplied Python class
-    (``tokenization_kimi.TikTokenTokenizer``). Pinning the revision
-    means transformers executes only the reviewed commit's code, not
-    whatever ``HEAD`` points at when the call fires.
+def _patched_load(model_name_or_path: str, **kwargs):
+    """Run ``AutoTokenizer.from_pretrained`` with fastokens patched in
+    process-locally — patch around the load, unpatch right after.
+
+    fastokens captures the loaded backend on a per-tokenizer basis, so
+    after we unpatch the returned tokenizer object continues to use
+    fastokens for ``encode``/``decode`` while subsequent
+    ``AutoTokenizer.from_pretrained`` calls (outside our control) go
+    back to vanilla. This keeps the global side effect minimal.
+    """
+    import fastokens
+    from transformers import AutoTokenizer
+
+    fastokens.patch_transformers()
+    try:
+        return AutoTokenizer.from_pretrained(model_name_or_path, **kwargs)
+    finally:
+        fastokens.unpatch_transformers()
+
+
+def load_tokenizer(
+    model_name_or_path: str,
+    *,
+    use_fastokens: bool = True,
+):
+    """Load a tokenizer with the renderers-package security + perf policy.
+
+    **Security** — default ``trust_remote_code=False``. Models listed in
+    ``TRUSTED_REVISIONS`` (Moonshot Kimi-K2 family) load with
+    ``trust_remote_code=True`` AND a pinned ``revision=<sha>`` so
+    transformers only executes the reviewed commit's tokenizer Python.
+
+    **Performance** — ``use_fastokens=True`` (default) routes the load
+    through ``fastokens.patch_transformers()`` so the resulting tokenizer
+    encodes ~10x faster than vanilla ``tokenizers``. The patch is
+    bracketed: it's applied before ``from_pretrained`` and removed
+    immediately after, so global ``AutoTokenizer.from_pretrained`` calls
+    elsewhere in the user's process are not affected.
+
+    Models in ``FASTOKENS_INCOMPATIBLE`` (DeepSeek-V3 family, MiniMax-M2
+    family) skip the patch — fastokens 0.1.1 either fails to load them
+    or produces token-divergent output. Pass ``use_fastokens=False`` to
+    force the vanilla backend for any other model.
 
     Unknown / fine-tuned model paths fall through to
-    ``trust_remote_code=False``. Callers who legitimately need to load
-    a custom-code tokenizer outside this allow-list should call
-    ``AutoTokenizer.from_pretrained`` themselves and pass the result to
-    ``create_renderer`` (which doesn't load tokenizers — only
-    ``create_renderer_pool`` does).
+    ``trust_remote_code=False`` and the patched-load fast path. If
+    fastokens raises during the patched load (e.g. an unknown
+    pre-tokenizer type), we automatically retry with the vanilla
+    backend and emit an INFO log.
     """
     from transformers import AutoTokenizer
 
+    kwargs: dict[str, Any] = {}
     revision = TRUSTED_REVISIONS.get(model_name_or_path)
     if revision is not None:
-        return AutoTokenizer.from_pretrained(
+        kwargs = {"trust_remote_code": True, "revision": revision}
+    else:
+        kwargs = {"trust_remote_code": False}
+
+    if not use_fastokens or model_name_or_path in FASTOKENS_INCOMPATIBLE:
+        return AutoTokenizer.from_pretrained(model_name_or_path, **kwargs)
+
+    try:
+        return _patched_load(model_name_or_path, **kwargs)
+    except Exception as exc:
+        logger.info(
+            "fastokens could not load %r (%s: %s); falling back to vanilla "
+            "AutoTokenizer. Add this model to FASTOKENS_INCOMPATIBLE in "
+            "renderers.base to suppress the retry.",
             model_name_or_path,
-            trust_remote_code=True,
-            revision=revision,
+            type(exc).__name__,
+            str(exc)[:160],
         )
-    return AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=False)
+        return AutoTokenizer.from_pretrained(model_name_or_path, **kwargs)
 
 
 def _populate_registry():
@@ -739,6 +1019,7 @@ def _populate_registry():
     from renderers.gpt_oss import GptOssRenderer
     from renderers.kimi_k2 import KimiK2Renderer
     from renderers.kimi_k25 import KimiK25Renderer
+    from renderers.laguna_xs2 import LagunaXS2Renderer
     from renderers.minimax_m2 import MiniMaxM2Renderer
     from renderers.nemotron3 import Nemotron3Renderer
     from renderers.qwen3 import Qwen3Renderer
@@ -760,6 +1041,7 @@ def _populate_registry():
             "deepseek-v3": DeepSeekV3Renderer,
             "kimi-k2": KimiK2Renderer,
             "kimi-k2.5": KimiK25Renderer,
+            "laguna-xs.2": LagunaXS2Renderer,
             "nemotron-3": Nemotron3Renderer,
             "gpt-oss": GptOssRenderer,
         }
@@ -824,8 +1106,8 @@ def create_renderer(
         tokenizer: HuggingFace tokenizer instance.
         renderer: Renderer name ('qwen3', 'qwen3-vl', 'qwen3.5', 'qwen3.6',
                   'glm-5', 'glm-5.1', 'glm-4.5', 'minimax-m2', 'deepseek-v3',
-                  'kimi-k2', 'kimi-k2.5', 'nemotron-3', 'gpt-oss', 'default')
-                  or 'auto' to detect from model name.
+                  'kimi-k2', 'kimi-k2.5', 'laguna-xs.2', 'nemotron-3',
+                  'gpt-oss', 'default') or 'auto' to detect from model name.
         tool_parser: Name of a tool parser registered in ``renderers.parsers``.
                   Only consumed by DefaultRenderer. Model-specific renderers
                   have their own parsing wired in.
@@ -928,11 +1210,24 @@ def build_training_sample(
 
     Single render() call + message_indices → per-token mask.
     Replaces build_incremental_token_mask (O(N) renders → O(1)).
+
+    When the renderer populates ``rendered.sampled_mask``, the loss mask
+    is the AND of role-based attribution and the sampled signal: only
+    tokens the model would have produced at inference are trainable.
+    This keeps SFT byte-aligned with the RL trajectory mask (where the
+    prompt / completion split achieves the same effect structurally).
+    Renderers that don't populate ``sampled_mask`` (empty list) fall
+    back to attribution-only masking — every token attributed to a
+    trainable role is trained on, including template-injected
+    ``<|im_start|>role\\n`` openers.
     """
     rendered = renderer.render(messages, tools=tools)
+    has_sampled_info = len(rendered.sampled_mask) == len(rendered.token_ids)
     loss_mask: list[bool] = []
-    for msg_idx in rendered.message_indices:
+    for k, msg_idx in enumerate(rendered.message_indices):
         if msg_idx < 0:
+            loss_mask.append(False)
+        elif has_sampled_info and not rendered.sampled_mask[k]:
             loss_mask.append(False)
         else:
             loss_mask.append(role_to_mask(messages[msg_idx]))

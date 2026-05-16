@@ -24,6 +24,12 @@ dependencies = [
     # OpenAI's reference implementation keeps us byte-identical with vLLM
     # (which also uses it) and saves us mirroring a 330-line Jinja template.
     "openai-harmony>=0.0.8",
+    # Crusoe's Rust BPE tokenizer; ~10x faster encode vs HF's tokenizers.
+    # ``load_tokenizer`` patches it in by default for every supported model
+    # except a small denylist (DeepSeek-V3 family, MiniMax-M2 family). The
+    # patch is bracketed around ``from_pretrained``, so subsequent
+    # ``AutoTokenizer`` calls outside the renderers package stay vanilla.
+    "fastokens>=0.1.1",
 ]
 
 [tool.hatch.version]

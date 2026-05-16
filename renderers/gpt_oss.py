@@ -198,10 +198,45 @@ class GptOssRenderer:
 
         tokens: list[int] = []
         indices: list[int] = []
+        sampled: list[bool] = []
 
-        def emit(ids: list[int], msg_idx: int) -> None:
+        def emit(ids: list[int], msg_idx: int, *, is_sampled: bool) -> None:
             tokens.extend(ids)
             indices.extend([msg_idx] * len(ids))
+            sampled.extend([is_sampled] * len(ids))
+
+        def emit_harmony_message(
+            hm_ids: list[int], msg_idx: int, *, is_assistant: bool
+        ) -> None:
+            """Emit one harmony-rendered message, splitting its tokens into
+            template scaffolding vs model-sampled content.
+
+            Harmony per-message layout:
+                <|start|> role [' to=' recipient] [<|channel|> name] <|message|>
+                <body...>
+                <|end|> | <|return|> | <|call|>
+
+            Everything up to and including ``<|message|>`` is the
+            generation-prompt header the template injects before the
+            model starts sampling. For assistant turns the body and the
+            terminator (``<|end|>`` / ``<|return|>`` / ``<|call|>``) are
+            what the model actually produces, so they are
+            ``is_sampled=True``. For non-assistant turns (user, system,
+            developer, tool) the whole message is conversation history
+            the model never samples — every token is
+            ``is_sampled=False``.
+            """
+            try:
+                msg_marker = hm_ids.index(self._message)
+            except ValueError:
+                # Defensive: a harmony message without <|message|> is
+                # malformed. Treat the whole thing as scaffolding.
+                emit(hm_ids, msg_idx, is_sampled=False)
+                return
+            header = hm_ids[: msg_marker + 1]
+            body = hm_ids[msg_marker + 1 :]
+            emit(header, msg_idx, is_sampled=False)
+            emit(body, msg_idx, is_sampled=is_assistant)
 
         # ── Build harmony prefix (system + developer) ───────────────────
         # When tools are present, harmony's conversation-level renderer
@@ -248,15 +283,17 @@ class GptOssRenderer:
             # Attribute the whole prefix block to first_system_idx if the
             # caller supplied a system message (so its content has *some*
             # caller-relative attribution); otherwise to -1 (pure scaffolding).
+            # The whole prefix is pure template scaffolding — never sampled.
             prefix_origin = first_system_idx if first_system_idx is not None else -1
-            emit(prefix_tokens, prefix_origin)
+            emit(prefix_tokens, prefix_origin, is_sampled=False)
 
         # ── Iterate the rest of the messages ────────────────────────────
         last_idx = len(messages) - 1
         for i, msg in enumerate(messages):
             if i == first_system_idx:
                 continue  # already emitted as developer
-            preserve_thinking = msg.get("role") == "assistant" and (
+            is_assistant = msg.get("role") == "assistant"
+            preserve_thinking = is_assistant and (
                 should_preserve_past_thinking(
                     messages,
                     i,
@@ -267,13 +304,15 @@ class GptOssRenderer:
             for hm in self._to_harmony_messages(
                 msg, preserve_thinking=preserve_thinking
             ):
-                emit(self._enc.render(hm), i)
+                emit_harmony_message(self._enc.render(hm), i, is_assistant=is_assistant)
 
         # When the conversation ends on an assistant final-channel turn,
         # ``apply_chat_template`` (and ``render_conversation_for_training``)
         # close it with ``<|return|>`` instead of ``<|end|>`` to mark the
         # final assistant turn as terminal. Per-message rendering always
-        # uses ``<|end|>``, so patch it here when applicable.
+        # uses ``<|end|>``, so patch it here when applicable. The sampled
+        # bit on the terminator slot stays True — both ``<|end|>`` and
+        # ``<|return|>`` are stop signals the model emits.
         if (
             not add_generation_prompt
             and last_idx >= 0
@@ -285,14 +324,20 @@ class GptOssRenderer:
             tokens[-1] = self._return
 
         # ── Generation prompt: <|start|>assistant<|channel|>analysis<|message|>
+        # Pure template scaffolding the model continues from — never sampled.
         if add_generation_prompt:
-            emit([self._start], -1)
-            emit(self._encode("assistant"), -1)
-            emit([self._channel], -1)
-            emit(self._encode("analysis"), -1)
-            emit([self._message], -1)
+            emit([self._start], -1, is_sampled=False)
+            emit(self._encode("assistant"), -1, is_sampled=False)
+            emit([self._channel], -1, is_sampled=False)
+            emit(self._encode("analysis"), -1, is_sampled=False)
+            emit([self._message], -1, is_sampled=False)
 
-        return RenderedTokens(token_ids=tokens, message_indices=indices)
+        return RenderedTokens(
+            token_ids=tokens,
+            message_indices=indices,
+            sampled_mask=sampled,
+            message_roles=[m.get("role") or "" for m in messages],
+        )
 
     def render_ids(
         self,
@@ -307,7 +352,12 @@ class GptOssRenderer:
             add_generation_prompt=add_generation_prompt,
         ).token_ids
 
-    def parse_response(self, token_ids: list[int]) -> ParsedResponse:
+    def parse_response(
+        self,
+        token_ids: list[int],
+        *,
+        tools: list[ToolSpec] | None = None,  # noqa: ARG002 — harmony args land in a JSON object, schema not needed
+    ) -> ParsedResponse:
         return parse_gpt_oss(
             self._tokenizer,
             token_ids,
@@ -353,22 +403,38 @@ class GptOssRenderer:
         if previous_ids is None:
             return None
 
+        # Bridge populates ``message_indices`` (relative to ``new_messages``)
+        # and ``sampled_mask`` (uniformly ``False``). The harmony encoder
+        # renders each ``new_messages[i]`` as a single block, so every
+        # token in that block carries index ``i``; the trailing
+        # generation prompt uses ``-1``.
         ext: list[int] = []
-        for msg in new_messages:
+        ext_indices: list[int] = []
+        for i, msg in enumerate(new_messages):
             role = msg.get("role")
             if role not in ("tool", "user", "system", "developer"):
                 return None
             for hm in self._to_harmony_messages(msg):
-                ext.extend(self._enc.render(hm))
+                ids = self._enc.render(hm)
+                ext.extend(ids)
+                ext_indices.extend([i] * len(ids))
 
         # Generation prompt: <|start|>assistant<|channel|>analysis<|message|>
+        gen_before = len(ext)
         ext.append(self._start)
         ext.extend(self._encode("assistant"))
         ext.append(self._channel)
         ext.extend(self._encode("analysis"))
         ext.append(self._message)
+        ext_indices.extend([-1] * (len(ext) - gen_before))
 
-        return RenderedTokens(token_ids=previous_ids + ext)
+        total_len = len(previous_ids) + len(ext)
+        return RenderedTokens(
+            token_ids=previous_ids + ext,
+            message_indices=[-1] * len(previous_ids) + ext_indices,
+            sampled_mask=[False] * total_len,
+            message_roles=[m.get("role") or "" for m in new_messages],
+        )
 
     # ── message conversion ───────────────────────────────────────────────────
 

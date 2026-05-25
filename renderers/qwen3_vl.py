@@ -46,6 +46,7 @@ from renderers.base import (
     reject_assistant_in_extension,
     trim_to_turn_close,
 )
+from renderers.configs import Qwen3VLRendererConfig
 from renderers.parsing import parse_qwen3
 
 _TOOLS_HEADER = (
@@ -291,35 +292,30 @@ class Qwen3VLRenderer:
 
     Constructor args:
         tokenizer: HF tokenizer for the model.
+        config: Typed renderer config (see
+            :class:`renderers.Qwen3VLRendererConfig`). Defaults to a
+            blank config with template defaults.
         processor: Optional ``Qwen3VLProcessor``. Required when rendering
             messages that contain image / video parts. If not supplied,
             the renderer lazy-loads it via ``AutoProcessor.from_pretrained``
             keyed off ``tokenizer.name_or_path`` the first time a
             multimodal part is seen.
-        preserve_all_thinking / preserve_thinking_between_tool_calls:
-            No-ops on Qwen3-VL — the chat template already drops past
-            ``<think>`` blocks unconditionally. Stored for Protocol parity.
-        image_cache_max: Max entries in the per-instance image-processor
-            cache (FIFO eviction). Default 256 covers typical RL pools
-            (``rollouts_per_example`` × in-flight examples). Bump for runs
-            with large image sets where the working set exceeds the cap.
+
+    ``preserve_all_thinking`` / ``preserve_thinking_between_tool_calls``
+    on the config are no-ops here — the chat template drops past
+    ``<think>`` blocks unconditionally. Stored for Protocol parity.
     """
 
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
+        config: Qwen3VLRendererConfig | None = None,
         *,
         processor: Any = None,
-        preserve_all_thinking: bool = False,
-        preserve_thinking_between_tool_calls: bool = False,
-        image_cache_max: int = 256,
     ):
         self._tokenizer = tokenizer
         self._processor = processor
-        self._preserve_all_thinking = preserve_all_thinking
-        self._preserve_thinking_between_tool_calls = (
-            preserve_thinking_between_tool_calls
-        )
+        self.config = config or Qwen3VLRendererConfig()
 
         self._im_start = self._token_id("<|im_start|>")
         self._im_end = self._token_id("<|im_end|>")
@@ -342,7 +338,6 @@ class Qwen3VLRenderer:
         # tuples of ``(processor_out, num_image_tokens)`` — bounded to
         # avoid unbounded growth on long-lived pools.
         self._image_cache: dict[str, tuple[Any, int]] = {}
-        self._image_cache_max = image_cache_max
 
     def _token_id(self, token: str) -> int:
         tid = self._tokenizer.convert_tokens_to_ids(token)
@@ -431,7 +426,7 @@ class Qwen3VLRenderer:
         grid_thw = out["image_grid_thw"][0]
         merge_size = proc.image_processor.merge_size
         num_image_tokens = int(grid_thw.prod()) // (merge_size * merge_size)
-        if len(self._image_cache) >= self._image_cache_max:
+        if len(self._image_cache) >= self.config.image_cache_max:
             # FIFO eviction — Python dicts preserve insertion order, so
             # ``next(iter(...))`` is the oldest key.
             self._image_cache.pop(next(iter(self._image_cache)))
@@ -452,6 +447,12 @@ class Qwen3VLRenderer:
         mm_hashes: dict[str, list[str]] = {}
         mm_placeholders: dict[str, list[PlaceholderRange]] = {}
         mm_items: dict[str, list[dict[str, Any]]] = {}
+        # ``add_vision_id`` mirrors the Jinja's ``image_count`` /
+        # ``video_count`` namespaces. Counters are 1-indexed and run
+        # across the entire conversation; they increment unconditionally
+        # on each image / video (the Qwen3-VL template increments first,
+        # then emits ``Picture N: `` only when ``add_vision_id`` is set).
+        vision_counts = {"image": 0, "video": 0}
 
         def emit_image(part: dict[str, Any]) -> None:
             # Image placeholders are prompt-side scaffolding the user
@@ -462,6 +463,13 @@ class Qwen3VLRenderer:
             # the surrounding ``<|vision_start|>`` / ``<|vision_end|>``
             # markers are renderer-emitted scaffold.
             _, out, n, h = self._process_image(part)
+            vision_counts["image"] += 1
+            if self.config.add_vision_id:
+                em.text(
+                    f"Picture {vision_counts['image']}: ",
+                    is_sampled=False,
+                    is_content=False,
+                )
             em.special(self._vision_start, is_sampled=False, is_content=False)
             offset = em.cursor()
             for _ in range(n):
@@ -663,6 +671,23 @@ class Qwen3VLRenderer:
         if previous_ids is None:
             return None
 
+        # ``add_vision_id`` numbers placeholders across the whole
+        # conversation. The bridge can only seed that counter from
+        # ``previous_multi_modal_data`` (raw prior token ids don't carry
+        # the image/video count back), so if the caller asks for
+        # ``add_vision_id=True`` while omitting prior mm-data on a
+        # conversation that already contains images, the bridged
+        # output would silently emit ``Picture 1:`` again. Refuse the
+        # bridge in that case — the caller falls back to a full
+        # re-render, which has the full message list and counts
+        # correctly.
+        if (
+            self.config.add_vision_id
+            and previous_multi_modal_data is None
+            and self._vision_start in previous_ids
+        ):
+            return None
+
         # Bridge populates ``message_indices`` (relative to ``new_messages``)
         # and ``sampled_mask`` (uniformly ``False`` — every token the
         # bridge emits is template scaffolding for the next prompt, not
@@ -685,9 +710,30 @@ class Qwen3VLRenderer:
         new_hashes: dict[str, list[str]] = {}
         new_placeholders: dict[str, list[PlaceholderRange]] = {}
         new_items: dict[str, list[dict[str, Any]]] = {}
+        # Seed the vision counters from any prior-turn images / videos
+        # the bridge was handed via ``previous_multi_modal_data``. The
+        # ``add_vision_id`` template numbers placeholders across the
+        # whole conversation, so a new turn's first image is
+        # ``Picture {prev_total + 1}``. The bridge can't recover this
+        # count from raw token ids, so callers must thread
+        # ``previous_multi_modal_data`` through when they want
+        # ``add_vision_id`` parity across turns.
+        prev_image_count = 0
+        prev_video_count = 0
+        if previous_multi_modal_data is not None:
+            prev_image_count = len(previous_multi_modal_data.mm_items.get("image", []))
+            prev_video_count = len(previous_multi_modal_data.mm_items.get("video", []))
+        vision_counts = {"image": prev_image_count, "video": prev_video_count}
 
         def emit_image(part: dict[str, Any]) -> None:
             _, out, n, h = self._process_image(part)
+            vision_counts["image"] += 1
+            if self.config.add_vision_id:
+                em.text(
+                    f"Picture {vision_counts['image']}: ",
+                    is_sampled=False,
+                    is_content=False,
+                )
             em.special(self._vision_start, is_sampled=False, is_content=False)
             offset = em.cursor()
             for _ in range(n):

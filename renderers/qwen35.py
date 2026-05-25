@@ -31,6 +31,7 @@ from renderers.base import (
     should_preserve_past_thinking,
     trim_to_turn_close,
 )
+from renderers.configs import Qwen35RendererConfig
 from renderers.parsing import parse_qwen35
 from renderers.qwen3_vl import (
     _image_hash,
@@ -103,25 +104,27 @@ def _detect_enable_thinking_default(tokenizer: PreTrainedTokenizer) -> bool:
 class Qwen35Renderer:
     """Deterministic message → token renderer for Qwen3.5 models."""
 
+    _config_cls: type = Qwen35RendererConfig
+
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
+        config: Qwen35RendererConfig | None = None,
         *,
         processor: Any = None,
-        enable_thinking: bool | None = None,
-        preserve_all_thinking: bool = False,
-        preserve_thinking_between_tool_calls: bool = False,
-        image_cache_max: int = 256,
     ):
         self._tokenizer = tokenizer
         self._processor = processor
-        if enable_thinking is None:
-            enable_thinking = _detect_enable_thinking_default(tokenizer)
-        self._enable_thinking = enable_thinking
-        self._preserve_all_thinking = preserve_all_thinking
-        self._preserve_thinking_between_tool_calls = (
-            preserve_thinking_between_tool_calls
-        )
+        cfg = config or type(self)._config_cls()
+        # ``enable_thinking=None`` defers to the tokenizer's chat-template
+        # default (Instruct → off, Thinking → on). Materialise here so
+        # downstream reads see a concrete bool; rebind the config with
+        # the resolved value so introspection sees the same.
+        if cfg.enable_thinking is None:
+            cfg = cfg.model_copy(
+                update={"enable_thinking": _detect_enable_thinking_default(tokenizer)}
+            )
+        self.config = cfg
 
         # Look up special token IDs from the tokenizer (not hardcoded)
         self._im_start = self._token_id("<|im_start|>")
@@ -142,7 +145,6 @@ class Qwen35Renderer:
         # rationale (FIFO-bounded; same image seen across rollouts /
         # bridge re-renders).
         self._image_cache: dict[str, tuple[Any, int]] = {}
-        self._image_cache_max = image_cache_max
 
     @property
     def mm_token_type_id_map(self) -> dict[int, int]:
@@ -187,7 +189,7 @@ class Qwen35Renderer:
         grid_thw = out["image_grid_thw"][0]
         merge_size = proc.image_processor.merge_size
         num_image_tokens = int(grid_thw.prod()) // (merge_size * merge_size)
-        if len(self._image_cache) >= self._image_cache_max:
+        if len(self._image_cache) >= self.config.image_cache_max:
             self._image_cache.pop(next(iter(self._image_cache)))
         self._image_cache[h] = (out, num_image_tokens)
         return pil, out, num_image_tokens, h
@@ -296,6 +298,13 @@ class Qwen35Renderer:
         mm_hashes: dict[str, list[str]] = {}
         mm_placeholders: dict[str, list[PlaceholderRange]] = {}
         mm_items: dict[str, list[dict[str, Any]]] = {}
+        # 1-indexed counters for ``add_vision_id`` (mirrors the Jinja's
+        # ``image_count`` / ``video_count`` namespaces). Increment only
+        # in the main message loop — the template renders the system
+        # message with ``do_vision_count=False`` and would raise on
+        # vision in system content anyway, so the renderer's
+        # ``emit_image`` is only reached from user / tool emission paths.
+        vision_counts = {"image": 0, "video": 0}
 
         def emit_ids(
             ids: list[int], msg_idx: int, *, is_sampled: bool, is_content: bool
@@ -350,6 +359,14 @@ class Qwen35Renderer:
             # the surrounding ``<|vision_start|>`` / ``<|vision_end|>``
             # specials are template scaffold.
             _, out, n, h = self._process_image(part)
+            vision_counts["image"] += 1
+            if self.config.add_vision_id:
+                emit_text(
+                    f"Picture {vision_counts['image']}: ",
+                    msg_idx,
+                    is_sampled=False,
+                    is_content=False,
+                )
             emit_special(
                 self._vision_start, msg_idx, is_sampled=False, is_content=False
             )
@@ -488,8 +505,8 @@ class Qwen35Renderer:
                 preserve_thinking = should_preserve_past_thinking(
                     messages,
                     i,
-                    preserve_all_thinking=self._preserve_all_thinking,
-                    preserve_thinking_between_tool_calls=self._preserve_thinking_between_tool_calls,
+                    preserve_all_thinking=self.config.preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=self.config.preserve_thinking_between_tool_calls,
                 )
                 self._render_assistant(
                     msg,
@@ -520,7 +537,7 @@ class Qwen35Renderer:
         if add_generation_prompt:
             emit_special(self._im_start, -1, is_sampled=False, is_content=False)
             emit_text("assistant\n", -1, is_sampled=False, is_content=False)
-            if self._enable_thinking:
+            if self.config.enable_thinking:
                 emit_special(self._think, -1, is_sampled=False, is_content=False)
                 emit_text("\n", -1, is_sampled=False, is_content=False)
             else:
@@ -604,6 +621,23 @@ class Qwen35Renderer:
         if previous_ids is None:
             return None
 
+        # ``add_vision_id`` numbers placeholders across the whole
+        # conversation. The bridge can only seed that counter from
+        # ``previous_multi_modal_data`` (raw prior token ids don't carry
+        # the image/video count back), so if the caller asks for
+        # ``add_vision_id=True`` while omitting prior mm-data on a
+        # conversation that already contains images, the bridged
+        # output would silently emit ``Picture 1:`` again. Refuse the
+        # bridge in that case — the caller falls back to a full
+        # re-render, which has the full message list and counts from
+        # scratch correctly.
+        if (
+            self.config.add_vision_id
+            and previous_multi_modal_data is None
+            and self._vision_start in previous_ids
+        ):
+            return None
+
         # Seed combined-token list with prior turn so placeholder offsets
         # are absolute in the bridged sequence (matching ``render()``).
         # Parallel ``indices``/``sampled`` are seeded with ``-1``/``False``
@@ -622,6 +656,17 @@ class Qwen35Renderer:
         new_hashes: dict[str, list[str]] = {}
         new_placeholders: dict[str, list[PlaceholderRange]] = {}
         new_items: dict[str, list[dict[str, Any]]] = {}
+        # Seed the ``add_vision_id`` counters from prior-turn images / videos
+        # so the bridged turn's first placeholder gets ``Picture {prev+1}``.
+        # Bridges can't recover the count from raw token ids, so callers
+        # must thread ``previous_multi_modal_data`` through to keep
+        # ``add_vision_id`` parity across turns.
+        prev_image_count = 0
+        prev_video_count = 0
+        if previous_multi_modal_data is not None:
+            prev_image_count = len(previous_multi_modal_data.mm_items.get("image", []))
+            prev_video_count = len(previous_multi_modal_data.mm_items.get("video", []))
+        vision_counts = {"image": prev_image_count, "video": prev_video_count}
 
         def emit_special(
             token_id: int,
@@ -664,6 +709,9 @@ class Qwen35Renderer:
 
         def emit_image(part: dict[str, Any], msg_idx: int = -1) -> None:
             _, out, n, h = self._process_image(part)
+            vision_counts["image"] += 1
+            if self.config.add_vision_id:
+                emit_text(f"Picture {vision_counts['image']}: ", msg_idx)
             emit_special(self._vision_start, msg_idx)
             offset = len(tokens)
             for _ in range(n):
@@ -755,7 +803,7 @@ class Qwen35Renderer:
         # Generation prompt — matches the gen-prompt branch of ``render()``.
         emit_special(self._im_start, -1)
         emit_text("assistant\n", -1)
-        if self._enable_thinking:
+        if self.config.enable_thinking:
             emit_special(self._think, -1)
             emit_text("\n", -1)
         else:

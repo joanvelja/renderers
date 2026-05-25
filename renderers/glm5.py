@@ -25,6 +25,7 @@ from renderers.base import (
     reject_assistant_in_extension,
     should_preserve_past_thinking,
 )
+from renderers.configs import GLM5RendererConfig, GLM51RendererConfig
 from renderers.parsing import parse_glm
 
 _TOOLS_HEADER = (
@@ -54,20 +55,18 @@ class GLM5Renderer:
     # GLM51Renderer; GLM-5 proper keeps this off.
     empty_think_on_last_assistant: bool = False
 
+    # GLM-5.1 uses the same template surface and binds the same kwargs.
+    # Subclassed in ``GLM51Renderer`` so the registry can dispatch on the
+    # ``glm-5.1`` discriminator while sharing this implementation.
+    _config_cls: type = GLM5RendererConfig
+
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
-        *,
-        enable_thinking: bool = True,
-        preserve_all_thinking: bool = False,
-        preserve_thinking_between_tool_calls: bool = False,
+        config: GLM5RendererConfig | GLM51RendererConfig | None = None,
     ):
         self._tokenizer = tokenizer
-        self._enable_thinking = enable_thinking
-        self._preserve_all_thinking = preserve_all_thinking
-        self._preserve_thinking_between_tool_calls = (
-            preserve_thinking_between_tool_calls
-        )
+        self.config = config or type(self)._config_cls()
 
         self._gmask = self._token_id("[gMASK]")
         self._sop = self._token_id("<sop>")
@@ -220,8 +219,8 @@ class GLM5Renderer:
                 preserve_thinking = should_preserve_past_thinking(
                     messages,
                     i,
-                    preserve_all_thinking=self._preserve_all_thinking,
-                    preserve_thinking_between_tool_calls=self._preserve_thinking_between_tool_calls,
+                    preserve_all_thinking=self.config.preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=self.config.preserve_thinking_between_tool_calls,
                 )
                 self._render_assistant(
                     msg,
@@ -250,7 +249,7 @@ class GLM5Renderer:
         # them. Always is_sampled=False / is_content=False.
         if add_generation_prompt:
             emit_special(self._assistant, -1, is_sampled=False, is_content=False)
-            if self._enable_thinking:
+            if self.config.enable_thinking:
                 emit_special(self._think, -1, is_sampled=False, is_content=False)
             else:
                 emit_special(self._think_end, -1, is_sampled=False, is_content=False)
@@ -409,7 +408,7 @@ class GLM5Renderer:
 
         # Generation prompt — match the gen-prompt branch of ``render()``.
         emit_special(self._assistant, -1)
-        if self._enable_thinking:
+        if self.config.enable_thinking:
             emit_special(self._think, -1)
         else:
             emit_special(self._think_end, -1)
@@ -463,9 +462,14 @@ class GLM5Renderer:
         # ``preserve_thinking`` is the override output of
         # ``should_preserve_past_thinking`` — it adds historical assistants
         # back when the renderer was constructed with
-        # ``preserve_all_thinking=True``.
+        # ``preserve_all_thinking=True``. ``clear_thinking=False`` mirrors
+        # the template's per-call ``clear_thinking is defined and not
+        # clear_thinking`` gate: a chat_template_kwarg surface for the
+        # same behaviour, gated explicitly by the caller per render.
         include_thinking = (
-            msg_idx > last_user_index or preserve_thinking
+            msg_idx > last_user_index
+            or preserve_thinking
+            or not self.config.clear_thinking
         ) and reasoning_content
 
         if include_thinking:
@@ -478,13 +482,23 @@ class GLM5Renderer:
                 reasoning_content.strip(), msg_idx, is_sampled=True, is_content=True
             )
             emit_special(self._think_end, msg_idx, is_sampled=True, is_content=True)
-        elif self.empty_think_on_last_assistant and msg_idx > last_user_index:
+        elif (
+            self.empty_think_on_last_assistant
+            and msg_idx > last_user_index
+            and self.config.enable_thinking
+        ):
             # GLM-5.1: wrap the last assistant with an empty <think></think>
             # even without reasoning, matching the Jinja template. With
             # ``enable_thinking=True`` the gen prompt already includes
             # ``<think>``; the model then samples ``</think>`` to close an
             # empty think block. So ``<think>`` is scaffolding,
             # ``</think>`` is sampled.
+            #
+            # When ``enable_thinking=False`` the GLM-5.1 template skips
+            # the opening ``<think>`` for the most-recent assistant too
+            # — it emits only the lone ``</think>`` separator (and the
+            # gen prompt likewise switches to ``</think>``). Fall
+            # through to the else branch below so we match.
             emit_special(self._think, msg_idx, is_sampled=False, is_content=False)
             emit_special(self._think_end, msg_idx, is_sampled=True, is_content=True)
         else:
@@ -587,6 +601,7 @@ class GLM51Renderer(GLM5Renderer):
     """
 
     empty_think_on_last_assistant = True
+    _config_cls = GLM51RendererConfig
 
     @staticmethod
     def _format_tool_spec(tool: ToolSpec) -> str:

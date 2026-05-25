@@ -26,11 +26,8 @@ from renderers.base import (
     should_preserve_past_thinking,
     trim_to_turn_close,
 )
+from renderers.configs import MiniMaxM2RendererConfig
 from renderers.parsing import parse_minimax
-
-_DEFAULT_SYSTEM = (
-    "You are a helpful assistant. Your name is MiniMax-M2.5 and is built by MiniMax."
-)
 
 _TOOLS_HEADER = (
     "\n\n# Tools\n"
@@ -59,17 +56,10 @@ class MiniMaxM2Renderer:
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
-        *,
-        default_system: str = _DEFAULT_SYSTEM,
-        preserve_all_thinking: bool = False,
-        preserve_thinking_between_tool_calls: bool = False,
+        config: MiniMaxM2RendererConfig | None = None,
     ):
         self._tokenizer = tokenizer
-        self._default_system = default_system
-        self._preserve_all_thinking = preserve_all_thinking
-        self._preserve_thinking_between_tool_calls = (
-            preserve_thinking_between_tool_calls
-        )
+        self.config = config or MiniMaxM2RendererConfig()
 
         self._bos = self._token_id("]~!b[")
         self._role = self._token_id("]~b]")
@@ -204,7 +194,7 @@ class MiniMaxM2Renderer:
         if sys_content:
             sys_segments.append((sys_content, True))
         else:
-            sys_segments.append((self._default_system, False))
+            sys_segments.append((self.config.model_identity, False))
 
         if tools:
             sys_segments.append((_TOOLS_HEADER, False))
@@ -249,8 +239,8 @@ class MiniMaxM2Renderer:
                 preserve_thinking = should_preserve_past_thinking(
                     messages,
                     orig_idx,
-                    preserve_all_thinking=self._preserve_all_thinking,
-                    preserve_thinking_between_tool_calls=self._preserve_thinking_between_tool_calls,
+                    preserve_all_thinking=self.config.preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=self.config.preserve_thinking_between_tool_calls,
                 )
                 self._render_assistant(
                     msg,

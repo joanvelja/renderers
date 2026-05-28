@@ -9,9 +9,7 @@ parsers are plugged in.
 from __future__ import annotations
 
 import json
-from typing import Any
-
-from transformers.tokenization_utils import PreTrainedTokenizer
+from typing import TYPE_CHECKING, Any
 
 from renderers.base import (
     Message,
@@ -24,6 +22,9 @@ from renderers.parsers import (
     get_reasoning_parser,
     get_tool_parser,
 )
+
+if TYPE_CHECKING:
+    from transformers.tokenization_utils import PreTrainedTokenizer
 
 
 def _decode_tool_call_arguments(messages: list) -> list:

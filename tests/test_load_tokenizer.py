@@ -8,11 +8,12 @@ repo doesn't auto-propagate.
 
 from __future__ import annotations
 
+import logging
 import re
+import warnings
 from unittest.mock import patch
 
 from renderers.base import TRUSTED_REVISIONS, load_tokenizer
-
 
 # ---------------------------------------------------------------------------
 # Allow-list shape
@@ -54,7 +55,8 @@ def test_unlisted_model_loads_without_remote_code(mock_from_pretrained):
     load_tokenizer("Qwen/Qwen3-0.6B")
     args, kwargs = mock_from_pretrained.call_args
     assert args == ("Qwen/Qwen3-0.6B",)
-    assert kwargs == {"trust_remote_code": False}
+    assert kwargs["trust_remote_code"] is False
+    assert kwargs["config"].model_type == "qwen3"
 
 
 @patch("transformers.AutoTokenizer.from_pretrained")
@@ -64,10 +66,9 @@ def test_kimi_loads_with_pinned_revision(mock_from_pretrained):
     load_tokenizer("moonshotai/Kimi-K2.5")
     args, kwargs = mock_from_pretrained.call_args
     assert args == ("moonshotai/Kimi-K2.5",)
-    assert kwargs == {
-        "trust_remote_code": True,
-        "revision": TRUSTED_REVISIONS["moonshotai/Kimi-K2.5"],
-    }
+    assert kwargs["trust_remote_code"] is True
+    assert kwargs["revision"] == TRUSTED_REVISIONS["moonshotai/Kimi-K2.5"]
+    assert kwargs["config"] is not None
 
 
 @patch("transformers.AutoTokenizer.from_pretrained")
@@ -87,9 +88,7 @@ def test_unknown_path_falls_through_to_no_remote_code(mock_from_pretrained):
         load_tokenizer(name)
         args, kwargs = mock_from_pretrained.call_args
         assert args == (name,)
-        assert kwargs == {"trust_remote_code": False}, (
-            f"{name}: unlisted path leaked trust_remote_code=True"
-        )
+        assert kwargs["trust_remote_code"] is False, f"{name}: unlisted path leaked trust_remote_code=True"
 
 
 # ---------------------------------------------------------------------------
@@ -116,3 +115,18 @@ def test_load_tokenizer_real_kimi_uses_pinned_revision():
     assert tok is not None
     ids = tok.encode("hello", add_special_tokens=False)
     assert len(ids) > 0
+
+
+def test_load_tokenizer_olmo3_normalizes_legacy_rope_config(caplog):
+    """OLMo3's Hub config is Transformers-4.x shaped; load without 5.x RoPE warnings."""
+    caplog.set_level(logging.WARNING)
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        tok = load_tokenizer("allenai/Olmo-3-7B-Instruct-DPO", use_fastokens=False)
+
+    assert tok is not None
+    assert "rope_parameters`'s beta_fast field must be a float" not in caplog.text
+    assert "rope_parameters`'s beta_slow field must be a float" not in caplog.text
+    warning_text = "\n".join(str(w.message) for w in captured)
+    assert "SwigPyPacked" not in warning_text
+    assert "SwigPyObject" not in warning_text

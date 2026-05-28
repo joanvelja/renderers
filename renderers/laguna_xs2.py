@@ -26,8 +26,7 @@ Main properties:
 from __future__ import annotations
 
 import json
-
-from transformers.tokenization_utils import PreTrainedTokenizer
+from typing import TYPE_CHECKING
 
 from renderers.base import (
     Content,
@@ -40,6 +39,9 @@ from renderers.base import (
 )
 from renderers.configs import LagunaXS2RendererConfig
 from renderers.parsing import parse_laguna_xs2
+
+if TYPE_CHECKING:
+    from transformers.tokenization_utils import PreTrainedTokenizer
 
 _DEFAULT_SYSTEM_MESSAGE = (
     "You are a helpful, conversationally-fluent assistant made by Poolside. "

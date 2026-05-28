@@ -30,10 +30,8 @@ import base64
 import hashlib
 import io
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
-
-from transformers.tokenization_utils import PreTrainedTokenizer
 
 from renderers.base import (
     Message,
@@ -48,6 +46,9 @@ from renderers.base import (
 )
 from renderers.configs import Qwen3VLRendererConfig
 from renderers.parsing import parse_qwen3
+
+if TYPE_CHECKING:
+    from transformers.tokenization_utils import PreTrainedTokenizer
 
 _TOOLS_HEADER = (
     "# Tools\n\n"

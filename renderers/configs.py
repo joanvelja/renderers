@@ -265,6 +265,18 @@ class GptOssRendererConfig(BaseRendererConfig):
     )
 
 
+class Olmo3RendererConfig(BaseRendererConfig):
+    """OLMo 3 renderer config."""
+
+    name: Literal["olmo3"] = "olmo3"
+
+
+class Gemma4RendererConfig(BaseRendererConfig):
+    """Gemma 4 renderer config."""
+
+    name: Literal["gemma4"] = "gemma4"
+
+
 class KimiK2RendererConfig(BaseRendererConfig):
     """Kimi K2 renderer config.
 
@@ -383,6 +395,8 @@ RendererConfig = Annotated[
         LagunaXS2RendererConfig,
         MiniMaxM2RendererConfig,
         Nemotron3RendererConfig,
+        Olmo3RendererConfig,
+        Gemma4RendererConfig,
         DeepSeekV3RendererConfig,
     ],
     Field(discriminator="name"),
@@ -417,6 +431,8 @@ _CONFIG_BY_NAME: dict[str, type[BaseRendererConfig]] = {
     "laguna-xs.2": LagunaXS2RendererConfig,
     "minimax-m2": MiniMaxM2RendererConfig,
     "nemotron-3": Nemotron3RendererConfig,
+    "olmo3": Olmo3RendererConfig,
+    "gemma4": Gemma4RendererConfig,
     "deepseek-v3": DeepSeekV3RendererConfig,
 }
 
@@ -453,12 +469,14 @@ __all__ = [
     "GLM45RendererConfig",
     "GLM51RendererConfig",
     "GLM5RendererConfig",
+    "Gemma4RendererConfig",
     "GptOssRendererConfig",
     "KimiK25RendererConfig",
     "KimiK2RendererConfig",
     "LagunaXS2RendererConfig",
     "MiniMaxM2RendererConfig",
     "Nemotron3RendererConfig",
+    "Olmo3RendererConfig",
     "Qwen35RendererConfig",
     "Qwen36RendererConfig",
     "Qwen3RendererConfig",

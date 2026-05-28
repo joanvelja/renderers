@@ -950,6 +950,17 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     # Nemotron 3.
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "nemotron-3",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "nemotron-3",
+    # OLMo 3.
+    "allenai/Olmo-3-7B-Instruct-DPO": "olmo3",
+    # Gemma 4.
+    "google/gemma-4-E2B": "gemma4",
+    "google/gemma-4-E2B-it": "gemma4",
+    "google/gemma-4-E4B": "gemma4",
+    "google/gemma-4-E4B-it": "gemma4",
+    "google/gemma-4-31B": "gemma4",
+    "google/gemma-4-31B-it": "gemma4",
+    "google/gemma-4-26B-A4B": "gemma4",
+    "google/gemma-4-26B-A4B-it": "gemma4",
     # Poolside Laguna.
     "poolside/Laguna-XS.2": "laguna-xs.2",
     # GPT-OSS.
@@ -1010,9 +1021,9 @@ def _model_has_vision_config(model_name: str) -> bool:
     a flaky HF probe never blocks a legitimate text-only fine-tune.
     """
     try:
-        from transformers import AutoConfig
+        from renderers.hf_compat import load_config
 
-        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=False)
+        cfg = load_config(model_name, trust_remote_code=False)
     except Exception:
         return False
     # Most VLM configs nest a vision tower as ``vision_config`` (Qwen-VL,
@@ -1140,14 +1151,28 @@ def load_tokenizer(
     pre-tokenizer type), we automatically retry with the vanilla
     backend and emit an INFO log.
     """
-    from transformers import AutoTokenizer
-
     kwargs: dict[str, Any] = {}
     revision = TRUSTED_REVISIONS.get(model_name_or_path)
     if revision is not None:
         kwargs = {"trust_remote_code": True, "revision": revision}
     else:
         kwargs = {"trust_remote_code": False}
+
+    from renderers.hf_compat import (
+        load_config,
+        load_direct_fast_tokenizer,
+        should_use_direct_fast_tokenizer,
+    )
+
+    try:
+        kwargs["config"] = load_config(model_name_or_path, **kwargs)
+    except Exception as exc:
+        logger.debug("Could not preload config for %r: %s", model_name_or_path, exc)
+
+    if should_use_direct_fast_tokenizer(model_name_or_path):
+        return load_direct_fast_tokenizer(model_name_or_path, **kwargs)
+
+    from transformers import AutoTokenizer
 
     if not use_fastokens or model_name_or_path in FASTOKENS_INCOMPATIBLE:
         return AutoTokenizer.from_pretrained(model_name_or_path, **kwargs)
@@ -1169,8 +1194,9 @@ def load_tokenizer(
 def _populate_registry():
     if RENDERER_REGISTRY:
         return
-    from renderers.default import DefaultRenderer
     from renderers.deepseek_v3 import DeepSeekV3Renderer
+    from renderers.default import DefaultRenderer
+    from renderers.gemma4 import Gemma4Renderer
     from renderers.glm5 import GLM5Renderer, GLM51Renderer
     from renderers.glm45 import GLM45Renderer
     from renderers.gpt_oss import GptOssRenderer
@@ -1179,6 +1205,7 @@ def _populate_registry():
     from renderers.laguna_xs2 import LagunaXS2Renderer
     from renderers.minimax_m2 import MiniMaxM2Renderer
     from renderers.nemotron3 import Nemotron3Renderer
+    from renderers.olmo3 import Olmo3Renderer
     from renderers.qwen3 import Qwen3Renderer
     from renderers.qwen3_vl import Qwen3VLRenderer
     from renderers.qwen35 import Qwen35Renderer
@@ -1187,6 +1214,7 @@ def _populate_registry():
     RENDERER_REGISTRY.update(
         {
             "default": DefaultRenderer,
+            "gemma4": Gemma4Renderer,
             "qwen3": Qwen3Renderer,
             "qwen3-vl": Qwen3VLRenderer,
             "qwen3.5": Qwen35Renderer,
@@ -1200,6 +1228,7 @@ def _populate_registry():
             "kimi-k2.5": KimiK25Renderer,
             "laguna-xs.2": LagunaXS2Renderer,
             "nemotron-3": Nemotron3Renderer,
+            "olmo3": Olmo3Renderer,
             "gpt-oss": GptOssRenderer,
         }
     )
@@ -1498,7 +1527,6 @@ def _get_offset_tokenizer(tokenizer):
         cached = _offset_tokenizers.get(name_or_path)
         if cached is not None:
             return cached
-        from transformers import AutoTokenizer
 
         kwargs: dict[str, Any] = {}
         revision = TRUSTED_REVISIONS.get(name_or_path)
@@ -1506,12 +1534,27 @@ def _get_offset_tokenizer(tokenizer):
             kwargs = {"trust_remote_code": True, "revision": revision}
         else:
             kwargs = {"trust_remote_code": False}
+        from renderers.hf_compat import (
+            load_config,
+            load_direct_fast_tokenizer,
+            should_use_direct_fast_tokenizer,
+        )
+
+        try:
+            kwargs["config"] = load_config(name_or_path, **kwargs)
+        except Exception as exc:
+            logger.debug("Could not preload offset tokenizer config for %r: %s", name_or_path, exc)
         # Explicitly vanilla — we want HF's Rust tokenizer with offset
         # tracking, not the fastokens shim. ``load_tokenizer`` would
         # patch fastokens in by default; calling
         # ``AutoTokenizer.from_pretrained`` directly here keeps the
         # fastokens patch out of this code path entirely.
-        offset_tok = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+        if should_use_direct_fast_tokenizer(name_or_path):
+            offset_tok = load_direct_fast_tokenizer(name_or_path, **kwargs)
+        else:
+            from transformers import AutoTokenizer
+
+            offset_tok = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
         if not getattr(offset_tok, "is_fast", False):
             raise RuntimeError(
                 f"Vanilla tokenizer for {name_or_path!r} is not a fast "

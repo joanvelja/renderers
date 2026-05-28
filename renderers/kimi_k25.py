@@ -23,9 +23,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
-
-from transformers.tokenization_utils import PreTrainedTokenizer
+from typing import TYPE_CHECKING, Any
 
 from renderers.base import (
     Message,
@@ -48,6 +46,9 @@ from renderers.qwen3_vl import (
     _is_video_part,
     _load_pil_image,
 )
+
+if TYPE_CHECKING:
+    from transformers.tokenization_utils import PreTrainedTokenizer
 
 # ---------------------------------------------------------------------------
 # Constants

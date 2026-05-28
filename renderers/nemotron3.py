@@ -15,9 +15,7 @@ Nemotron 3 uses the same <|im_start|>/<|im_end|> format as Qwen3.5 but differs i
 from __future__ import annotations
 
 import json
-from typing import Any
-
-from transformers.tokenization_utils import PreTrainedTokenizer
+from typing import TYPE_CHECKING, Any
 
 from renderers.base import (
     Message,
@@ -31,6 +29,9 @@ from renderers.base import (
 )
 from renderers.configs import Nemotron3RendererConfig
 from renderers.parsing import parse_qwen35
+
+if TYPE_CHECKING:
+    from transformers.tokenization_utils import PreTrainedTokenizer
 
 # ---------------------------------------------------------------------------
 # Tool system prompt constants

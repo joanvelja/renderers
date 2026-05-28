@@ -29,7 +29,6 @@ from functools import lru_cache
 from typing import Any
 
 import pytest
-
 from renderers import create_renderer
 from renderers.base import (
     MODEL_RENDERER_MAP,
@@ -37,7 +36,6 @@ from renderers.base import (
     load_tokenizer,
 )
 from renderers.configs import _config_class_for
-
 
 # Models exercised by the parity tests. Mirrors ``conftest.RENDERER_MODELS``
 # in spirit — one representative model per renderer family — plus the
@@ -55,6 +53,8 @@ _RENDERER_MODELS = [
     ("moonshotai/Kimi-K2.6", "auto"),
     ("deepseek-ai/DeepSeek-V3", "auto"),
     ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "auto"),
+    ("allenai/Olmo-3-7B-Instruct-DPO", "auto"),
+    ("google/gemma-4-E2B-it", "auto"),
     ("poolside/Laguna-XS.2", "auto"),
     ("openai/gpt-oss-20b", "gpt-oss"),
 ]
@@ -413,11 +413,13 @@ def _harmony_expected(
     from openai_harmony import (
         Conversation,
         HarmonyEncodingName,
-        Message as HarmonyMessage,
         ReasoningEffort,
         Role,
         SystemContent,
         load_harmony_encoding,
+    )
+    from openai_harmony import (
+        Message as HarmonyMessage,
     )
 
     # Base preamble pins the same default date the renderer fixture

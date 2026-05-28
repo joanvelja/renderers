@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import pytest
 from pydantic import ValidationError
-
 from renderers import create_renderer
 from renderers.base import MODEL_RENDERER_MAP, should_preserve_past_thinking
 from renderers.configs import _config_class_for

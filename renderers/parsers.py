@@ -21,7 +21,6 @@ from typing import Protocol, runtime_checkable
 
 from renderers.base import ParsedToolCall, ToolCallParseStatus
 
-
 # ── Shared helpers ───────────────────────────────────────────────────
 
 

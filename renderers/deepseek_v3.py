@@ -13,8 +13,7 @@ When enable_thinking=True the generation prompt prefills <think>\\n to trigger r
 from __future__ import annotations
 
 import json
-
-from transformers.tokenization_utils import PreTrainedTokenizer
+from typing import TYPE_CHECKING
 
 from renderers.base import (
     Message,
@@ -27,6 +26,9 @@ from renderers.base import (
 )
 from renderers.configs import DeepSeekV3RendererConfig
 from renderers.parsing import parse_deepseek_v3
+
+if TYPE_CHECKING:
+    from transformers.tokenization_utils import PreTrainedTokenizer
 
 # Fullwidth vertical bar used in DeepSeek special token names.
 _SEP = "\uff5c"  # ｜  (U+FF5C)

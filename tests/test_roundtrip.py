@@ -25,7 +25,6 @@ from typing import Any
 
 import pytest
 
-
 # (HuggingFace model name, renderer name or "auto"). These are the
 # renderers we actively rely on; expand as new ones get hand-coded.
 _ROUNDTRIP_MODELS = [
@@ -43,6 +42,8 @@ _ROUNDTRIP_MODELS = [
     ("moonshotai/Kimi-K2.6", "auto"),
     ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "auto"),
     ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16", "auto"),
+    ("allenai/Olmo-3-7B-Instruct-DPO", "auto"),
+    ("google/gemma-4-E2B-it", "auto"),
     ("poolside/Laguna-XS.2", "auto"),
     ("openai/gpt-oss-20b", "gpt-oss"),
     ("Qwen/Qwen2.5-0.5B-Instruct", "default"),

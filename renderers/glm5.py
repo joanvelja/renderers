@@ -12,9 +12,7 @@ Key differences from Qwen family:
 from __future__ import annotations
 
 import json
-from typing import Any
-
-from transformers.tokenization_utils import PreTrainedTokenizer
+from typing import TYPE_CHECKING, Any
 
 from renderers.base import (
     Message,
@@ -27,6 +25,9 @@ from renderers.base import (
 )
 from renderers.configs import GLM5RendererConfig, GLM51RendererConfig
 from renderers.parsing import parse_glm
+
+if TYPE_CHECKING:
+    from transformers.tokenization_utils import PreTrainedTokenizer
 
 _TOOLS_HEADER = (
     "\n# Tools\n\n"

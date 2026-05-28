@@ -12,9 +12,7 @@ Unique characteristics:
 from __future__ import annotations
 
 import json
-from typing import Any
-
-from transformers.tokenization_utils import PreTrainedTokenizer
+from typing import TYPE_CHECKING, Any
 
 from renderers.base import (
     Message,
@@ -28,6 +26,9 @@ from renderers.base import (
 )
 from renderers.configs import MiniMaxM2RendererConfig
 from renderers.parsing import parse_minimax
+
+if TYPE_CHECKING:
+    from transformers.tokenization_utils import PreTrainedTokenizer
 
 _TOOLS_HEADER = (
     "\n\n# Tools\n"

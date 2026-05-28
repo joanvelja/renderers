@@ -26,16 +26,18 @@ from openai_harmony import (
     Conversation,
     DeveloperContent,
     HarmonyEncodingName,
-    Message as HarmonyMessage,
     ReasoningEffort,
     Role,
     SystemContent,
     ToolDescription,
     load_harmony_encoding,
 )
+from openai_harmony import (
+    Message as HarmonyMessage,
+)
+from renderers.base import load_tokenizer
 from renderers.configs import GptOssRendererConfig
 from renderers.gpt_oss import GptOssRenderer
-from transformers import AutoTokenizer
 
 GPT_OSS_MODEL = "openai/gpt-oss-20b"
 DATE_FOR_PARITY = datetime.now().strftime("%Y-%m-%d")
@@ -43,7 +45,7 @@ DATE_FOR_PARITY = datetime.now().strftime("%Y-%m-%d")
 
 @pytest.fixture(scope="module")
 def tokenizer():
-    return AutoTokenizer.from_pretrained(GPT_OSS_MODEL)
+    return load_tokenizer(GPT_OSS_MODEL)
 
 
 @pytest.fixture(scope="module")

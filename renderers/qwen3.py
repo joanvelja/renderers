@@ -10,8 +10,7 @@ Key differences from Qwen3.5:
 from __future__ import annotations
 
 import json
-
-from transformers.tokenization_utils import PreTrainedTokenizer
+from typing import TYPE_CHECKING
 
 from renderers.base import (
     Message,
@@ -25,6 +24,9 @@ from renderers.base import (
 )
 from renderers.configs import Qwen3RendererConfig
 from renderers.parsing import parse_qwen3
+
+if TYPE_CHECKING:
+    from transformers.tokenization_utils import PreTrainedTokenizer
 
 _TOOLS_HEADER = (
     "# Tools\n\n"

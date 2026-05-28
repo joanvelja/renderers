@@ -35,21 +35,22 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from openai_harmony import (
     Conversation,
     DeveloperContent,
     HarmonyEncoding,
     HarmonyEncodingName,
-    Message as HarmonyMessage,
     ReasoningEffort,
     Role,
     SystemContent,
     ToolDescription,
     load_harmony_encoding,
 )
-from transformers.tokenization_utils import PreTrainedTokenizer
+from openai_harmony import (
+    Message as HarmonyMessage,
+)
 
 from renderers.base import (
     Message,
@@ -62,6 +63,9 @@ from renderers.base import (
 )
 from renderers.configs import GptOssRendererConfig
 from renderers.parsing import parse_gpt_oss
+
+if TYPE_CHECKING:
+    from transformers.tokenization_utils import PreTrainedTokenizer
 
 
 def _reasoning_effort(effort: str | None) -> ReasoningEffort:

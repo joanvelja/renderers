@@ -220,9 +220,7 @@ class RenderedTokens:
     message_roles: list[str] = field(default_factory=list)
     multi_modal_data: "MultiModalData | None" = None
 
-    def tokens_per_message(
-        self, n_messages: int | None = None, *, sampled_only: bool = False
-    ) -> list[int]:
+    def tokens_per_message(self, n_messages: int | None = None, *, sampled_only: bool = False) -> list[int]:
         """Count rendered tokens attributed to each caller-relative message.
 
         ``out[i]`` is the number of tokens with ``message_indices[k] == i``,
@@ -1039,20 +1037,20 @@ def _model_has_vision_config(model_name: str) -> bool:
 
 
 # Models whose tokenizer requires ``trust_remote_code=True`` AND a pinned
-# revision. Empirical audit (2026-05-07) confirms only the Moonshot
-# Kimi-K2 family ships an ``auto_map.AutoTokenizer`` entry that runs
-# repo-supplied Python on every ``AutoTokenizer.from_pretrained`` call —
-# every other model in ``MODEL_RENDERER_MAP`` loads cleanly without it.
+# revision. Each entry runs repo-supplied Python on
+# ``AutoTokenizer.from_pretrained`` and must be added deliberately after
+# reviewing the pinned commit.
 #
 # Pinning the revision keeps the trust narrow: even with
 # ``trust_remote_code=True``, transformers downloads / executes the
 # tokenizer Python from this exact commit only. A future malicious push
-# to the Moonshot HF repo doesn't auto-propagate to anyone using
+# to one of these HF repos doesn't auto-propagate to anyone using
 # ``create_renderer_pool``. Bump these SHAs deliberately, with review.
 TRUSTED_REVISIONS: dict[str, str] = {
     "moonshotai/Kimi-K2-Instruct": "fd1984e2b7a3350dbf7305fe73a4ede25c14de50",
     "moonshotai/Kimi-K2.5": "4d01dfe0332d63057c186e0b262165819efb6611",
     "moonshotai/Kimi-K2.6": "2755962d07cb42aa2d988a35bcb65cd4a9c2de82",
+    "poolside/Laguna-XS.2": "07c6c8e9fc4a43381946f981850a7822c12ad8c5",
 }
 
 
@@ -1108,10 +1106,7 @@ def _patched_load(model_name_or_path: str, **kwargs):
         with contextlib.redirect_stdout(io.StringIO()):
             fastokens.patch_transformers()
         if not _FASTOKENS_ANNOUNCED:
-            logger.info(
-                "fastokens enabled — tokenizers load through the Rust BPE "
-                "fast path (~10x encode speedup)."
-            )
+            logger.info("fastokens enabled — tokenizers load through the Rust BPE fast path (~10x encode speedup).")
             _FASTOKENS_ANNOUNCED = True
     try:
         return AutoTokenizer.from_pretrained(model_name_or_path, **kwargs)
@@ -1129,7 +1124,7 @@ def load_tokenizer(
     """Load a tokenizer with the renderers-package security + perf policy.
 
     **Security** — default ``trust_remote_code=False``. Models listed in
-    ``TRUSTED_REVISIONS`` (Moonshot Kimi-K2 family) load with
+    ``TRUSTED_REVISIONS`` (custom-code tokenizer families) load with
     ``trust_remote_code=True`` AND a pinned ``revision=<sha>`` so
     transformers only executes the reviewed commit's tokenizer Python.
 
@@ -1299,10 +1294,7 @@ def create_renderer(
     if not isinstance(config, AutoRendererConfig):
         cls = RENDERER_REGISTRY.get(config.name)
         if cls is None:
-            raise ValueError(
-                f"Unknown renderer {config.name!r}. "
-                f"Available: {', '.join(sorted(RENDERER_REGISTRY))}"
-            )
+            raise ValueError(f"Unknown renderer {config.name!r}. Available: {', '.join(sorted(RENDERER_REGISTRY))}")
         return cls(tokenizer, config)
 
     return _resolve_auto(tokenizer, config)
@@ -1702,9 +1694,7 @@ def should_preserve_past_thinking(
         return False
     # The current segment must contain a tool response for it to count
     # as an in-flight tool cycle.
-    return any(
-        messages[j].get("role") == "tool" for j in range(last_user + 1, len(messages))
-    )
+    return any(messages[j].get("role") == "tool" for j in range(last_user + 1, len(messages)))
 
 
 def build_trajectory_step(
@@ -1726,9 +1716,7 @@ def build_trajectory_step(
     the completion).
     """
     has_completion = len(completion_messages) > 0
-    prompt_ids = renderer.render_ids(
-        prompt_messages, tools=tools, add_generation_prompt=has_completion
-    )
+    prompt_ids = renderer.render_ids(prompt_messages, tools=tools, add_generation_prompt=has_completion)
     full_rendered = renderer.render(prompt_messages + completion_messages, tools=tools)
     full_ids = full_rendered.token_ids
 
@@ -1743,9 +1731,6 @@ def build_trajectory_step(
         "completion_logprobs": [0.0] * len(completion_ids),
         "routed_experts": None,
     }
-    if (
-        full_rendered.multi_modal_data is not None
-        and not full_rendered.multi_modal_data.is_empty()
-    ):
+    if full_rendered.multi_modal_data is not None and not full_rendered.multi_modal_data.is_empty():
         out["multi_modal_data"] = full_rendered.multi_modal_data
     return out

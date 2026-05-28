@@ -1,9 +1,9 @@
 """Unit tests for ``renderers.base.load_tokenizer`` security policy.
 
 The renderers package centralises ``trust_remote_code`` handling here:
-default off, opt-in only for the Moonshot Kimi-K2 family, and even then
-pinned to a reviewed revision so a future malicious push to the upstream
-repo doesn't auto-propagate.
+default off, opt-in only for reviewed custom-code tokenizer families, and
+even then pinned to a reviewed revision so a future malicious push to the
+upstream repo doesn't auto-propagate.
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from renderers.base import TRUSTED_REVISIONS, load_tokenizer
 # ---------------------------------------------------------------------------
 
 
-def test_trusted_revisions_only_kimi_family():
-    """Only the Moonshot Kimi-K2 family is allowed to run repo-supplied
+def test_trusted_revisions_only_reviewed_custom_code_models():
+    """Only reviewed model families are allowed to run repo-supplied
     Python at ``from_pretrained`` time. Adding a new entry here means
     the renderers package is opting into arbitrary-code execution for
     that model — should require deliberate review."""
@@ -29,6 +29,7 @@ def test_trusted_revisions_only_kimi_family():
         "moonshotai/Kimi-K2-Instruct",
         "moonshotai/Kimi-K2.5",
         "moonshotai/Kimi-K2.6",
+        "poolside/Laguna-XS.2",
     }
 
 
@@ -68,6 +69,18 @@ def test_kimi_loads_with_pinned_revision(mock_from_pretrained):
     assert args == ("moonshotai/Kimi-K2.5",)
     assert kwargs["trust_remote_code"] is True
     assert kwargs["revision"] == TRUSTED_REVISIONS["moonshotai/Kimi-K2.5"]
+    assert kwargs["config"] is not None
+
+
+@patch("transformers.AutoTokenizer.from_pretrained")
+def test_laguna_loads_with_pinned_revision(mock_from_pretrained):
+    """Laguna XS.2 ships a custom tokenizer/config pair; load it only from
+    the reviewed commit pinned in ``TRUSTED_REVISIONS``."""
+    load_tokenizer("poolside/Laguna-XS.2")
+    args, kwargs = mock_from_pretrained.call_args
+    assert args == ("poolside/Laguna-XS.2",)
+    assert kwargs["trust_remote_code"] is True
+    assert kwargs["revision"] == TRUSTED_REVISIONS["poolside/Laguna-XS.2"]
     assert kwargs["config"] is not None
 
 

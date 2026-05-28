@@ -5,7 +5,7 @@ Kimi K2.5 shares the same tokenizer and base message format as Kimi K2
 
 1. Thinking mode via a ``<think>`` prefill in the generation prompt.
 2. Multimodal/vision support via ``<|media_begin|>image<|media_content|>...<|media_end|>``.
-3. TypeScript-style tool declarations instead of JSON.
+3. Tool declarations emitted through the tokenizer template's compact-JSON branch.
 
 Message format (identical to K2):
     <|im_system|>system<|im_middle|>You are Kimi...<|im_end|>
@@ -55,351 +55,6 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_SYSTEM_PROMPT = "You are Kimi, an AI assistant created by Moonshot AI."
-
-# ---------------------------------------------------------------------------
-# TypeScript-style tool declaration
-# ---------------------------------------------------------------------------
-
-_TS_INDENT = "  "
-_TS_FIELD_DELIMITER = ",\n"
-
-
-def _format_description(description: str, indent: str = "") -> str:
-    return "\n".join(
-        [f"{indent}// {line}" if line else "" for line in description.split("\n")]
-    )
-
-
-class _BaseType:
-    description: str
-    constraints: dict[str, Any]
-
-    def __init__(self, extra_props: dict[str, Any], *, allowed_constraint_keys=()):
-        self.description = extra_props.get("description", "")
-        self.constraints = {
-            k: v for k, v in extra_props.items() if k in allowed_constraint_keys
-        }
-
-    def to_typescript_style(self, indent: str = "") -> str:
-        raise NotImplementedError
-
-    def format_docstring(self, indent: str) -> str:
-        lines = []
-        if self.description:
-            lines.append(_format_description(self.description, indent))
-        if self.constraints:
-            constraints_str = ", ".join(
-                f"{k}: {v}"
-                for k, v in sorted(self.constraints.items(), key=lambda kv: kv[0])
-            )
-            lines.append(f"{indent}// {constraints_str}")
-        return "".join(x + "\n" for x in lines)
-
-
-class _SchemaRegistry:
-    def __init__(self):
-        self.definitions: dict[str, Any] = {}
-        self.has_self_ref = False
-
-    def register_definitions(self, defs: dict[str, Any]) -> None:
-        for def_name, def_schema in defs.items():
-            self.definitions[def_name] = def_schema
-
-    def resolve_ref(self, ref: str) -> dict[str, Any]:
-        if ref == "#":
-            self.has_self_ref = True
-            return {"$self_ref": True}
-        elif ref.startswith("#/$defs/"):
-            def_name = ref.split("/")[-1]
-            if def_name not in self.definitions:
-                raise ValueError(f"Reference not found: {ref}")
-            return self.definitions[def_name]
-        else:
-            raise ValueError(f"Unsupported reference format: {ref}")
-
-
-class _ScalarType(_BaseType):
-    def __init__(self, type_: str, extra_props: dict[str, Any] | None = None):
-        self.type_ = type_
-        allowed: list[str] = []
-        if type_ == "string":
-            allowed = ["maxLength", "minLength", "pattern"]
-        elif type_ in ("number", "integer"):
-            allowed = ["maximum", "minimum"]
-        super().__init__(extra_props or {}, allowed_constraint_keys=allowed)
-
-    def to_typescript_style(self, indent: str = "") -> str:
-        return "number" if self.type_ == "integer" else self.type_
-
-
-class _ObjectType(_BaseType):
-    def __init__(self, schema: dict[str, Any], registry: _SchemaRegistry | None = None):
-        super().__init__(schema)
-        self.properties: list[_TypedParam] = []
-        self.additional_properties: Any = None
-        if not schema:
-            return
-        if "$defs" in schema and registry:
-            registry.register_definitions(schema["$defs"])
-        self.additional_properties = schema.get("additionalProperties")
-        if isinstance(self.additional_properties, dict):
-            self.additional_properties = _parse_type(
-                self.additional_properties, registry
-            )
-        if "properties" not in schema:
-            return
-        required = set(schema.get("required", []))
-        for name, prop in schema["properties"].items():
-            self.properties.append(
-                _TypedParam(
-                    name=name,
-                    type_=_parse_type(prop, registry),
-                    optional=name not in required,
-                    default=prop.get("default") if isinstance(prop, dict) else None,
-                )
-            )
-
-    def to_typescript_style(self, indent: str = "") -> str:
-        required_params = sorted(
-            [p for p in self.properties if not p.optional], key=lambda p: p.name
-        )
-        optional_params = sorted(
-            [p for p in self.properties if p.optional], key=lambda p: p.name
-        )
-        params = required_params + optional_params
-        param_strs = [p.to_typescript_style(indent=indent + _TS_INDENT) for p in params]
-        if self.additional_properties is not None:
-            if self.additional_properties is True:
-                ap_type = "any"
-            elif self.additional_properties is False:
-                ap_type = "never"
-            else:
-                ap_type = self.additional_properties.to_typescript_style(
-                    indent=indent + _TS_INDENT
-                )
-            param_strs.append(f"{indent + _TS_INDENT}[k: string]: {ap_type}")
-        if not param_strs:
-            return "{}"
-        params_str = _TS_FIELD_DELIMITER.join(param_strs)
-        return f"{{\n{params_str}\n{indent}}}"
-
-
-class _ArrayType(_BaseType):
-    def __init__(self, schema: dict[str, Any], registry: _SchemaRegistry | None = None):
-        super().__init__(schema, allowed_constraint_keys=("minItems", "maxItems"))
-        self.item = (
-            _parse_type(schema["items"], registry)
-            if schema.get("items")
-            else _ScalarType("any")
-        )
-
-    def to_typescript_style(self, indent: str = "") -> str:
-        docstring = self.item.format_docstring(indent + _TS_INDENT)
-        if docstring:
-            return (
-                "Array<\n"
-                + docstring
-                + indent
-                + _TS_INDENT
-                + self.item.to_typescript_style(indent=indent + _TS_INDENT)
-                + "\n"
-                + indent
-                + ">"
-            )
-        return f"Array<{self.item.to_typescript_style(indent=indent)}>"
-
-
-class _EnumType(_BaseType):
-    def __init__(self, schema: dict[str, Any]):
-        super().__init__(schema)
-        self.enum = schema["enum"]
-
-    def to_typescript_style(self, indent: str = "") -> str:
-        return " | ".join(
-            f'"{e}"' if isinstance(e, str) else json.dumps(e) for e in self.enum
-        )
-
-
-class _AnyOfType(_BaseType):
-    def __init__(self, schema: dict[str, Any], registry: _SchemaRegistry | None = None):
-        super().__init__(schema)
-        self.types = [_parse_type(t, registry) for t in schema["anyOf"]]
-
-    def to_typescript_style(self, indent: str = "") -> str:
-        return " | ".join(t.to_typescript_style(indent=indent) for t in self.types)
-
-
-class _UnionType(_BaseType):
-    _MAPPING = {
-        "string": "string",
-        "number": "number",
-        "integer": "number",
-        "boolean": "boolean",
-        "null": "null",
-        "object": "{}",
-        "array": "Array<any>",
-    }
-
-    def __init__(self, schema: dict[str, Any]):
-        super().__init__(schema)
-        self.types = [self._MAPPING[t] for t in schema["type"]]
-
-    def to_typescript_style(self, indent: str = "") -> str:
-        return " | ".join(self.types)
-
-
-class _RefType(_BaseType):
-    def __init__(self, schema: dict[str, Any], registry: _SchemaRegistry):
-        super().__init__(schema)
-        ref = schema["$ref"]
-        resolved = registry.resolve_ref(ref)
-        if resolved.get("$self_ref", False):
-            self.ref_name = "parameters"
-            self.is_self_ref = True
-        else:
-            self.ref_name = ref.split("/")[-1]
-            self.is_self_ref = False
-
-    def to_typescript_style(self, indent: str = "") -> str:
-        return self.ref_name
-
-
-_ParamType = (
-    _ScalarType
-    | _ObjectType
-    | _ArrayType
-    | _EnumType
-    | _AnyOfType
-    | _UnionType
-    | _RefType
-)
-
-
-class _TypedParam:
-    def __init__(
-        self, name: str, type_: _ParamType, optional: bool = True, default: Any = None
-    ):
-        self.name = name
-        self.type_ = type_
-        self.optional = optional
-        self.default = default
-
-    def to_typescript_style(self, indent: str = "") -> str:
-        comments = self.type_.format_docstring(indent)
-        if self.default is not None:
-            default_repr = json.dumps(self.default, ensure_ascii=False)
-            comments += f"{indent}// Default: {default_repr}\n"
-        opt = "?" if self.optional else ""
-        return (
-            comments
-            + f"{indent}{self.name}{opt}: {self.type_.to_typescript_style(indent=indent)}"
-        )
-
-
-def _parse_type(
-    schema: dict[str, Any] | bool, registry: _SchemaRegistry | None = None
-) -> _ParamType:
-    if isinstance(schema, bool):
-        return _ScalarType("any" if schema else "null")
-    if "$ref" in schema and registry:
-        return _RefType(schema, registry)
-    if "anyOf" in schema:
-        return _AnyOfType(schema, registry)
-    if "enum" in schema:
-        return _EnumType(schema)
-    if "type" in schema:
-        typ = schema["type"]
-        if isinstance(typ, list):
-            return _UnionType(schema)
-        if typ == "object":
-            return _ObjectType(schema, registry)
-        if typ == "array":
-            return _ArrayType(schema, registry)
-        return _ScalarType(typ, schema)
-    if schema == {}:
-        return _ScalarType("any")
-    raise ValueError(f"Invalid JSON Schema object: {schema}")
-
-
-def _function_to_typescript(function: dict[str, Any]) -> str:
-    """Convert an OpenAI-format function definition to TypeScript-style string."""
-    registry = _SchemaRegistry()
-    parameters = function.get("parameters") or {}
-    parsed = _ObjectType(parameters, registry)
-
-    interfaces: list[str] = []
-    root_interface_name: str | None = None
-
-    if registry.has_self_ref:
-        root_interface_name = "parameters"
-        params_str = _TS_FIELD_DELIMITER.join(
-            p.to_typescript_style(indent=_TS_INDENT) for p in parsed.properties
-        )
-        params_str = f"\n{params_str}\n" if params_str else ""
-        interfaces.append(f"interface {root_interface_name} {{{params_str}}}")
-
-    for def_name, def_schema in registry.definitions.items():
-        obj_type = _parse_type(def_schema, registry)
-        params_str = obj_type.to_typescript_style()
-        description_part = ""
-        if desc := def_schema.get("description", ""):
-            description_part = _format_description(desc) + "\n"
-        interfaces.append(f"{description_part}interface {def_name} {params_str}")
-
-    interface_str = "\n".join(interfaces)
-    func_name = function.get("name", "function")
-    if root_interface_name:
-        type_def = f"type {func_name} = (_: {root_interface_name}) => any;"
-    else:
-        params_str = parsed.to_typescript_style()
-        type_def = f"type {func_name} = (_: {params_str}) => any;"
-
-    description = function.get("description")
-    return "\n".join(
-        filter(
-            bool,
-            [
-                interface_str,
-                (description and _format_description(description)) or "",
-                type_def,
-            ],
-        )
-    )
-
-
-def _encode_tools_typescript(tools: list[ToolSpec]) -> str:
-    """Convert a list of ToolSpec dicts to TypeScript-style tool declaration string.
-
-    Mirrors the upstream encoder shipped with the K2.5/K2.6 tokenizer
-    (``tool_declaration_ts.encode_tools_to_typescript_style``): unwraps
-    OpenAI ``{"type":"function","function":{...}}`` and skips other
-    tool types.
-    """
-    if not tools:
-        return ""
-    functions = []
-    for tool in tools:
-        # Support both shapes:
-        #  * OpenAI envelope: {"type": "function", "function": {...}}
-        #  * Flat ``ToolSpec`` (TypedDict in renderers.base): {name, description, parameters}
-        # ToolNamespaceConfig non-function entries (e.g. ``"_plugin"``) are
-        # skipped explicitly.
-        if tool.get("type") and tool.get("type") != "function":
-            continue
-        if isinstance(tool.get("function"), dict):
-            func_def_dict = tool["function"]
-        else:
-            func_def_dict = tool
-        if not func_def_dict:
-            continue
-        func_def = _function_to_typescript(func_def_dict)
-        if func_def:
-            functions.append(func_def)
-    if not functions:
-        return ""
-    functions_str = "\n".join(functions)
-    return "# Tools\n\n## functions\nnamespace functions {\n" + functions_str + "\n}\n"
-
 
 # ---------------------------------------------------------------------------
 # Kimi K2.5 response parsing (mirrors K2 format, same token structure)
@@ -472,11 +127,7 @@ def _parse_kimi_k2_response(
             tool_call_argument_begin_id=tool_call_argument_begin_id,
             tool_call_end_id=tool_call_end_id,
         )
-        text = (
-            tokenizer.decode(content_ids, skip_special_tokens=False)
-            if content_ids
-            else ""
-        )
+        text = tokenizer.decode(content_ids, skip_special_tokens=False) if content_ids else ""
     else:
         text = tokenizer.decode(ids, skip_special_tokens=False) if ids else ""
 
@@ -486,18 +137,12 @@ def _parse_kimi_k2_response(
         tc_match = _TOOL_CALLS_SECTION_RE.search(text)
         if tc_match:
             text = text[: tc_match.start()]
-            tool_section = (
-                tc_match.group(1)
-                if tc_match.group(1) is not None
-                else tc_match.group(2)
-            )
+            tool_section = tc_match.group(1) if tc_match.group(1) is not None else tc_match.group(2)
             for m in _TOOL_CALL_RE.finditer(tool_section):
                 tool_id = m.group(1).strip()
                 args_str = m.group(2).strip()
                 name_part = tool_id.split(":", 1)[0]
-                func_name = (
-                    name_part.split(".", 1)[1] if "." in name_part else name_part
-                )
+                func_name = name_part.split(".", 1)[1] if "." in name_part else name_part
                 arguments: dict[str, Any] | str
                 invalid_json = False
                 try:
@@ -751,25 +396,19 @@ class KimiK25Renderer:
         mm_placeholders: dict[str, list[PlaceholderRange]] = {}
         mm_items: dict[str, list[dict[str, Any]]] = {}
 
-        def emit_ids(
-            ids: list[int], msg_idx: int, *, is_sampled: bool, is_content: bool
-        ) -> None:
+        def emit_ids(ids: list[int], msg_idx: int, *, is_sampled: bool, is_content: bool) -> None:
             tokens.extend(ids)
             indices.extend([msg_idx] * len(ids))
             sampled.extend([is_sampled] * len(ids))
             content_mask.extend([is_content] * len(ids))
 
-        def emit_special(
-            token_id: int, msg_idx: int, *, is_sampled: bool, is_content: bool
-        ) -> None:
+        def emit_special(token_id: int, msg_idx: int, *, is_sampled: bool, is_content: bool) -> None:
             tokens.append(token_id)
             indices.append(msg_idx)
             sampled.append(is_sampled)
             content_mask.append(is_content)
 
-        def emit_text(
-            text: str, msg_idx: int, *, is_sampled: bool, is_content: bool
-        ) -> None:
+        def emit_text(text: str, msg_idx: int, *, is_sampled: bool, is_content: bool) -> None:
             emit_ids(
                 self._encode(text),
                 msg_idx,
@@ -804,13 +443,9 @@ class KimiK25Renderer:
             ``\\n``) are template-injected scaffold.
             """
             _, out, _num_patches, h = self._process_image(part)
-            emit_special(
-                self._media_begin, msg_idx, is_sampled=is_sampled, is_content=False
-            )
+            emit_special(self._media_begin, msg_idx, is_sampled=is_sampled, is_content=False)
             emit_text("image", msg_idx, is_sampled=is_sampled, is_content=False)
-            emit_special(
-                self._media_content, msg_idx, is_sampled=is_sampled, is_content=False
-            )
+            emit_special(self._media_content, msg_idx, is_sampled=is_sampled, is_content=False)
             offset = len(tokens)
             emit_special(
                 self._media_pad,
@@ -818,14 +453,10 @@ class KimiK25Renderer:
                 is_sampled=is_sampled,
                 is_content=is_content,
             )
-            emit_special(
-                self._media_end, msg_idx, is_sampled=is_sampled, is_content=False
-            )
+            emit_special(self._media_end, msg_idx, is_sampled=is_sampled, is_content=False)
             emit_text("\n", msg_idx, is_sampled=is_sampled, is_content=False)
             mm_hashes.setdefault("image", []).append(h)
-            mm_placeholders.setdefault("image", []).append(
-                PlaceholderRange(offset=offset, length=1)
-            )
+            mm_placeholders.setdefault("image", []).append(PlaceholderRange(offset=offset, length=1))
             # ``grid_thws`` (Kimi) is the per-image equivalent of Qwen-VL's
             # ``image_grid_thw``. Ship under Kimi's native key so the
             # orchestrator's generic ``torch.cat``-based packer routes it
@@ -838,18 +469,20 @@ class KimiK25Renderer:
             )
 
         # ── Tool declaration prefix (comes first) ──
-        # K2.5/K2.6's tokenizer auto-computes ``tools_ts_str`` and threads
-        # it into apply_chat_template, so the template's TS branch always
-        # fires when tools are present. Match that with our own TS encoder.
-        # The tools-TS body is recoverable from the ``tools`` argument, so
-        # we attribute the entire tool_declare emission as scaffold —
-        # consistent with Qwen3's tools-header treatment.
+        # ``apply_chat_template(tools=...)`` reaches the template's compact
+        # JSON fallback unless the caller passes ``tools_ts_str`` explicitly.
+        # Renderer Protocol does not expose arbitrary template kwargs, so
+        # match the default tools path here.
         if tools:
-            tools_ts = _encode_tools_typescript(tools)
             emit_special(self._im_system, -1, is_sampled=False, is_content=False)
             emit_text("tool_declare", -1, is_sampled=False, is_content=False)
             emit_special(self._im_middle, -1, is_sampled=False, is_content=False)
-            emit_text(tools_ts, -1, is_sampled=False, is_content=False)
+            emit_text(
+                json.dumps(tools, ensure_ascii=False, separators=(",", ":")),
+                -1,
+                is_sampled=False,
+                is_content=False,
+            )
             emit_special(self._im_end, -1, is_sampled=False, is_content=False)
 
         # ── Iterate messages ─────────────────────────────────────────
@@ -1016,11 +649,7 @@ class KimiK25Renderer:
         tools: list[ToolSpec] | None = None,
         previous_multi_modal_data: MultiModalData | None = None,
     ) -> "RenderedTokens | None":
-        if (
-            not previous_prompt_ids
-            or not new_messages
-            or reject_assistant_in_extension(new_messages)
-        ):
+        if not previous_prompt_ids or not new_messages or reject_assistant_in_extension(new_messages):
             return None
 
         close_ids: set[int] = {self._im_end}
@@ -1108,9 +737,7 @@ class KimiK25Renderer:
             emit_special(self._media_end, msg_idx)
             emit_text("\n", msg_idx)
             new_hashes.setdefault("image", []).append(h)
-            new_placeholders.setdefault("image", []).append(
-                PlaceholderRange(offset=offset, length=1)
-            )
+            new_placeholders.setdefault("image", []).append(PlaceholderRange(offset=offset, length=1))
             new_items.setdefault("image", []).append(
                 {
                     "pixel_values": out["pixel_values"],
@@ -1167,19 +794,13 @@ class KimiK25Renderer:
 
         # Merge prev mm_data (earlier-turn images) with the new turn's items.
         merged_hashes: dict[str, list[str]] = (
-            dict(previous_multi_modal_data.mm_hashes)
-            if previous_multi_modal_data
-            else {}
+            dict(previous_multi_modal_data.mm_hashes) if previous_multi_modal_data else {}
         )
         merged_placeholders: dict[str, list[PlaceholderRange]] = (
-            dict(previous_multi_modal_data.mm_placeholders)
-            if previous_multi_modal_data
-            else {}
+            dict(previous_multi_modal_data.mm_placeholders) if previous_multi_modal_data else {}
         )
         merged_items: dict[str, list[dict[str, Any]]] = (
-            dict(previous_multi_modal_data.mm_items)
-            if previous_multi_modal_data
-            else {}
+            dict(previous_multi_modal_data.mm_items) if previous_multi_modal_data else {}
         )
         for modality, vals in new_hashes.items():
             merged_hashes.setdefault(modality, []).extend(vals)
@@ -1262,14 +883,10 @@ class KimiK25Renderer:
                     if emit_image is None:
                         # Silently drop — caller didn't opt into multimodal.
                         continue
-                    emit_image(
-                        part, msg_idx, is_sampled=is_sampled, is_content=is_content
-                    )
+                    emit_image(part, msg_idx, is_sampled=is_sampled, is_content=is_content)
                     continue
                 if is_video:
-                    raise NotImplementedError(
-                        "Video parts are not yet supported by KimiK25Renderer."
-                    )
+                    raise NotImplementedError("Video parts are not yet supported by KimiK25Renderer.")
                 if ptype == "text":
                     emit_text(
                         part.get("text", ""),
@@ -1315,23 +932,15 @@ class KimiK25Renderer:
             reasoning_content = msg["reasoning_content"]
             if isinstance(content, list):
                 text_content = "".join(
-                    p.get("text", "")
-                    for p in content
-                    if isinstance(p, dict) and p.get("type") == "text"
+                    p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"
                 )
             else:
                 text_content = content or ""
         elif isinstance(content, list):
             thinking_parts = [
-                p.get("thinking", "")
-                for p in content
-                if isinstance(p, dict) and p.get("type") == "thinking"
+                p.get("thinking", "") for p in content if isinstance(p, dict) and p.get("type") == "thinking"
             ]
-            text_parts = [
-                p.get("text", "")
-                for p in content
-                if isinstance(p, dict) and p.get("type") == "text"
-            ]
+            text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
             reasoning_content = "".join(thinking_parts)
             text_content = "".join(text_parts)
         elif isinstance(content, str) and "</think>" in content:
@@ -1372,11 +981,7 @@ class KimiK25Renderer:
             for tc in tool_calls:
                 func = tc.get("function") or tc
                 arguments = func.get("arguments", {})
-                args_str = (
-                    json.dumps(arguments, ensure_ascii=False)
-                    if not isinstance(arguments, str)
-                    else arguments
-                )
+                args_str = json.dumps(arguments, ensure_ascii=False) if not isinstance(arguments, str) else arguments
                 # Template emits ``tool_call['id']`` verbatim — empty when
                 # missing. Round-trip requires caller to pass id in
                 # ``functions.{name}:{idx}`` form (Kimi's parser recovers
@@ -1479,14 +1084,12 @@ class KimiK25Renderer:
         # caller's slicing happens to include earlier scaffolding tokens
         # (e.g. the assistant role tag) before the open tag.
         contains_open = any(
-            response[j : j + len(open_ids)] == open_ids
-            for j in range(len(response) - len(open_ids) + 1)
+            response[j : j + len(open_ids)] == open_ids for j in range(len(response) - len(open_ids) + 1)
         )
 
         # Check whether </think> appears anywhere in the response
         contains_close = any(
-            response[j : j + len(close_ids)] == close_ids
-            for j in range(len(response) - len(close_ids) + 1)
+            response[j : j + len(close_ids)] == close_ids for j in range(len(response) - len(close_ids) + 1)
         )
 
         if not contains_open and contains_close:

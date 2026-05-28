@@ -12,6 +12,7 @@ from renderers.base import (
     ToolSpec,
     attribute_text_segments,
     reject_assistant_in_extension,
+    should_preserve_past_thinking,
     trim_to_turn_close,
 )
 from renderers.configs import Olmo3RendererConfig
@@ -70,29 +71,21 @@ class Olmo3Renderer:
         sampled: list[bool] = []
         content_mask: list[bool] = []
 
-        def emit_special(
-            token_id: int, msg_idx: int, *, is_sampled: bool, is_content: bool
-        ) -> None:
+        def emit_special(token_id: int, msg_idx: int, *, is_sampled: bool, is_content: bool) -> None:
             tokens.append(token_id)
             indices.append(msg_idx)
             sampled.append(is_sampled)
             content_mask.append(is_content)
 
-        def emit_text(
-            text: str, msg_idx: int, *, is_sampled: bool, is_content: bool
-        ) -> None:
+        def emit_text(text: str, msg_idx: int, *, is_sampled: bool, is_content: bool) -> None:
             ids = self._encode(text)
             tokens.extend(ids)
             indices.extend([msg_idx] * len(ids))
             sampled.extend([is_sampled] * len(ids))
             content_mask.extend([is_content] * len(ids))
 
-        def emit_text_segments(
-            segments: list[tuple[str, bool]], msg_idx: int, *, is_sampled: bool
-        ) -> None:
-            for token_id, is_content in attribute_text_segments(
-                self._tokenizer, segments
-            ):
+        def emit_text_segments(segments: list[tuple[str, bool]], msg_idx: int, *, is_sampled: bool) -> None:
+            for token_id, is_content in attribute_text_segments(self._tokenizer, segments):
                 tokens.append(token_id)
                 indices.append(msg_idx)
                 sampled.append(is_sampled)
@@ -130,11 +123,18 @@ class Olmo3Renderer:
                     emit_text_segments=emit_text_segments,
                 )
             elif role == "assistant":
+                preserve_thinking = should_preserve_past_thinking(
+                    messages,
+                    i,
+                    preserve_all_thinking=self.config.preserve_all_thinking,
+                    preserve_thinking_between_tool_calls=self.config.preserve_thinking_between_tool_calls,
+                )
                 self._render_assistant(
                     msg,
                     i,
                     content,
                     is_last=i == num_messages - 1,
+                    preserve_thinking=preserve_thinking,
                     emit_special=emit_special,
                     emit_text=emit_text,
                 )
@@ -198,11 +198,7 @@ class Olmo3Renderer:
         *,
         tools: list[ToolSpec] | None = None,
     ) -> RenderedTokens | None:
-        if (
-            not previous_prompt_ids
-            or not new_messages
-            or reject_assistant_in_extension(new_messages)
-        ):
+        if not previous_prompt_ids or not new_messages or reject_assistant_in_extension(new_messages):
             return None
 
         previous_ids = trim_to_turn_close(
@@ -220,11 +216,9 @@ class Olmo3Renderer:
         total_len = len(previous_ids) + len(extension_ids)
         return RenderedTokens(
             token_ids=previous_ids + extension_ids,
-            message_indices=[-1] * (len(previous_ids) + len(bridge_prefix))
-            + bridge.message_indices,
+            message_indices=[-1] * (len(previous_ids) + len(bridge_prefix)) + bridge.message_indices,
             sampled_mask=[False] * total_len,
-            is_content=[False] * (len(previous_ids) + len(bridge_prefix))
-            + bridge.is_content,
+            is_content=[False] * (len(previous_ids) + len(bridge_prefix)) + bridge.is_content,
             message_roles=bridge.message_roles,
         )
 
@@ -312,27 +306,31 @@ class Olmo3Renderer:
         content: str,
         *,
         is_last: bool,
+        preserve_thinking: bool,
         emit_special,
         emit_text,
     ) -> None:
         emit_special(self._im_start, msg_idx, is_sampled=False, is_content=False)
         emit_text("assistant\n", msg_idx, is_sampled=False, is_content=False)
+        reasoning = msg.get("reasoning") or msg.get("reasoning_content")
+        if preserve_thinking and isinstance(reasoning, str) and reasoning:
+            emit_text(
+                reasoning.rstrip("\n") + "\n",
+                msg_idx,
+                is_sampled=True,
+                is_content=True,
+            )
         if content:
             emit_text(content, msg_idx, is_sampled=True, is_content=True)
         tool_calls = msg.get("tool_calls") or []
         if tool_calls:
-            emit_special(
-                self._function_calls, msg_idx, is_sampled=True, is_content=True
+            emit_special(self._function_calls, msg_idx, is_sampled=True, is_content=True)
+            emit_text(
+                "\n".join(_format_tool_call(tool_call) for tool_call in tool_calls),
+                msg_idx,
+                is_sampled=True,
+                is_content=True,
             )
-            for tc_idx, tool_call in enumerate(tool_calls):
-                emit_text(
-                    _format_tool_call(tool_call),
-                    msg_idx,
-                    is_sampled=True,
-                    is_content=True,
-                )
-                if tc_idx != len(tool_calls) - 1:
-                    emit_text("\n", msg_idx, is_sampled=True, is_content=True)
             emit_special(
                 self._function_calls_end,
                 msg_idx,

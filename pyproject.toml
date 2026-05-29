@@ -79,13 +79,24 @@ dev = [
 ]
 
 [tool.uv]
+# Enforce a uv version that supports the friendly-duration form
+# (`"7 days"`) in the static pyproject parser. Older uvs silently parse
+# the value as an RFC 3339 date, emit a TOML parse warning, and proceed
+# *without* the cooldown — bypassing this security policy.
+required-version = ">=0.11.1"
 exclude-newer = "7 days"
+
+[tool.uv.exclude-newer-package]
 # fastokens 0.2.0 was published on 2026-05-17 and contains the
 # ``unpatch_transformers`` fix (crusoecloud/fastokens#32) needed for
 # MiniMax-M2's slow→fast tokenizer conversion path. Exempting it from
 # the project-wide 7-day cutoff lets the lockfile pick it up immediately
 # while the rest of the dependency graph stays gated.
-exclude-newer-package = { fastokens = false, "prime-pydantic-config" = false }
+fastokens = false
+# PrimeIntellect-published packages in this project's dependency closure —
+# fast-track so first-party releases can land same-day. Only packages that
+# appear in `uv tree` are listed.
+prime-pydantic-config = false
 
 [tool.ty.environment]
 python-version = "3.13"

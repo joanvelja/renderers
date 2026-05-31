@@ -23,6 +23,7 @@ from renderers.base import (
     RenderedTokens,
     ToolSpec,
     attribute_text_segments,
+    extract_message_tool_names,
     reject_assistant_in_extension,
     should_preserve_past_thinking,
     trim_to_turn_close,
@@ -412,6 +413,7 @@ class Nemotron3Renderer:
             sampled_mask=sampled,
             is_content=content_mask,
             message_roles=[m.get("role") or "" for m in original_messages],
+            message_tool_names=extract_message_tool_names(original_messages),
         )
 
     def render_ids(
@@ -431,7 +433,7 @@ class Nemotron3Renderer:
         self,
         token_ids: list[int],
         *,
-        tools: list[ToolSpec] | None = None,  # noqa: ARG002 — args land in a JSON object, schema not needed
+        tools: list[ToolSpec] | None = None,
     ) -> ParsedResponse:
         stop_ids = {self._im_end}
         if self._endoftext is not None:
@@ -444,6 +446,7 @@ class Nemotron3Renderer:
             think_end_id=self._think_end,
             tool_call_id=self._tool_call,
             tool_call_end_id=self._tool_call_end,
+            tools=tools,
         )
 
     def get_stop_token_ids(self) -> list[int]:
@@ -581,6 +584,7 @@ class Nemotron3Renderer:
             sampled_mask=[False] * total_len,
             is_content=[False] * len(previous_ids) + ext_content,
             message_roles=[m.get("role") or "" for m in new_messages],
+            message_tool_names=extract_message_tool_names(new_messages),
         )
 
     # ------------------------------------------------------------------

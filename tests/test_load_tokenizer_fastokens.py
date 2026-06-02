@@ -3,8 +3,7 @@
 ``load_tokenizer`` defaults to routing every supported model through
 ``fastokens.patch_transformers()`` for ~10x faster encode. Models in
 ``FASTOKENS_INCOMPATIBLE`` skip the patch (DeepSeek's Metaspace
-pretokenizer isn't supported; MiniMax tokenizers diverge on literal
-special-token text). Callers can opt out per-call with
+pretokenizer isn't supported). Callers can opt out per-call with
 ``use_fastokens=False``.
 
 These tests pin the policy:
@@ -47,8 +46,6 @@ def test_fastokens_incompatible_is_explicit_set():
         {
             "deepseek-ai/DeepSeek-V3",
             "deepseek-ai/DeepSeek-V3-Base",
-            "MiniMaxAI/MiniMax-M2",
-            "MiniMaxAI/MiniMax-M2.5",
         }
     )
 
@@ -108,7 +105,7 @@ def test_fast_and_vanilla_encode_identically_on_compatible_model():
 def test_incompat_model_loads_via_vanilla_backend(model):
     """For models we know diverge / fail under fastokens, the fast path
     must be skipped so the load still succeeds with a vanilla backend."""
-    if "DeepSeek" in model or "MiniMax" in model:
+    if "DeepSeek" in model:
         # Skip if upstream gating / size makes the load impractical here.
         # We only care that the path doesn't try fastokens. Probe the
         # tokenizer_config to make sure the repo is reachable; if not,
@@ -170,3 +167,45 @@ def test_fallback_on_fastokens_load_error(monkeypatch):
     assert "Shim" not in _backend_class_name(tok)
     # Still works.
     assert len(tok.encode("hi", add_special_tokens=False)) > 0
+
+
+# ---------------------------------------------------------------------------
+# Print suppression: fastokens itself prints "[fastokens]
+# patch_transformers: ..." on every patch/unpatch call. Building a
+# RendererPool of size N would emit ~N lines (the pool factory calls
+# load_tokenizer once per slot). load_tokenizer swallows that stdout
+# chatter and emits a single INFO log on the first patch instead.
+# ---------------------------------------------------------------------------
+
+
+def test_no_fastokens_stdout_chatter(capsys, caplog):
+    """``load_tokenizer`` must not leak ``[fastokens]`` prints onto
+    stdout, and must emit exactly one INFO log per process announcing
+    the fast path (not once per call)."""
+    import logging
+
+    import renderers.base as rb
+
+    # Reset the process-wide "announced" flag so this test sees the
+    # first-call log even if another test loaded a tokenizer earlier.
+    rb._FASTOKENS_ANNOUNCED = False
+
+    with caplog.at_level(logging.INFO, logger="renderers.base"):
+        load_tokenizer(_FAST_MODEL)
+        load_tokenizer(_FAST_MODEL)
+
+    captured = capsys.readouterr()
+    assert "[fastokens]" not in captured.out, (
+        f"fastokens print leaked to stdout: {captured.out!r}"
+    )
+    assert "[fastokens]" not in captured.err, (
+        f"fastokens print leaked to stderr: {captured.err!r}"
+    )
+
+    fastokens_info = [
+        r for r in caplog.records if "fastokens enabled" in r.getMessage()
+    ]
+    assert len(fastokens_info) == 1, (
+        f"expected exactly one fastokens INFO log across two loads, "
+        f"got {len(fastokens_info)}"
+    )

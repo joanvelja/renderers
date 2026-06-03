@@ -1335,6 +1335,8 @@ def _populate_registry():
     from renderers.qwen3_vl import Qwen3VLRenderer
     from renderers.qwen35 import Qwen35Renderer
     from renderers.qwen36 import Qwen36Renderer
+    from renderers.gemma4 import Gemma4Renderer
+    from renderers.olmo3 import Olmo3Renderer
 
     RENDERER_REGISTRY.update(
         {
@@ -1353,6 +1355,8 @@ def _populate_registry():
             "laguna-xs.2": LagunaXS2Renderer,
             "nemotron-3": Nemotron3Renderer,
             "gpt-oss": GptOssRenderer,
+            "gemma4": Gemma4Renderer,
+            "olmo3": Olmo3Renderer,
         }
     )
 

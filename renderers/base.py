@@ -1037,14 +1037,30 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     "moonshotai/Kimi-K2-Instruct": "kimi-k2",
     "moonshotai/Kimi-K2.5": "kimi-k2.5",
     "moonshotai/Kimi-K2.6": "kimi-k2.5",
-    # Nemotron 3.
+    # Nemotron 3. Nano / Super share one chat-template variant; the Ultra
+    # checkpoints use the Ultra variant — the renderer auto-selects it from
+    # the model name (see ``nemotron3._ULTRA_DEFAULTS``). BF16 and FP8 share the
+    # same tokenizer and template.
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "nemotron-3",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "nemotron-3",
+    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16": "nemotron-3",
+    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8": "nemotron-3",
     # Poolside Laguna.
     "poolside/Laguna-XS.2": "laguna-xs.2",
     # GPT-OSS.
     "openai/gpt-oss-20b": "gpt-oss",
     "openai/gpt-oss-120b": "gpt-oss",
+    # Gemma 4. The renderer implements Gemma4's text/tool chat template.
+    # Non-text image/audio/video parts are rejected explicitly until a
+    # multimodal sidecar is implemented.
+    "google/gemma-4-E2B": "gemma4",
+    "google/gemma-4-E2B-it": "gemma4",
+    "google/gemma-4-E4B": "gemma4",
+    "google/gemma-4-E4B-it": "gemma4",
+    "google/gemma-4-31B": "gemma4",
+    "google/gemma-4-31B-it": "gemma4",
+    "google/gemma-4-26B-A4B": "gemma4",
+    "google/gemma-4-26B-A4B-it": "gemma4",
 }
 
 
@@ -1323,6 +1339,7 @@ def _populate_registry():
         return
     from renderers.deepseek_v3 import DeepSeekV3Renderer
     from renderers.default import DefaultRenderer
+    from renderers.gemma4 import Gemma4Renderer
     from renderers.glm5 import GLM5Renderer, GLM51Renderer
     from renderers.glm45 import GLM45Renderer
     from renderers.gpt_oss import GptOssRenderer
@@ -1339,6 +1356,7 @@ def _populate_registry():
     RENDERER_REGISTRY.update(
         {
             "default": DefaultRenderer,
+            "gemma4": Gemma4Renderer,
             "qwen3": Qwen3Renderer,
             "qwen3-vl": Qwen3VLRenderer,
             "qwen3.5": Qwen35Renderer,

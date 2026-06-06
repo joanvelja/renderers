@@ -265,6 +265,17 @@ class GptOssRendererConfig(BaseRendererConfig):
     )
 
 
+class Gemma4RendererConfig(BaseRendererConfig):
+    """Gemma 4 renderer config."""
+
+    name: Literal["gemma4"] = "gemma4"
+
+    enable_thinking: bool = False
+    """When ``True``, the system prelude includes ``<|think|>``. Mirrors
+    the chat template's ``enable_thinking`` kwarg; default ``False`` matches
+    upstream when the kwarg is omitted."""
+
+
 class KimiK2RendererConfig(BaseRendererConfig):
     """Kimi K2 renderer config.
 
@@ -378,6 +389,7 @@ RendererConfig = Annotated[
         GLM51RendererConfig,
         GLM45RendererConfig,
         GptOssRendererConfig,
+        Gemma4RendererConfig,
         KimiK2RendererConfig,
         KimiK25RendererConfig,
         LagunaXS2RendererConfig,
@@ -412,6 +424,7 @@ _CONFIG_BY_NAME: dict[str, type[BaseRendererConfig]] = {
     "glm-5.1": GLM51RendererConfig,
     "glm-4.5": GLM45RendererConfig,
     "gpt-oss": GptOssRendererConfig,
+    "gemma4": Gemma4RendererConfig,
     "kimi-k2": KimiK2RendererConfig,
     "kimi-k2.5": KimiK25RendererConfig,
     "laguna-xs.2": LagunaXS2RendererConfig,
@@ -453,6 +466,7 @@ __all__ = [
     "GLM45RendererConfig",
     "GLM51RendererConfig",
     "GLM5RendererConfig",
+    "Gemma4RendererConfig",
     "GptOssRendererConfig",
     "KimiK25RendererConfig",
     "KimiK2RendererConfig",

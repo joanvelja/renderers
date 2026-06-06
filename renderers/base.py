@@ -1045,6 +1045,17 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     # GPT-OSS.
     "openai/gpt-oss-20b": "gpt-oss",
     "openai/gpt-oss-120b": "gpt-oss",
+    # Gemma 4. The renderer implements Gemma4's text/tool chat template.
+    # Non-text image/audio/video parts are rejected explicitly until a
+    # multimodal sidecar is implemented.
+    "google/gemma-4-E2B": "gemma4",
+    "google/gemma-4-E2B-it": "gemma4",
+    "google/gemma-4-E4B": "gemma4",
+    "google/gemma-4-E4B-it": "gemma4",
+    "google/gemma-4-31B": "gemma4",
+    "google/gemma-4-31B-it": "gemma4",
+    "google/gemma-4-26B-A4B": "gemma4",
+    "google/gemma-4-26B-A4B-it": "gemma4",
 }
 
 
@@ -1323,6 +1334,7 @@ def _populate_registry():
         return
     from renderers.deepseek_v3 import DeepSeekV3Renderer
     from renderers.default import DefaultRenderer
+    from renderers.gemma4 import Gemma4Renderer
     from renderers.glm5 import GLM5Renderer, GLM51Renderer
     from renderers.glm45 import GLM45Renderer
     from renderers.gpt_oss import GptOssRenderer
@@ -1339,6 +1351,7 @@ def _populate_registry():
     RENDERER_REGISTRY.update(
         {
             "default": DefaultRenderer,
+            "gemma4": Gemma4Renderer,
             "qwen3": Qwen3Renderer,
             "qwen3-vl": Qwen3VLRenderer,
             "qwen3.5": Qwen35Renderer,

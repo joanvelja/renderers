@@ -57,6 +57,7 @@ _RENDERER_MODELS = [
     ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "auto"),
     ("poolside/Laguna-XS.2", "auto"),
     ("openai/gpt-oss-20b", "gpt-oss"),
+    ("google/gemma-4-E2B-it", "auto"),
 ]
 
 

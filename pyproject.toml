@@ -57,6 +57,18 @@ tag-pattern = '^renderers-v(?P<version>.+)$'
 # only fires when the resolver has nothing to go on.
 fallback-version = "0.0.0"
 
+[tool.hatch.version.raw-options]
+git_describe_command = [
+    "git",
+    "describe",
+    "--tags",
+    "--long",
+    "--match",
+    "renderers-v[0-9]*",
+    "--exclude",
+    "*.dev*",
+]
+
 [tool.hatch.build.hooks.vcs]
 # Write the resolved version to a Python file so it can be inspected
 # at runtime via ``renderers.__version__`` without re-parsing the

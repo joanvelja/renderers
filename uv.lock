@@ -1409,7 +1409,7 @@ requires-dist = [
     { name = "jinja2" },
     { name = "numpy" },
     { name = "openai", specifier = ">=1.108.1" },
-    { name = "openai-harmony", specifier = ">=0.0.8" },
+    { name = "openai-harmony", specifier = ">=0.0.4" },
     { name = "prime-pydantic-config", specifier = ">=0.3.0.dev83" },
     { name = "tiktoken" },
     { name = "transformers", specifier = ">=4.50.0" },

@@ -5,8 +5,10 @@ name: Publish Dev
 # its patch bumped; ``<N>`` is the number of commits since that release so
 # each main commit maps to a unique PEP 440 dev version.
 #
-# Building from the freshly-created tag means hatch-vcs resolves the version
-# cleanly (no ``+gHASH`` local segment), which PyPI requires.
+# The checkout still points at the freshly-created tag, but pyproject.toml
+# deliberately ignores automated ``.devN`` tags so local editable installs do
+# not fail on them. The build step therefore passes the computed dev version
+# explicitly to setuptools-scm.
 
 on:
   push:
@@ -77,7 +79,14 @@ jobs:
       - uses: astral-sh/setup-uv@v7
 
       - name: Build renderers
-        run: uv build
+        env:
+          TAG: ${{ needs.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#renderers-v}"
+          SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION" \
+          SETUPTOOLS_SCM_PRETEND_VERSION_FOR_RENDERERS="$VERSION" \
+            uv build
 
       - name: Upload dist artifacts
         uses: actions/upload-artifact@v4

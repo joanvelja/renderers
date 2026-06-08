@@ -47,6 +47,7 @@ _ROUNDTRIP_MODELS = [
     # (no separating newline) — the Ultra-specific glue stresses the round-trip.
     ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", "auto"),
     ("poolside/Laguna-XS.2", "auto"),
+    ("unsloth/Llama-3.2-1B-Instruct", "llama-3"),
     ("openai/gpt-oss-20b", "gpt-oss"),
     ("Qwen/Qwen2.5-0.5B-Instruct", "default"),
 ]
@@ -210,6 +211,12 @@ def test_roundtrip_multiple_tool_calls(
     """Parsers that loop over ``<tool_call>…</tool_call>`` blocks can
     silently drop the second one; this test catches that."""
     _maybe_skip_tool_calls(rt_renderer_name)
+    if rt_renderer_name == "llama-3":
+        pytest.skip(
+            "Llama-3's chat template forbids >1 tool call per assistant "
+            "message (the renderer raises, mirroring the template); the "
+            "single-call path is covered by test_roundtrip_single_tool_call."
+        )
 
     msg = {
         "role": "assistant",

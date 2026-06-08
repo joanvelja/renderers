@@ -318,6 +318,31 @@ class LagunaXS2RendererConfig(BaseRendererConfig):
     chat template's ``render_assistant_messages_raw`` gate."""
 
 
+class Llama3RendererConfig(BaseRendererConfig):
+    """Llama-3.x Instruct renderer config.
+
+    Llama-3 ships no reasoning channel, so the base ``preserve_*_thinking``
+    flags don't apply: ``Llama3Renderer`` raises ``NotImplementedError``
+    if either is set (matching ``DefaultRenderer``'s contract for the
+    same case). Both fields below mirror real ``apply_chat_template``
+    kwargs.
+    """
+
+    name: Literal["llama-3"] = "llama-3"
+
+    date_string: str = "26 Jul 2024"
+    """``Today Date`` value injected into the system preamble. Pinned to
+    the chat template's ``strftime`` fallback by default so output stays
+    deterministic; override per instance for production runs that want
+    today's date. Mirrors the chat template's ``date_string`` kwarg."""
+
+    tools_in_user_message: bool = True
+    """When ``True`` (default), tool descriptions + JSON signatures inject
+    into the first user message; ``False`` routes them into the system
+    block instead. Mirrors the chat template's ``tools_in_user_message``
+    kwarg."""
+
+
 class MiniMaxM2RendererConfig(BaseRendererConfig):
     """MiniMax M2 / M2.5 renderer config."""
 
@@ -410,6 +435,7 @@ RendererConfig = Annotated[
         KimiK2RendererConfig,
         KimiK25RendererConfig,
         LagunaXS2RendererConfig,
+        Llama3RendererConfig,
         MiniMaxM2RendererConfig,
         Nemotron3RendererConfig,
         DeepSeekV3RendererConfig,
@@ -444,6 +470,7 @@ _CONFIG_BY_NAME: dict[str, type[BaseRendererConfig]] = {
     "kimi-k2": KimiK2RendererConfig,
     "kimi-k2.5": KimiK25RendererConfig,
     "laguna-xs.2": LagunaXS2RendererConfig,
+    "llama-3": Llama3RendererConfig,
     "minimax-m2": MiniMaxM2RendererConfig,
     "nemotron-3": Nemotron3RendererConfig,
     "deepseek-v3": DeepSeekV3RendererConfig,
@@ -486,6 +513,7 @@ __all__ = [
     "KimiK25RendererConfig",
     "KimiK2RendererConfig",
     "LagunaXS2RendererConfig",
+    "Llama3RendererConfig",
     "MiniMaxM2RendererConfig",
     "Nemotron3RendererConfig",
     "Qwen35RendererConfig",

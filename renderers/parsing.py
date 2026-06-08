@@ -1270,3 +1270,70 @@ def _gptoss_extract_after_token(
         return None
     after = _decode(tokenizer, header_ids[pos + 1 :]).strip()
     return after.split()[0] if after else None
+
+
+# ── Llama-3: single JSON tool call {"name": "...", "parameters": {...}} ─
+
+
+def parse_llama_3(
+    tokenizer,
+    token_ids: list[int],
+    *,
+    stop_ids: set[int],
+) -> ParsedResponse:
+    """Parse Llama-3 completion tokens.
+
+    The Llama-3 chat template emits tool calls as a single JSON blob in
+    the assistant body — ``{"name": "...", "parameters": {...}}`` — with
+    no surrounding XML tags or special tokens. Plain replies are just
+    text. We detect the tool-call shape with a strict starts-with-``{``
+    + parses-as-dict-with-name-key check; anything else is treated as
+    content. Llama-3 doesn't have a built-in reasoning channel, so
+    ``reasoning_content`` is always ``None``.
+
+    Unlike the delimiter-based formats (Qwen/GLM), the tool call has no
+    special token to anchor on, so a leading assistant role-header
+    (``<|start_header_id|>assistant<|end_header_id|>\\n\\n``) would defeat
+    the starts-with-``{`` check. Callers that slice a completion without
+    dropping the generation prompt include that scaffold; we skip past the
+    final ``<|end_header_id|>`` so the body is what we parse. The sampled
+    stream in production carries no header, making this a no-op there.
+    """
+    ids = _strip_stop_tokens(token_ids, stop_ids)
+
+    # Skip a leading assistant role-header scaffold if present.
+    body_start = 0
+    end_header_id = tokenizer.convert_tokens_to_ids("<|end_header_id|>")
+    if isinstance(end_header_id, int):
+        eh_positions = _find_all(ids, end_header_id)
+        if eh_positions:
+            body_start = eh_positions[-1] + 1
+    body_ids = ids[body_start:]
+    text = _decode(tokenizer, body_ids).strip()
+
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("name"):
+            arguments = parsed.get("parameters", parsed.get("arguments", {}))
+            return ParsedResponse(
+                content="",
+                reasoning_content=None,
+                tool_calls=[
+                    ParsedToolCall(
+                        raw=text,
+                        name=parsed["name"],
+                        arguments=arguments,
+                        token_span=(body_start, len(ids)),
+                        status=ToolCallParseStatus.OK,
+                    )
+                ],
+            )
+
+    # Not a tool-call shape (plain reply, or a ``{...}`` body that didn't
+    # parse / lacked a name). Llama-3 has no delimiter to anchor a
+    # "malformed attempt" against, so it falls through to content rather
+    # than producing a non-OK ParsedToolCall.
+    return ParsedResponse(content=text, reasoning_content=None)

@@ -1045,6 +1045,14 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "nemotron-3",
     "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16": "nemotron-3",
     "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8": "nemotron-3",
+    # Llama 3.2 (Instruct). Tested against the gated meta-llama repos and
+    # the unrestricted unsloth/... mirror, which ships a byte-identical
+    # chat template. ``Llama3Renderer`` defaults ``date_string`` to
+    # "26 Jul 2024" — matching the chat template's strftime fallback —
+    # so the renderer is reproducible. Pass ``date_string=...`` at
+    # construction to pin a different date.
+    "meta-llama/Llama-3.2-1B-Instruct": "llama-3",
+    "meta-llama/Llama-3.2-3B-Instruct": "llama-3",
     # Poolside Laguna.
     "poolside/Laguna-XS.2": "laguna-xs.2",
     # GPT-OSS.
@@ -1334,6 +1342,7 @@ def _populate_registry():
     from renderers.kimi_k2 import KimiK2Renderer
     from renderers.kimi_k25 import KimiK25Renderer
     from renderers.laguna_xs2 import LagunaXS2Renderer
+    from renderers.llama_3 import Llama3Renderer
     from renderers.minimax_m2 import MiniMaxM2Renderer
     from renderers.nemotron3 import Nemotron3Renderer
     from renderers.qwen3 import Qwen3Renderer
@@ -1356,6 +1365,7 @@ def _populate_registry():
             "kimi-k2": KimiK2Renderer,
             "kimi-k2.5": KimiK25Renderer,
             "laguna-xs.2": LagunaXS2Renderer,
+            "llama-3": Llama3Renderer,
             "nemotron-3": Nemotron3Renderer,
             "gpt-oss": GptOssRenderer,
         }

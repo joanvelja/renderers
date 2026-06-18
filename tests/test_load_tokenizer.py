@@ -154,9 +154,7 @@ def test_offset_tokenizer_uses_unsloth_mirror_for_meta_llama(monkeypatch):
     finally:
         base._offset_tokenizers.clear()
 
-    assert calls == [
-        ("unsloth/Llama-3.2-1B-Instruct", {"trust_remote_code": False})
-    ]
+    assert calls == [("unsloth/Llama-3.2-1B-Instruct", {"trust_remote_code": False})]
     assert tok.name_or_path == "meta-llama/Llama-3.2-1B-Instruct"
 
 

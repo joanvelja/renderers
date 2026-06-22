@@ -133,6 +133,39 @@ def _decode(tokenizer, ids: list[int]) -> str:
     return tokenizer.decode(ids, skip_special_tokens=False)
 
 
+def _reasoning_end_token_index(
+    tokenizer, ids: list[int], marker: str = "</think>"
+) -> int:
+    """Token index immediately past the first ``</think>`` in ``ids``.
+
+    Returns 0 when ``ids`` has no closed reasoning region — callers treat
+    that as "scan from the start" (preserves pre-existing behavior for
+    non-thinking / truncated-reasoning completions).
+
+    Used by parsers whose ``</think>`` is *not* a single special token
+    (DeepSeek-V3, Kimi-K2.5) — where it tokenizes to several pieces and is
+    context-sensitive (the closing ``>`` merges differently depending on the
+    next char), so a token-id or fixed-subsequence search isn't reliable. We
+    instead locate the boundary in decoded text via binary search over prefix
+    decodes, which holds as long as ``decode(ids[:k])`` is prefix-stable in
+    ``k`` (true for the byte-level BPE tokenizers here; ``</think>`` is clean
+    ASCII that won't straddle a byte boundary). Single-token ``</think>``
+    parsers (Qwen3) anchor on the token id directly and don't need this.
+    """
+    if not ids or marker not in _decode(tokenizer, ids):
+        return 0
+    # Smallest prefix length (in tokens) whose decode already contains the
+    # full marker — i.e. the index just past where </think> completes.
+    lo, hi = 1, len(ids)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if marker in _decode(tokenizer, ids[:mid]):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
 # ── Qwen3: <tool_call> JSON </tool_call> ────────────────────────────
 
 
@@ -143,11 +176,26 @@ def parse_qwen3(
     stop_ids: set[int],
     tool_call_id: int,
     tool_call_end_id: int,
+    reasoning_end_id: int | None = None,
 ) -> ParsedResponse:
     """Parse Qwen3 completion tokens. Hermes-style JSON tool calls."""
     ids = _strip_stop_tokens(token_ids, stop_ids)
 
-    tc_start = _find(ids, tool_call_id)
+    # Reasoning is resolved before tool calls. Thinking models (e.g.
+    # Qwen3-*-Thinking) routinely draft ``<tool_call>`` blocks *inside* their
+    # ``<think>...</think>`` trace while planning; those are reasoning, not
+    # real invocations. Anchoring the tool-call scan after the ``</think>``
+    # boundary keeps in-think drafts out of ``tool_calls`` (otherwise they
+    # surface as phantom/duplicate calls) and out of the reasoning/content
+    # split. Mirrors vLLM's DelegatingParser, which runs the reasoning parser
+    # first and tool-parses only the post-``</think>`` content.
+    # ``reasoning_end_id`` is the ``</think>`` token id; when it's absent
+    # (``None``) or the model never closed its reasoning, the scan falls back
+    # to the whole stream (prior behavior).
+    reasoning_end = _find(ids, reasoning_end_id) if reasoning_end_id is not None else -1
+    scan_start = reasoning_end + 1 if reasoning_end != -1 else 0
+
+    tc_start = _find(ids, tool_call_id, scan_start)
     tool_calls: list[ParsedToolCall] = []
     if tc_start != -1:
         content_ids = ids[:tc_start]
@@ -931,7 +979,15 @@ def parse_deepseek_v3(
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
 
-    tc_section_start = _find(ids, tool_calls_begin_id)
+    # Reasoning first: skip past </think> before looking for the tool-call
+    # section, so a section the model drafts *inside* its <think> trace isn't
+    # parsed as a real call (regression #78 — cf. parse_qwen3). content_ids
+    # still starts at 0, so the </think> text-split below recovers reasoning.
+    # DeepSeek-V3 renders </think> as multi-token text, hence the decode-based
+    # boundary finder rather than a token-id anchor.
+    reasoning_end = _reasoning_end_token_index(tokenizer, ids)
+
+    tc_section_start = _find(ids, tool_calls_begin_id, reasoning_end)
     tool_calls: list[ParsedToolCall] = []
     if tc_section_start != -1:
         content_ids = ids[:tc_section_start]
@@ -1208,6 +1264,7 @@ def parse_kimi_k2_section(
     tool_call_begin_id: int,
     tool_call_argument_begin_id: int,
     tool_call_end_id: int,
+    scan_start: int = 0,
 ) -> tuple[list[int], list[ParsedToolCall]]:
     """Split ``ids`` into ``(content_before_section, tool_calls)`` by finding
     the Kimi-style tool-call section delimiters.
@@ -1219,8 +1276,15 @@ def parse_kimi_k2_section(
     of the section and a list of ``ParsedToolCall`` covering every attempted
     block inside it; an unclosed section is still walked to whatever the model
     emitted before EOS. Returns ``(ids, [])`` when no section is present.
+
+    ``scan_start`` restricts the section search to ``ids[scan_start:]`` while
+    keeping ``content_ids = ids[:section_start]`` and all token spans relative
+    to the full ``ids``. Callers pass the post-``</think>`` index so a section
+    the model drafts inside its reasoning trace isn't parsed as a real call;
+    because ``content_ids`` still starts at 0, downstream text-based reasoning
+    extraction is unaffected (regression #78).
     """
-    section_start = _find_any(ids, tool_calls_section_begin_ids)
+    section_start = _find_any(ids, tool_calls_section_begin_ids, scan_start)
     if section_start == -1:
         return list(ids), []
     content_ids = ids[:section_start]
@@ -1516,3 +1580,70 @@ def _gptoss_extract_after_token(
         return None
     after = _decode(tokenizer, header_ids[pos + 1 :]).strip()
     return after.split()[0] if after else None
+
+
+# ── Llama-3: single JSON tool call {"name": "...", "parameters": {...}} ─
+
+
+def parse_llama_3(
+    tokenizer,
+    token_ids: list[int],
+    *,
+    stop_ids: set[int],
+) -> ParsedResponse:
+    """Parse Llama-3 completion tokens.
+
+    The Llama-3 chat template emits tool calls as a single JSON blob in
+    the assistant body — ``{"name": "...", "parameters": {...}}`` — with
+    no surrounding XML tags or special tokens. Plain replies are just
+    text. We detect the tool-call shape with a strict starts-with-``{``
+    + parses-as-dict-with-name-key check; anything else is treated as
+    content. Llama-3 doesn't have a built-in reasoning channel, so
+    ``reasoning_content`` is always ``None``.
+
+    Unlike the delimiter-based formats (Qwen/GLM), the tool call has no
+    special token to anchor on, so a leading assistant role-header
+    (``<|start_header_id|>assistant<|end_header_id|>\\n\\n``) would defeat
+    the starts-with-``{`` check. Callers that slice a completion without
+    dropping the generation prompt include that scaffold; we skip past the
+    final ``<|end_header_id|>`` so the body is what we parse. The sampled
+    stream in production carries no header, making this a no-op there.
+    """
+    ids = _strip_stop_tokens(token_ids, stop_ids)
+
+    # Skip a leading assistant role-header scaffold if present.
+    body_start = 0
+    end_header_id = tokenizer.convert_tokens_to_ids("<|end_header_id|>")
+    if isinstance(end_header_id, int):
+        eh_positions = _find_all(ids, end_header_id)
+        if eh_positions:
+            body_start = eh_positions[-1] + 1
+    body_ids = ids[body_start:]
+    text = _decode(tokenizer, body_ids).strip()
+
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("name"):
+            arguments = parsed.get("parameters", parsed.get("arguments", {}))
+            return ParsedResponse(
+                content="",
+                reasoning_content=None,
+                tool_calls=[
+                    ParsedToolCall(
+                        raw=text,
+                        name=parsed["name"],
+                        arguments=arguments,
+                        token_span=(body_start, len(ids)),
+                        status=ToolCallParseStatus.OK,
+                    )
+                ],
+            )
+
+    # Not a tool-call shape (plain reply, or a ``{...}`` body that didn't
+    # parse / lacked a name). Llama-3 has no delimiter to anchor a
+    # "malformed attempt" against, so it falls through to content rather
+    # than producing a non-OK ParsedToolCall.
+    return ParsedResponse(content=text, reasoning_content=None)

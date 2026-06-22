@@ -329,6 +329,31 @@ class LagunaXS2RendererConfig(BaseRendererConfig):
     chat template's ``render_assistant_messages_raw`` gate."""
 
 
+class Llama3RendererConfig(BaseRendererConfig):
+    """Llama-3.x Instruct renderer config.
+
+    Llama-3 ships no reasoning channel, so the base ``preserve_*_thinking``
+    flags don't apply: ``Llama3Renderer`` raises ``NotImplementedError``
+    if either is set (matching ``DefaultRenderer``'s contract for the
+    same case). Both fields below mirror real ``apply_chat_template``
+    kwargs.
+    """
+
+    name: Literal["llama-3"] = "llama-3"
+
+    date_string: str = "26 Jul 2024"
+    """``Today Date`` value injected into the system preamble. Pinned to
+    the chat template's ``strftime`` fallback by default so output stays
+    deterministic; override per instance for production runs that want
+    today's date. Mirrors the chat template's ``date_string`` kwarg."""
+
+    tools_in_user_message: bool = True
+    """When ``True`` (default), tool descriptions + JSON signatures inject
+    into the first user message; ``False`` routes them into the system
+    block instead. Mirrors the chat template's ``tools_in_user_message``
+    kwarg."""
+
+
 class MiniMaxM2RendererConfig(BaseRendererConfig):
     """MiniMax M2 / M2.5 renderer config."""
 
@@ -340,7 +365,14 @@ class MiniMaxM2RendererConfig(BaseRendererConfig):
 
 
 class Nemotron3RendererConfig(BaseRendererConfig):
-    """Nemotron 3 renderer config."""
+    """Nemotron-3 **Nano / Super** renderer config.
+
+    Nano and Super share one chat-template variant; the renderer routes both
+    through :class:`renderers.nemotron3.Nemotron3Renderer`. The Ultra variant
+    has its own template (different reasoning-block glue) and config —
+    :class:`Nemotron3UltraRendererConfig` — and is reached via the
+    ``nemotron-3-ultra`` discriminator.
+    """
 
     name: Literal["nemotron-3"] = "nemotron-3"
 
@@ -375,35 +407,64 @@ class Nemotron3RendererConfig(BaseRendererConfig):
     ``preserve_all_thinking`` / ``preserve_thinking_between_tool_calls``
     — see :class:`BaseRendererConfig` for the contract."""
 
-    # ``ultra`` is a template-variant SELECTOR — it picks which template the
-    # renderer mirrors (Ultra vs Nano/Super), not a variable passed into one;
-    # there is no ``ultra`` Jinja variable. Marked internal so the parity
-    # matrix doesn't cross it as a template field. Same ``_internal_fields``
-    # mechanism DeepSeek-V3 uses for its no-op ``enable_thinking``, for a
-    # different underlying reason (theirs is an ignored kwarg, this is a
-    # variant switch).
-    _internal_fields = frozenset({"ultra"})
+    low_effort: bool = False
+    """When ``True``, append ``\\n\\n{reasoning effort: low}`` to the last user
+    message, nudging the model toward shorter reasoning. Mirrors the **Super**
+    chat template's ``low_effort`` kwarg. A no-op on **Nano** (its template
+    doesn't define it) — exactly as ``apply_chat_template`` ignores an undefined
+    template variable; the renderer distinguishes the two by model name (see
+    ``renderers.nemotron3._is_super``)."""
+
+
+class Nemotron3UltraRendererConfig(BaseRendererConfig):
+    """Nemotron-3 **Ultra** renderer config — distinct discriminator so the
+    registry routes Ultra checkpoints to the Ultra template variant.
+
+    Ultra's template differs from Nano/Super: the reasoning block is glued as
+    ``<think>\\n{reasoning}</think>{content}`` (no ``\\n`` around ``</think>``)
+    and truncated historical turns collapse to ``<think></think>{content}``
+    (no ``\\n``). It shares the :class:`renderers.nemotron3.Nemotron3Renderer`
+    implementation, which selects the variant from ``config.name``.
+    """
+
+    name: Literal["nemotron-3-ultra"] = "nemotron-3-ultra"
+
+    enable_thinking: bool = True
+    """See :class:`Nemotron3RendererConfig.enable_thinking`."""
+
+    truncate_history_thinking: bool = True
+    """See :class:`Nemotron3RendererConfig.truncate_history_thinking`."""
+
+    medium_effort: bool = False
+    """When ``True``, append ``\\n\\n{reasoning effort: efficient}`` to the last
+    user message. Mirrors the Ultra chat template's ``medium_effort`` kwarg."""
 
 
 class DeepSeekV3RendererConfig(BaseRendererConfig):
-    """DeepSeek V3 renderer config.
+    """DeepSeek-V3 renderer config (non-reasoning).
 
-    ``enable_thinking`` is renderer-internal here — DeepSeek-V3's chat
-    template does not reference any thinking variable, so passing it to
-    ``apply_chat_template`` upstream is a no-op. The renderer uses it
-    to control the ``<think>`` prefill at the generation prompt (R1
-    distill convention).
+    DeepSeek-V3 has no thinking concept: the generation prompt is a bare
+    ``<｜Assistant｜>`` and assistant content is emitted verbatim. For the
+    reasoning variant use :class:`DeepSeekR1RendererConfig`.
     """
 
     name: Literal["deepseek-v3"] = "deepseek-v3"
 
-    enable_thinking: bool = True
-    """Renderer convention for the R1-distill family: when ``True``,
-    prefill ``<think>`` at the generation prompt. The DeepSeek-V3 Jinja
-    template ignores this kwarg upstream; it's not a chat-template
-    kwarg in the strict sense."""
 
-    _internal_fields = frozenset({"enable_thinking"})
+class DeepSeekR1RendererConfig(BaseRendererConfig):
+    """DeepSeek-R1 renderer config (reasoning).
+
+    R1 always reasons — its chat template unconditionally prefills
+    ``<think>\\n`` at the generation prompt and strips ``</think>`` from
+    historical assistant turns. There is therefore no ``enable_thinking``
+    knob (thinking is not optional), and ``preserve_*`` flags are no-ops
+    (history reasoning is always dropped); both stored for protocol
+    uniformity. Applies to full ``deepseek-ai/DeepSeek-R1`` / ``-R1-0528``
+    — NOT the R1-Distill-Qwen/Llama models, which use those base
+    tokenizers and route to the Qwen3 / Llama-3 renderers.
+    """
+
+    name: Literal["deepseek-r1"] = "deepseek-r1"
 
 
 RendererConfig = Annotated[
@@ -422,9 +483,12 @@ RendererConfig = Annotated[
         KimiK2RendererConfig,
         KimiK25RendererConfig,
         LagunaXS2RendererConfig,
+        Llama3RendererConfig,
         MiniMaxM2RendererConfig,
         Nemotron3RendererConfig,
+        Nemotron3UltraRendererConfig,
         DeepSeekV3RendererConfig,
+        DeepSeekR1RendererConfig,
     ],
     Field(discriminator="name"),
 ]
@@ -457,9 +521,12 @@ _CONFIG_BY_NAME: dict[str, type[BaseRendererConfig]] = {
     "kimi-k2": KimiK2RendererConfig,
     "kimi-k2.5": KimiK25RendererConfig,
     "laguna-xs.2": LagunaXS2RendererConfig,
+    "llama-3": Llama3RendererConfig,
     "minimax-m2": MiniMaxM2RendererConfig,
     "nemotron-3": Nemotron3RendererConfig,
+    "nemotron-3-ultra": Nemotron3UltraRendererConfig,
     "deepseek-v3": DeepSeekV3RendererConfig,
+    "deepseek-r1": DeepSeekR1RendererConfig,
 }
 
 
@@ -491,6 +558,7 @@ __all__ = [
     "AutoRendererConfig",
     "BaseRendererConfig",
     "DefaultRendererConfig",
+    "DeepSeekR1RendererConfig",
     "DeepSeekV3RendererConfig",
     "GLM45RendererConfig",
     "GLM51RendererConfig",
@@ -500,8 +568,10 @@ __all__ = [
     "KimiK25RendererConfig",
     "KimiK2RendererConfig",
     "LagunaXS2RendererConfig",
+    "Llama3RendererConfig",
     "MiniMaxM2RendererConfig",
     "Nemotron3RendererConfig",
+    "Nemotron3UltraRendererConfig",
     "Qwen35RendererConfig",
     "Qwen36RendererConfig",
     "Qwen3RendererConfig",

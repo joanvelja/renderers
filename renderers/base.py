@@ -1030,21 +1030,33 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     # MiniMax.
     "MiniMaxAI/MiniMax-M2": "minimax-m2",
     "MiniMaxAI/MiniMax-M2.5": "minimax-m2",
-    # DeepSeek V3.
+    # DeepSeek V3 (non-reasoning).
     "deepseek-ai/DeepSeek-V3": "deepseek-v3",
     "deepseek-ai/DeepSeek-V3-Base": "deepseek-v3",
+    # DeepSeek R1 (reasoning).
+    "deepseek-ai/DeepSeek-R1": "deepseek-r1",
+    "deepseek-ai/DeepSeek-R1-0528": "deepseek-r1",
     # Kimi K2 (K2.5 and K2.6 share the K2.5 template, distinct from K2).
     "moonshotai/Kimi-K2-Instruct": "kimi-k2",
     "moonshotai/Kimi-K2.5": "kimi-k2.5",
     "moonshotai/Kimi-K2.6": "kimi-k2.5",
-    # Nemotron 3. Nano / Super share one chat-template variant; the Ultra
-    # checkpoints use the Ultra variant — the renderer auto-selects it from
-    # the model name (see ``nemotron3._ULTRA_DEFAULTS``). BF16 and FP8 share the
+    # Nemotron 3. Nano / Super share one chat-template variant (``nemotron-3``);
+    # the Ultra checkpoints use the Ultra variant (``nemotron-3-ultra``, distinct
+    # ``</think>`` glue). Both route to the same Nemotron3Renderer, which selects
+    # the variant from the resolved config's ``name``. BF16 and FP8 share the
     # same tokenizer and template.
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "nemotron-3",
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "nemotron-3",
-    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16": "nemotron-3",
-    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8": "nemotron-3",
+    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16": "nemotron-3-ultra",
+    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8": "nemotron-3-ultra",
+    # Llama 3.2 (Instruct). Tested against the gated meta-llama repos and
+    # the unrestricted unsloth/... mirror, which ships a byte-identical
+    # chat template. ``Llama3Renderer`` defaults ``date_string`` to
+    # "26 Jul 2024" — matching the chat template's strftime fallback —
+    # so the renderer is reproducible. Pass ``date_string=...`` at
+    # construction to pin a different date.
+    "meta-llama/Llama-3.2-1B-Instruct": "llama-3",
+    "meta-llama/Llama-3.2-3B-Instruct": "llama-3",
     # Poolside Laguna.
     "poolside/Laguna-XS.2": "laguna-xs.2",
     # GPT-OSS.
@@ -1151,6 +1163,17 @@ TRUSTED_REVISIONS: dict[str, str] = {
 }
 
 
+# Tokenizer repos to use when a canonical model repo is gated but an
+# audited unrestricted mirror ships byte-identical tokenizer files and
+# chat_template. The returned tokenizer keeps the caller's original
+# ``name_or_path`` so exact-match renderer resolution still uses
+# ``MODEL_RENDERER_MAP``.
+TOKENIZER_SOURCE_OVERRIDES: dict[str, str] = {
+    "meta-llama/Llama-3.2-1B-Instruct": "unsloth/Llama-3.2-1B-Instruct",
+    "meta-llama/Llama-3.2-3B-Instruct": "unsloth/Llama-3.2-3B-Instruct",
+}
+
+
 # Models for which ``fastokens`` is known to diverge from vanilla
 # ``transformers.AutoTokenizer`` and therefore must NOT be patched.
 # Empirical audit ran each entry of ``MODEL_RENDERER_MAP`` through both
@@ -1164,12 +1187,50 @@ FASTOKENS_INCOMPATIBLE: frozenset[str] = frozenset(
         # doesn't yet implement.
         "deepseek-ai/DeepSeek-V3",
         "deepseek-ai/DeepSeek-V3-Base",
+        "deepseek-ai/DeepSeek-R1",
+        "deepseek-ai/DeepSeek-R1-0528",
     }
 )
 
 
 _FASTOKENS_PATCH_LOCK = threading.Lock()
 _FASTOKENS_ANNOUNCED = False
+
+
+def _tokenizer_source_for(model_name_or_path: str) -> str:
+    return TOKENIZER_SOURCE_OVERRIDES.get(model_name_or_path, model_name_or_path)
+
+
+def _tokenizer_load_kwargs(model_name_or_path: str) -> dict[str, Any]:
+    revision = TRUSTED_REVISIONS.get(model_name_or_path)
+    if revision is not None:
+        return {"trust_remote_code": True, "revision": revision}
+    return {"trust_remote_code": False}
+
+
+def _preserve_requested_tokenizer_name(
+    tokenizer,
+    *,
+    requested_name_or_path: str,
+    loaded_name_or_path: str,
+):
+    if requested_name_or_path == loaded_name_or_path:
+        return tokenizer
+
+    try:
+        tokenizer.name_or_path = requested_name_or_path
+    except Exception:
+        init_kwargs = getattr(tokenizer, "init_kwargs", None)
+        if isinstance(init_kwargs, dict):
+            init_kwargs["name_or_path"] = requested_name_or_path
+
+    if getattr(tokenizer, "name_or_path", "") != requested_name_or_path:
+        raise RuntimeError(
+            f"Loaded tokenizer for {requested_name_or_path!r} from "
+            f"{loaded_name_or_path!r}, but could not preserve the requested "
+            "name_or_path for renderer auto-resolution."
+        )
+    return tokenizer
 
 
 def _patched_load(model_name_or_path: str, **kwargs):
@@ -1309,34 +1370,47 @@ def load_tokenizer(
     validation for configs with nested ``rope_parameters``), we fall
     back to loading the repo's self-contained ``tokenizer.json``
     directly — see ``_load_tokenizer_via_auto``.
-    """
-    kwargs: dict[str, Any] = {}
-    revision = TRUSTED_REVISIONS.get(model_name_or_path)
-    if revision is not None:
-        kwargs = {"trust_remote_code": True, "revision": revision}
-    else:
-        kwargs = {"trust_remote_code": False}
 
-    if not use_fastokens or model_name_or_path in FASTOKENS_INCOMPATIBLE:
-        return _load_tokenizer_via_auto(model_name_or_path, **kwargs)
+    Canonical Meta Llama-3.2 Instruct repos are gated on HuggingFace. For
+    those exact IDs we load tokenizer files from the audited unrestricted
+    ``unsloth`` mirrors instead, then restore ``tokenizer.name_or_path`` to
+    the requested Meta ID so auto-resolution still selects ``Llama3Renderer``.
+    """
+    load_name_or_path = _tokenizer_source_for(model_name_or_path)
+    kwargs = _tokenizer_load_kwargs(load_name_or_path)
+
+    if not use_fastokens or load_name_or_path in FASTOKENS_INCOMPATIBLE:
+        tok = _load_tokenizer_via_auto(load_name_or_path, **kwargs)
+        return _preserve_requested_tokenizer_name(
+            tok,
+            requested_name_or_path=model_name_or_path,
+            loaded_name_or_path=load_name_or_path,
+        )
 
     try:
-        return _patched_load(model_name_or_path, **kwargs)
+        tok = _patched_load(load_name_or_path, **kwargs)
     except Exception as exc:
         logger.info(
             "fastokens could not load %r (%s: %s); falling back to vanilla "
             "AutoTokenizer. Add this model to FASTOKENS_INCOMPATIBLE in "
             "renderers.base to suppress the retry.",
-            model_name_or_path,
+            load_name_or_path,
             type(exc).__name__,
             str(exc)[:160],
         )
-        return _load_tokenizer_via_auto(model_name_or_path, **kwargs)
+        tok = _load_tokenizer_via_auto(load_name_or_path, **kwargs)
+
+    return _preserve_requested_tokenizer_name(
+        tok,
+        requested_name_or_path=model_name_or_path,
+        loaded_name_or_path=load_name_or_path,
+    )
 
 
 def _populate_registry():
     if RENDERER_REGISTRY:
         return
+    from renderers.deepseek_r1 import DeepSeekR1Renderer
     from renderers.deepseek_v3 import DeepSeekV3Renderer
     from renderers.default import DefaultRenderer
     from renderers.gemma4 import Gemma4Renderer
@@ -1346,8 +1420,9 @@ def _populate_registry():
     from renderers.kimi_k2 import KimiK2Renderer
     from renderers.kimi_k25 import KimiK25Renderer
     from renderers.laguna_xs2 import LagunaXS2Renderer
+    from renderers.llama_3 import Llama3Renderer
     from renderers.minimax_m2 import MiniMaxM2Renderer
-    from renderers.nemotron3 import Nemotron3Renderer
+    from renderers.nemotron3 import Nemotron3Renderer, Nemotron3UltraRenderer
     from renderers.qwen3 import Qwen3Renderer
     from renderers.qwen3_vl import Qwen3VLRenderer
     from renderers.qwen35 import Qwen35Renderer
@@ -1366,10 +1441,13 @@ def _populate_registry():
             "glm-4.5": GLM45Renderer,
             "minimax-m2": MiniMaxM2Renderer,
             "deepseek-v3": DeepSeekV3Renderer,
+            "deepseek-r1": DeepSeekR1Renderer,
             "kimi-k2": KimiK2Renderer,
             "kimi-k2.5": KimiK25Renderer,
             "laguna-xs.2": LagunaXS2Renderer,
+            "llama-3": Llama3Renderer,
             "nemotron-3": Nemotron3Renderer,
+            "nemotron-3-ultra": Nemotron3UltraRenderer,
             "gpt-oss": GptOssRenderer,
         }
     )
@@ -1696,25 +1774,57 @@ def _get_offset_tokenizer(tokenizer):
         if cached is not None:
             return cached
 
-        kwargs: dict[str, Any] = {}
-        revision = TRUSTED_REVISIONS.get(name_or_path)
-        if revision is not None:
-            kwargs = {"trust_remote_code": True, "revision": revision}
-        else:
-            kwargs = {"trust_remote_code": False}
-        # Explicitly vanilla — we want HF's Rust tokenizer with offset
-        # tracking, not the fastokens shim. ``load_tokenizer`` would
-        # patch fastokens in by default; routing through
-        # ``_load_tokenizer_via_auto`` keeps the fastokens patch out
-        # of this code path while still applying the config-build
-        # fallback (RoPE-validation failures on nested
-        # ``rope_parameters``, etc.).
-        offset_tok = _load_tokenizer_via_auto(name_or_path, **kwargs)
-        if not getattr(offset_tok, "is_fast", False):
+        load_name_or_path = _tokenizer_source_for(name_or_path)
+        kwargs = _tokenizer_load_kwargs(load_name_or_path)
+
+        def _has_offsets(tok) -> bool:
+            if not getattr(tok, "is_fast", False):
+                return False
+            try:
+                tok("a", add_special_tokens=False, return_offsets_mapping=True)
+                return True
+            except (NotImplementedError, ValueError, TypeError):
+                return False
+
+        # We want HF's Rust tokenizer with offset tracking, not the fastokens
+        # shim. The shim is installed by a *process-global* monkeypatch that
+        # ``load_tokenizer`` toggles per pool-slot load, so a plain reload here
+        # can race a concurrent slot's open patch window and silently pick up
+        # the offset-less shim (then get cached, poisoning the process). So:
+        # load, verify offsets, and if missing, reload with the patch forced
+        # off — serialized against pool patch/unpatch via ``_FASTOKENS_PATCH_LOCK``
+        # so no concurrent window can swap the shim back in mid-load — then
+        # restore the prior patch state. Never cache a non-offset tokenizer.
+        offset_tok = _load_tokenizer_via_auto(load_name_or_path, **kwargs)
+        offset_tok = _preserve_requested_tokenizer_name(
+            offset_tok,
+            requested_name_or_path=name_or_path,
+            loaded_name_or_path=load_name_or_path,
+        )
+        if not _has_offsets(offset_tok):
+            import fastokens
+
+            with _FASTOKENS_PATCH_LOCK:
+                was_patched = bool(getattr(fastokens, "_patched", False))
+                if was_patched:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        fastokens.unpatch_transformers()
+                try:
+                    offset_tok = _load_tokenizer_via_auto(load_name_or_path, **kwargs)
+                    offset_tok = _preserve_requested_tokenizer_name(
+                        offset_tok,
+                        requested_name_or_path=name_or_path,
+                        loaded_name_or_path=load_name_or_path,
+                    )
+                finally:
+                    if was_patched:
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            fastokens.patch_transformers()
+        if not _has_offsets(offset_tok):
             raise RuntimeError(
-                f"Vanilla tokenizer for {name_or_path!r} is not a fast "
-                "tokenizer; offset_mapping is unavailable. Hand-coded "
-                "renderers require a fast tokenizer for body/scaffold "
+                f"Could not load an offset-capable tokenizer for {name_or_path!r}: "
+                "offset_mapping is unavailable even with the fastokens patch off. "
+                "Hand-coded renderers require a fast tokenizer for body/scaffold "
                 "attribution."
             )
         _offset_tokenizers[name_or_path] = offset_tok

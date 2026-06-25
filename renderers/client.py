@@ -53,7 +53,10 @@ class OverlongPromptError(Exception):
     def __init__(self, *, prompt_len: int, max_prompt_len: int) -> None:
         self.prompt_len = prompt_len
         self.max_prompt_len = max_prompt_len
-        super().__init__(f"Prompt length ({prompt_len}) exceeds maximum context length ({max_prompt_len}).")
+        super().__init__(
+            f"Prompt length ({prompt_len}) exceeds maximum "
+            f"context length ({max_prompt_len})."
+        )
 
 
 # Per-process cache of resolved engine context-length caps, keyed by
@@ -230,12 +233,16 @@ async def generate(
             rendered,
         )
 
-    prompt_ids, stop_token_ids, mm_data, prompt_attr = await _maybe_offload(renderer, _prepare)
+    prompt_ids, stop_token_ids, mm_data, prompt_attr = await _maybe_offload(
+        renderer, _prepare
+    )
 
     if max_prompt_len is None:
         max_prompt_len = await _resolve_max_prompt_len(client, model)
     if max_prompt_len is not None and len(prompt_ids) > max_prompt_len:
-        raise OverlongPromptError(prompt_len=len(prompt_ids), max_prompt_len=max_prompt_len)
+        raise OverlongPromptError(
+            prompt_len=len(prompt_ids), max_prompt_len=max_prompt_len
+        )
 
     sp: dict[str, Any] = dict(sampling_params or {})
     sp["stop_token_ids"] = stop_token_ids
@@ -247,7 +254,11 @@ async def generate(
         "token_ids": prompt_ids,
         "sampling_params": sp,
     }
-    features = _build_mm_features(renderer, mm_data) if mm_data and not mm_data.is_empty() else None
+    features = (
+        _build_mm_features(renderer, mm_data)
+        if mm_data and not mm_data.is_empty()
+        else None
+    )
     if features is not None:
         body["features"] = features
     if cache_salt is not None:
@@ -278,7 +289,9 @@ async def generate(
     choice = (data.get("choices") or [{}])[0]
     completion_ids = choice.get("token_ids") or []
 
-    parsed = await _maybe_offload(renderer, lambda: renderer.parse_response(completion_ids, tools=tools))
+    parsed = await _maybe_offload(
+        renderer, lambda: renderer.parse_response(completion_ids, tools=tools)
+    )
 
     # ChatCompletionLogProbs flatten: {"content": [{"logprob": ...}, ...]}
     raw_logprobs = choice.get("logprobs") or {}
@@ -296,7 +309,9 @@ async def generate(
     # ``parsed.tool_calls`` so verifiers can inspect them, but they don't
     # trigger the tool-loop continuation.
     finish_reason = choice.get("finish_reason")
-    ok_tool_calls = [tc for tc in parsed.tool_calls if tc.status == ToolCallParseStatus.OK]
+    ok_tool_calls = [
+        tc for tc in parsed.tool_calls if tc.status == ToolCallParseStatus.OK
+    ]
     if ok_tool_calls and finish_reason == "stop":
         finish_reason = "tool_calls"
 
@@ -356,7 +371,9 @@ def _build_mm_features(
     # Type dispatch only needs the renderer class. Pools expose
     # ``renderer_cls`` as a snapshot attribute, so we don't have to check
     # out a slot just to read ``type(r)``.
-    renderer_cls = renderer.renderer_cls if isinstance(renderer, RendererPool) else type(renderer)
+    renderer_cls = (
+        renderer.renderer_cls if isinstance(renderer, RendererPool) else type(renderer)
+    )
 
     # Qwen3-VL and Qwen3.5 both ship ``pixel_values`` + ``image_grid_thw``
     # via the shared Qwen2-VL field factory. ``spatial_merge_size=2`` is
@@ -370,7 +387,9 @@ def _build_mm_features(
     )
 
 
-def _build_qwen_vl_features(mm_data: MultiModalData, *, spatial_merge_size: int) -> dict[str, Any]:
+def _build_qwen_vl_features(
+    mm_data: MultiModalData, *, spatial_merge_size: int
+) -> dict[str, Any]:
     """vLLM features payload for the Qwen-VL family (Qwen2-VL / Qwen3-VL).
 
     Stacks per-image processor outputs back into a batched ``BatchFeature``,
@@ -405,16 +424,23 @@ def _build_qwen_vl_features(mm_data: MultiModalData, *, spatial_merge_size: int)
         # mm_items now ship numpy arrays (the renderer is torch-free);
         # convert at this vLLM-glue boundary where torch is already a
         # hard dependency.
-        pixel_values = torch.cat([torch.as_tensor(it["pixel_values"]) for it in image_items], dim=0)
-        image_grid_thw = torch.cat([torch.as_tensor(it["image_grid_thw"]) for it in image_items], dim=0)
-        hf_inputs = BatchFeature(data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw})
+        pixel_values = torch.cat(
+            [torch.as_tensor(it["pixel_values"]) for it in image_items], dim=0
+        )
+        image_grid_thw = torch.cat(
+            [torch.as_tensor(it["image_grid_thw"]) for it in image_items], dim=0
+        )
+        hf_inputs = BatchFeature(
+            data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw}
+        )
         config = _create_qwen2vl_field_factory(spatial_merge_size)(hf_inputs)
         kwargs_items = MultiModalKwargsItems.from_hf_inputs(hf_inputs, config)
         encoded = [encode_mm_kwargs_item(it) for it in kwargs_items["image"]]
         out["kwargs_data"]["image"] = encoded
         out["mm_hashes"]["image"] = list(mm_data.mm_hashes.get("image") or [])
         out["mm_placeholders"]["image"] = [
-            {"offset": p.offset, "length": p.length} for p in mm_data.mm_placeholders.get("image") or []
+            {"offset": p.offset, "length": p.length}
+            for p in mm_data.mm_placeholders.get("image") or []
         ]
 
     # If kwargs_data is empty across all modalities, drop the key so vLLM

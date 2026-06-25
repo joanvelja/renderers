@@ -32,16 +32,12 @@ class _FakeRenderer:
         )
 
     def render_ids(self, messages, *, tools=None, add_generation_prompt=False):
-        return self.render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
-        ).token_ids
+        return self.render(messages, tools=tools, add_generation_prompt=add_generation_prompt).token_ids
 
     def get_stop_token_ids(self):
         return [99]
 
-    def parse_response(
-        self, completion_ids: list[int], *, tools=None
-    ) -> ParsedResponse:
+    def parse_response(self, completion_ids: list[int], *, tools=None) -> ParsedResponse:
         assert completion_ids == [7, 8]
         # Stores tools so tests can assert the client plumbed them through.
         self._last_parse_tools = tools
@@ -69,9 +65,7 @@ class _FakeClient:
         self.base_url = "http://fake-host:8000/v1"
 
     async def post(self, path, *, cast_to=dict, body=None, options=None):
-        self.calls.append(
-            {"path": path, "cast_to": cast_to, "body": body, "options": options}
-        )
+        self.calls.append({"path": path, "cast_to": cast_to, "body": body, "options": options})
         routed_experts = np.array([[[1]], [[2]]], dtype=np.uint8)
         payload = {
             "request_id": "gen-test",
@@ -87,9 +81,7 @@ class _FakeClient:
                     },
                     "finish_reason": "stop",
                     "routed_experts": {
-                        "data": base64.b64encode(routed_experts.tobytes()).decode(
-                            "ascii"
-                        ),
+                        "data": base64.b64encode(routed_experts.tobytes()).decode("ascii"),
                         "shape": list(routed_experts.shape),
                     },
                 }
@@ -119,9 +111,7 @@ def test_generate_builds_request_body_and_parses_response():
 
     # The client must plumb `tools` through to parse_response so XML-style
     # parsers can preserve declared-string args verbatim.
-    assert renderer._last_parse_tools == [
-        {"type": "function", "function": {"name": "echo"}}
-    ]
+    assert renderer._last_parse_tools == [{"type": "function", "function": {"name": "echo"}}]
 
     assert len(client.calls) == 1
     # /inference/v1/generate is mounted at the server root, so we post to
@@ -178,9 +168,7 @@ def test_generate_builds_request_body_and_parses_response():
 class _MalformedToolRenderer(_FakeRenderer):
     """Returns only a malformed tool-call attempt — finish_reason must stay "stop"."""
 
-    def parse_response(
-        self, completion_ids: list[int], *, tools=None
-    ) -> ParsedResponse:
+    def parse_response(self, completion_ids: list[int], *, tools=None) -> ParsedResponse:
         return ParsedResponse(
             content="",
             reasoning_content=None,
@@ -291,9 +279,7 @@ def test_generate_threads_prompt_attribution_through_prebuilt_prompt_path():
     ],
     ids=["qwen3_vl", "qwen35"],
 )
-def test_generate_serializes_multimodal_features_for_qwen_vl_family(
-    model_id, renderer_class_path
-):
+def test_generate_serializes_multimodal_features_for_qwen_vl_family(model_id, renderer_class_path):
     """When the renderer emits ``MultiModalData``, ``generate`` translates
     it into vLLM's ``features`` payload (mm_hashes + mm_placeholders +
     base64-encoded kwargs_data) and sticks it in the request body. Covers

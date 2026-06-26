@@ -12,7 +12,6 @@ achieve real parallelism.
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 from collections.abc import Mapping
@@ -122,19 +121,14 @@ async def _maybe_offload(renderer: Renderer | RendererPool, fn):
     return fn()
 
 
-def strip_routed_experts_data(raw: bytes) -> tuple[bytes, bytes | None]:
+def strip_routed_experts_data(raw: bytes) -> tuple[bytes, memoryview | None]:
     data_start = raw.find(ROUTED_EXPERTS_DATA_PREFIX)
     if data_start < 0:
         return raw, None
 
     data_start += len(ROUTED_EXPERTS_DATA_PREFIX)
     data_end = raw.index(b'"', data_start)
-    # Copy the b64 slice out of ``raw`` and decode it once, here, into raw
-    # uint8 bytes. Slicing ``bytes`` (not ``memoryview``) yields an owned copy,
-    # so ``raw`` (the full multi-MB HTTP body) becomes collectable as soon as
-    # ``stripped`` is built — no lingering memoryview pin. Downstream the site's
-    # "data" is already raw bytes, so the worker walk / wire never re-decode b64.
-    routed_data = base64.b64decode(raw[data_start:data_end])
+    routed_data = memoryview(raw)[data_start:data_end]
     stripped = raw[:data_start] + raw[data_end:]
     return stripped, routed_data
 

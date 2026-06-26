@@ -150,8 +150,11 @@ def test_generate_builds_request_body_and_parses_response():
     assert result["completion_ids"] == [7, 8]
     assert result["completion_logprobs"] == [-0.1, -0.2]
     assert result["routed_experts"]["shape"] == [2, 1, 1]
-    assert isinstance(result["routed_experts"]["data"], memoryview)
-    assert result["routed_experts"]["data"].tobytes() == base64.b64encode(b"\x01\x02")
+    # The renderer copies the routed_experts slice out of the HTTP body and
+    # decodes b64 once, so "data" is raw uint8 bytes (no memoryview pin, no
+    # downstream b64 decode).
+    assert isinstance(result["routed_experts"]["data"], bytes)
+    assert result["routed_experts"]["data"] == b"\x01\x02"
     assert result["multi_modal_data"] is None
     assert result["request_id"] == "gen-test"
     # Per-token attribution from the renderer surfaces on the result so

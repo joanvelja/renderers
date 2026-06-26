@@ -18,7 +18,11 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from renderers.configs import AutoRendererConfig, RendererConfig
+    from renderers.configs import (
+        AutoRendererConfig,
+        RendererConfig,
+        ResolvedThinkingRetention,
+    )
 
 logger = logging.getLogger("renderers.base")
 
@@ -664,15 +668,12 @@ class Renderer(Protocol):
         """Render messages to token IDs with per-token message attribution.
 
         Behaviour around historical ``reasoning_content`` is owned by the
-        renderer instance — the ``preserve_all_thinking`` and
-        ``preserve_thinking_between_tool_calls`` flags are constructor
-        kwargs, not call-site kwargs. To render with a different
-        configuration, build a different renderer (or different pool).
-        Defaults preserve byte-identity with each model's chat template;
-        flipping a flag at construction restores ``reasoning_content``
-        the template would otherwise drop. See
-        ``should_preserve_past_thinking`` for the per-message
-        classification.
+        renderer instance — the ``thinking_retention`` level is resolved at
+        construction, not passed per call. To render with a different
+        configuration, build a different renderer (or different pool). When
+        ``thinking_retention`` is left unset, full renders follow the model's
+        chat template and bridge policy is derived from that template's own
+        history-retention knobs.
         """
         ...
 
@@ -767,8 +768,12 @@ class Renderer(Protocol):
         Return ``None`` whenever the renderer can't prove that contract
         holds — the caller falls back to a full re-render. In particular,
         bridges refuse assistant messages in ``new_messages`` (those would
-        re-tokenize model-sampled content). Hand-coded renderers know their
-        canonical close and synthesise it on truncated priors;
+        re-tokenize model-sampled content). They also follow the renderer's
+        resolved thinking-retention bridge policy: ``"template"`` always
+        re-renders, ``"tool_cycle"`` re-renders at a new user-query boundary,
+        and ``"all"`` allows extension when the rest of the structural bridge
+        checks pass. Hand-coded renderers know their canonical close and
+        synthesise it on truncated priors;
         DefaultRenderer always returns ``None`` because the template's
         close is unknown.
         """
@@ -1335,6 +1340,7 @@ def create_renderer_pool(
     config: RendererConfig | None = None,
     *,
     size: int = 16,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> RendererPool:
     """Create a RendererPool with *size* independent tokenizer copies.
 
@@ -1346,8 +1352,10 @@ def create_renderer_pool(
     :data:`renderers.RendererConfig`). Defaults to
     :class:`AutoRendererConfig`, which resolves to a concrete renderer
     via ``MODEL_RENDERER_MAP`` at construction time using the loaded
-    tokenizer's name. Every slot in the pool shares the same config; to
-    run a different config, build a different pool.
+    tokenizer's name. ``chat_template_kwargs`` are merged into the
+    resolved concrete config and validated before renderer construction.
+    Every slot in the pool shares the same config; to run a different
+    config, build a different pool.
 
     Tokenizers load via ``load_tokenizer`` — see its docstring for the
     ``trust_remote_code`` policy (default off; Moonshot Kimi-K2 family
@@ -1356,7 +1364,11 @@ def create_renderer_pool(
 
     def factory() -> Renderer:
         tokenizer = load_tokenizer(tokenizer_name_or_path)
-        return create_renderer(tokenizer, config)
+        return create_renderer(
+            tokenizer,
+            config,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
     return RendererPool(factory, size=size)
 
@@ -1364,6 +1376,8 @@ def create_renderer_pool(
 def create_renderer(
     tokenizer,
     config: RendererConfig | None = None,
+    *,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
 ) -> Renderer:
     """Create a Renderer from a typed config.
 
@@ -1379,33 +1393,77 @@ def create_renderer(
             template-control kwargs (e.g. ``enable_thinking``), pass
             the specific :class:`Qwen3RendererConfig`,
             :class:`GLM5RendererConfig` etc. and set those fields.
+        chat_template_kwargs: Optional per-run chat-template kwargs. When
+            ``config`` is auto/``None``, renderers first resolves the concrete
+            config from ``tokenizer.name_or_path`` and then validates these
+            kwargs against that config.
 
     Selecting the auto-renderer for a model without a registered
     renderer falls back to :class:`DefaultRenderer` for text-only models
     and raises for VLMs (where ``apply_chat_template`` would silently
     drop images).
     """
-    from renderers.configs import AutoRendererConfig
-
     _populate_registry()
+
+    config = _resolve_renderer_config(
+        tokenizer,
+        config,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    cls = RENDERER_REGISTRY.get(config.name)
+    if cls is None:
+        raise ValueError(
+            f"Unknown renderer {config.name!r}. Available: {', '.join(sorted(RENDERER_REGISTRY))}"
+        )
+    return cls(tokenizer, config)
+
+
+def _merge_chat_template_kwargs(
+    config: RendererConfig,
+    chat_template_kwargs: Mapping[str, Any] | None,
+) -> RendererConfig:
+    if not chat_template_kwargs:
+        return config
+    if not isinstance(chat_template_kwargs, Mapping):
+        raise TypeError("chat_template_kwargs must be a mapping.")
+    data: dict[str, Any] = {"name": config.name}
+    for field_name in config.__pydantic_fields_set__:
+        data[field_name] = getattr(config, field_name)
+    data.update(getattr(config, "model_extra", None) or {})
+    data.update(dict(chat_template_kwargs))
+    return type(config).model_validate(data)
+
+
+def _resolve_renderer_config(
+    tokenizer,
+    config: RendererConfig | None,
+    *,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+) -> RendererConfig:
+    """Resolve auto/default config and merge chat-template kwargs."""
+    from renderers.configs import AutoRendererConfig
 
     if config is None:
         config = AutoRendererConfig()
 
-    if not isinstance(config, AutoRendererConfig):
-        cls = RENDERER_REGISTRY.get(config.name)
-        if cls is None:
-            raise ValueError(
-                f"Unknown renderer {config.name!r}. Available: {', '.join(sorted(RENDERER_REGISTRY))}"
-            )
-        return cls(tokenizer, config)
+    if isinstance(config, AutoRendererConfig):
+        return _resolve_auto_config(
+            tokenizer,
+            config,
+            chat_template_kwargs=chat_template_kwargs,
+        )
 
-    return _resolve_auto(tokenizer, config)
+    return _merge_chat_template_kwargs(config, chat_template_kwargs)
 
 
-def _resolve_auto(tokenizer, auto: AutoRendererConfig) -> Renderer:
+def _resolve_auto_config(
+    tokenizer,
+    auto: AutoRendererConfig,
+    *,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+) -> RendererConfig:
     """Map ``AutoRendererConfig`` → concrete typed config via the
-    tokenizer's ``name_or_path``, then instantiate the matching renderer.
+    tokenizer's ``name_or_path``.
 
     Fine-tunes and renamed checkpoints miss on purpose — their chat
     template may differ from the original even when the architecture
@@ -1417,14 +1475,24 @@ def _resolve_auto(tokenizer, auto: AutoRendererConfig) -> Renderer:
     model_name = getattr(tokenizer, "name_or_path", "")
     renderer_name = MODEL_RENDERER_MAP.get(model_name)
 
-    preserve_carry = {
-        "preserve_all_thinking": auto.preserve_all_thinking,
-        "preserve_thinking_between_tool_calls": auto.preserve_thinking_between_tool_calls,
-    }
+    preserve_carry = {}
+    if auto.thinking_retention is not None:
+        preserve_carry["thinking_retention"] = auto.thinking_retention
 
     if renderer_name is not None:
         cfg_cls = _config_class_for(renderer_name)
-        return RENDERER_REGISTRY[renderer_name](tokenizer, cfg_cls(**preserve_carry))
+        return _merge_chat_template_kwargs(
+            cfg_cls(**preserve_carry),
+            chat_template_kwargs,
+        )
+
+    if chat_template_kwargs:
+        raise ValueError(
+            "AutoRendererConfig cannot apply chat_template_kwargs for unknown "
+            f"model {model_name!r}. Pass an explicit model-specific renderer "
+            "config, or use DefaultRendererConfig explicitly for opaque "
+            "apply_chat_template kwargs."
+        )
 
     # No match. For VLMs this must be fatal: DefaultRenderer only knows
     # ``apply_chat_template`` + text tokens, so it would silently drop
@@ -1445,11 +1513,12 @@ def _resolve_auto(tokenizer, auto: AutoRendererConfig) -> Renderer:
     # Text-only fall back to default (apply_chat_template). For fine-tunes
     # with customized chat templates this is the *correct* choice, so we
     # don't warn. Note the pick at INFO and advertise the parser knobs.
-    if auto.preserve_all_thinking or auto.preserve_thinking_between_tool_calls:
+    if auto.thinking_retention is not None:
         raise NotImplementedError(
             "Auto-resolved DefaultRenderer can't selectively re-emit "
             "dropped reasoning_content. Pass an explicit typed renderer "
-            "config (model-specific) if you need preserve_*_thinking."
+            "config (model-specific) if you need thinking_retention != "
+            "'template'."
         )
     logger.info(
         "No model-specific renderer matched %r. Using DefaultRenderer "
@@ -1457,7 +1526,7 @@ def _resolve_auto(tokenizer, auto: AutoRendererConfig) -> Renderer:
         "reasoning_parser=...) to enable structured output parsing.",
         model_name or "<unnamed tokenizer>",
     )
-    return RENDERER_REGISTRY["default"](tokenizer, DefaultRendererConfig())
+    return DefaultRendererConfig()
 
 
 # ---------------------------------------------------------------------------
@@ -1725,51 +1794,52 @@ def reject_assistant_in_extension(new_messages: list[Message]) -> bool:
     return any(m.get("role") == "assistant" for m in new_messages)
 
 
-def should_preserve_past_thinking(
-    messages: list[Message],
-    msg_idx: int,
+def _is_user_message(message: Message) -> bool:
+    return message.get("role") == "user"
+
+
+def introduces_user_query(
+    new_messages: list[Message],
     *,
-    preserve_all_thinking: bool,
-    preserve_thinking_between_tool_calls: bool,
+    is_user_query: Callable[[Message], bool] = _is_user_message,
 ) -> bool:
-    """Should ``messages[msg_idx]``'s ``reasoning_content`` be emitted as
-    thinking even when the chat template would drop it?
+    """Return True if ``new_messages`` opens a new user-query turn.
 
-    Returns ``True`` only as an override above the template default. Each
-    renderer ORs this into its own "render thinking?" condition; a result
-    of ``False`` means "follow the template" (drop or keep as the template
-    decides), not "force-drop".
-
-    Override rules:
-
-    - ``preserve_all_thinking`` — every past-asst's thinking is kept.
-    - ``preserve_thinking_between_tool_calls`` — keeps thinking only
-      inside the *current* tool cycle: the contiguous A-T-...-A block
-      after the most recent ``user`` message, and only if that block
-      contains at least one ``tool`` response. As soon as a new
-      ``user`` turn arrives, the previous block becomes "older" and
-      its thinking is dropped (template default), matching how most
-      chat templates already handle multi-turn contexts. Use
-      ``preserve_all_thinking`` if you need thinking on older blocks
-      to survive the user-turn boundary too.
+    The generic boundary is any ``role="user"`` message. Renderers whose
+    chat templates define a narrower notion of query boundary can pass their
+    own predicate, but the shared default stays role-based.
     """
-    if preserve_all_thinking:
+    return any(is_user_query(m) for m in new_messages)
+
+
+def resolve_thinking_retention(
+    config: Any,
+    implied: ResolvedThinkingRetention,
+) -> ResolvedThinkingRetention:
+    """Resolve the effective bridge policy for a renderer instance.
+
+    ``config.thinking_retention is None`` means "derive from template knobs";
+    otherwise the explicit generic bridge policy wins. Conflicting explicit
+    template/generic knobs are rejected by the typed config validators.
+    """
+    requested = getattr(config, "thinking_retention", None)
+    if requested is None:
+        return implied
+    return requested
+
+
+def should_rerender_for_thinking_retention(
+    thinking_retention: ResolvedThinkingRetention,
+    new_messages: list[Message],
+    *,
+    is_user_query: Callable[[Message], bool] = _is_user_message,
+) -> bool:
+    """Return True when the resolved policy requires a full re-render."""
+    if thinking_retention == "template":
         return True
-    if not preserve_thinking_between_tool_calls:
+    if thinking_retention == "all":
         return False
-    # Most recent user message (or -1 if none).
-    last_user = -1
-    for j in range(len(messages) - 1, -1, -1):
-        if messages[j].get("role") == "user":
-            last_user = j
-            break
-    if msg_idx <= last_user:
-        return False
-    # The current segment must contain a tool response for it to count
-    # as an in-flight tool cycle.
-    return any(
-        messages[j].get("role") == "tool" for j in range(last_user + 1, len(messages))
-    )
+    return introduces_user_query(new_messages, is_user_query=is_user_query)
 
 
 def build_trajectory_step(

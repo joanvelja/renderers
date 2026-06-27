@@ -20,7 +20,8 @@ from renderers.base import (
     ToolSpec,
     _get_offset_tokenizer,
     extract_message_tool_names,
-    should_preserve_past_thinking,
+    resolve_thinking_retention,
+    should_rerender_for_thinking_retention,
     trim_to_turn_close,
 )
 from renderers.configs import Gemma4RendererConfig
@@ -67,6 +68,13 @@ class Gemma4Renderer:
     ):
         self._tokenizer = tokenizer
         self.config = config or Gemma4RendererConfig()
+        # Default to retaining thinking across turns: the bridge reuses the prior
+        # prefix verbatim (token-faithful prefix continuation / stable KV cache).
+        # Configurable via thinking_retention (e.g. "tool_cycle" to drop at a new
+        # user-query boundary).
+        self.effective_thinking_retention = resolve_thinking_retention(
+            self.config, "all"
+        )
         self._turn_end = self._token_id("<turn|>")
         self._tool_call = self._token_id("<|tool_call>")
         self._tool_call_end = self._token_id("<tool_call|>")
@@ -583,23 +591,17 @@ class Gemma4Renderer:
             is_assistant = role == "assistant"
             tool_calls = msg.get("tool_calls") or []
             thinking_text = msg.get("reasoning") or msg.get("reasoning_content")
-            preserve_thinking = is_assistant and should_preserve_past_thinking(
-                messages,
-                msg_idx,
-                preserve_all_thinking=self.config.preserve_all_thinking,
-                preserve_thinking_between_tool_calls=self.config.preserve_thinking_between_tool_calls,
-            )
+            # render() is retention-agnostic (canonical thinking_retention model,
+            # matching upstream renderers): only the current tool cycle's reasoning
+            # is emitted inline; cross-turn retention is handled by
+            # bridge_to_next_turn via should_rerender_for_thinking_retention.
             native_thinking = (
                 is_assistant
                 and isinstance(thinking_text, str)
                 and local_idx > last_user
                 and bool(tool_calls)
             )
-            if (
-                (native_thinking or preserve_thinking)
-                and isinstance(thinking_text, str)
-                and thinking_text
-            ):
+            if native_thinking and thinking_text:
                 emit("<|channel>thought\n", msg_idx, is_sampled=True, is_content=True)
                 emit(thinking_text, msg_idx, is_sampled=True, is_content=True)
                 emit("\n<channel|>", msg_idx, is_sampled=True, is_content=True)
@@ -765,6 +767,9 @@ class Gemma4Renderer:
             or not new_messages
             or self._uses_tooling(new_messages, tools)
             or any(msg.get("role") == "assistant" for msg in new_messages)
+            or should_rerender_for_thinking_retention(
+                self.effective_thinking_retention, new_messages
+            )
         ):
             return None
 

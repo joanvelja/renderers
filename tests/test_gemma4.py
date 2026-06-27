@@ -90,7 +90,7 @@ MULTI_TOOLS = [
 
 @lru_cache(maxsize=1)
 def _gemma4():
-    tokenizer = load_tokenizer("google/gemma-4-E2B-it", use_fastokens=False)
+    tokenizer = load_tokenizer("google/gemma-4-E2B-it")
     renderer = create_renderer(tokenizer)
     return tokenizer, renderer
 
@@ -170,7 +170,7 @@ def test_gemma4_generation_prompt_parity_across_it_sizes(
     gemma4_model_name,
     enable_thinking,
 ):
-    tokenizer = load_tokenizer(gemma4_model_name, use_fastokens=False)
+    tokenizer = load_tokenizer(gemma4_model_name)
     renderer = create_renderer(
         tokenizer,
         Gemma4RendererConfig(enable_thinking=enable_thinking),
@@ -187,7 +187,7 @@ def test_gemma4_generation_prompt_parity_across_it_sizes(
 
 @pytest.mark.parametrize("enable_thinking", [True, False])
 def test_gemma4_text_and_tool_chat_parity_with_hf_template(enable_thinking):
-    tokenizer = load_tokenizer("google/gemma-4-E2B-it", use_fastokens=False)
+    tokenizer = load_tokenizer("google/gemma-4-E2B-it")
     renderer = create_renderer(
         tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking)
     )
@@ -383,7 +383,11 @@ def test_gemma4_render_accepts_openai_json_string_arguments():
 
 @pytest.mark.parametrize("enable_thinking", [True, False])
 def test_gemma4_bridge_matches_full_render(enable_thinking):
-    tokenizer = load_tokenizer("google/gemma-4-E2B-it", use_fastokens=False)
+    tokenizer = load_tokenizer("google/gemma-4-E2B-it")
+    # Default retention retains thinking across turns (prefix continuation): the
+    # bridge reuses the prior prefix verbatim and must equal a full render.
+    # Opting out (thinking_retention="tool_cycle") drops it at a new user-query
+    # boundary — asserted at the end.
     renderer = create_renderer(
         tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking)
     )
@@ -406,6 +410,21 @@ def test_gemma4_bridge_matches_full_render(enable_thinking):
         add_generation_prompt=True,
     )
     assert bridged.message_tool_names == [None]
+
+    # Opting out via thinking_retention="tool_cycle" drops thinking at a new
+    # user-query boundary -> full re-render required (None).
+    drop_renderer = create_renderer(
+        tokenizer,
+        Gemma4RendererConfig(
+            enable_thinking=enable_thinking, thinking_retention="tool_cycle"
+        ),
+    )
+    assert (
+        drop_renderer.bridge_to_next_turn(
+            previous_prompt_ids, previous_completion_ids, next_turn
+        )
+        is None
+    )
 
 
 def test_gemma4_rejects_non_text_multimodal_parts_until_sidecar_exists():

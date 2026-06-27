@@ -15,6 +15,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -167,7 +168,7 @@ async def generate(
 
     ``sampling_params`` is forwarded to vLLM verbatim. Two fields are always
     set by us and override caller values: ``stop_token_ids`` (from the
-    renderer) and ``logprobs=1`` (we always emit completion_logprobs). Pass
+    renderer) and ``logprobs=0`` (sampled-token completion logprobs). Pass
     ``prompt_ids`` to skip rendering and use a prebuilt token sequence —
     pair it with ``multi_modal_data`` when the prebuilt prompt has image /
     video placeholders that need engine-side mm payload, and with
@@ -246,7 +247,7 @@ async def generate(
 
     sp: dict[str, Any] = dict(sampling_params or {})
     sp["stop_token_ids"] = stop_token_ids
-    sp["logprobs"] = 1
+    sp["logprobs"] = 0
     sp.setdefault("skip_special_tokens", False)
 
     body: dict[str, Any] = {
@@ -287,7 +288,15 @@ async def generate(
     data = parse_generate_response(raw_response.content)
 
     choice = (data.get("choices") or [{}])[0]
-    completion_ids = choice.get("token_ids") or []
+    raw_completion_ids = choice.get("token_ids")
+    if not isinstance(raw_completion_ids, list):
+        raise ValueError("completion token ids must be a list")
+    if any(
+        isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0
+        for token_id in raw_completion_ids
+    ):
+        raise ValueError("completion token ids must be non-negative integers")
+    completion_ids = raw_completion_ids
 
     parsed = await _maybe_offload(
         renderer, lambda: renderer.parse_response(completion_ids, tools=tools)
@@ -296,7 +305,14 @@ async def generate(
     # ChatCompletionLogProbs flatten: {"content": [{"logprob": ...}, ...]}
     raw_logprobs = choice.get("logprobs") or {}
     content_lp = raw_logprobs.get("content") if isinstance(raw_logprobs, dict) else None
-    completion_logprobs = [float(c.get("logprob") or 0.0) for c in content_lp or []]
+    completion_logprobs = [float(c["logprob"]) for c in content_lp or []]
+    if len(completion_logprobs) != len(completion_ids):
+        raise ValueError(
+            "completion logprobs length does not match completion token ids "
+            f"({len(completion_logprobs)} != {len(completion_ids)})"
+        )
+    if not all(math.isfinite(logprob) for logprob in completion_logprobs):
+        raise ValueError("finite completion logprobs required")
 
     routed_experts = choice.get("routed_experts")
 

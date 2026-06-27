@@ -77,10 +77,14 @@ def load_config(pretrained_model_name_or_path: str, **kwargs):
     kwargs["_from_auto"] = True
     kwargs["name_or_path"] = pretrained_model_name_or_path
 
-    config_dict, unused_kwargs = PreTrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+    config_dict, unused_kwargs = PreTrainedConfig.get_config_dict(
+        pretrained_model_name_or_path, **kwargs
+    )
     config_dict = normalize_legacy_rope_config(config_dict)
 
-    has_remote_code = "auto_map" in config_dict and "AutoConfig" in config_dict["auto_map"]
+    has_remote_code = (
+        "auto_map" in config_dict and "AutoConfig" in config_dict["auto_map"]
+    )
     if has_remote_code and trust_remote_code:
         if code_revision is not None:
             auto_kwargs["code_revision"] = code_revision
@@ -114,4 +118,6 @@ def load_direct_fast_tokenizer(pretrained_model_name_or_path: str, **kwargs):
     """
     from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 
-    return PreTrainedTokenizerFast.from_pretrained(pretrained_model_name_or_path, **kwargs)
+    return PreTrainedTokenizerFast.from_pretrained(
+        pretrained_model_name_or_path, **kwargs
+    )

@@ -31,12 +31,6 @@ dependencies = [
     # against 0.0.8) and ``tests/test_gpt_oss_harmony_parity.py`` passes on it,
     # so the older harmony is safe.
     "openai-harmony>=0.0.4",
-    # Crusoe's Rust BPE tokenizer; ~10x faster encode vs HF's tokenizers.
-    # ``load_tokenizer`` patches it in by default for every supported model
-    # except a small denylist (DeepSeek-V3 family). The patch is bracketed
-    # around ``from_pretrained``, so subsequent ``AutoTokenizer`` calls
-    # outside the renderers package stay vanilla.
-    "fastokens>=0.2.0",
     # ``BaseRendererConfig`` inherits from ``pydantic_config.BaseConfig`` so
     # the typed-config surface stays uniform with prime-rl / verifiers config
     # bases. Transitively brings pydantic, which ``renderers.configs`` also
@@ -48,11 +42,9 @@ dependencies = [
 source = "vcs"
 # Tags look like ``renderers-v0.1.8`` (prefix matches the publish.yml
 # release contract); strip the prefix to get a PEP 440 version. The
-# regex accepts release/pre-release suffixes after the prefix, but ignores
-# automated ``.devN`` tags. hatch-vcs/setuptools-scm cannot use arbitrary
-# ``0.1.8.dev41`` tags as version bases, but it can derive dev versions
-# from the latest non-dev tag.
-tag-pattern = '^renderers-v(?P<version>(?!.*\.dev\d+$).+)$'
+# regex accepts any PEP 440-valid suffix after the prefix so we can
+# tag pre-releases like ``renderers-v0.2.0rc1`` later if needed.
+tag-pattern = '^renderers-v(?P<version>.+)$'
 # Used when building from a context without VCS metadata (e.g. an
 # sdist consumed by a downstream that doesn't ship .git). Real
 # builds from a checkout get the resolved version; this fallback
@@ -60,9 +52,20 @@ tag-pattern = '^renderers-v(?P<version>(?!.*\.dev\d+$).+)$'
 fallback-version = "0.0.0"
 
 [tool.hatch.version.raw-options]
-# Keep setuptools-scm from selecting automated dev tags before ``tag-pattern``
-# gets a chance to parse the selected tag.
-git_describe_command = "git describe --dirty --tags --long --match renderers-v[0-9]* --exclude *dev*"
+# Only stable ``renderers-v<MAJOR>.<MINOR>.<PATCH>`` tags participate in
+# version resolution; legacy per-commit ``.devN`` tags are excluded.
+# Untagged commits get a clean PEP 440 dev version derived from distance
+# to the latest stable tag (e.g. ``0.1.8.dev46``), with no ``+gHASH``
+# local segment so PyPI accepts the wheel directly. setuptools-scm
+# refuses to bump a pre-existing ``.devN`` tag, so matching only stable
+# tags also unblocks local ``uv lock`` / ``uv build`` on untagged
+# branches. Mirrors verifiers' setup.
+local_scheme = "no-local-version"
+git_describe_command = [
+    "git", "describe", "--tags", "--long",
+    "--match", "renderers-v[0-9]*.[0-9]*.[0-9]*",
+    "--exclude", "*dev*",
+]
 
 [tool.hatch.build.hooks.vcs]
 # Write the resolved version to a Python file so it can be inspected
@@ -94,12 +97,6 @@ required-version = ">=0.11.1"
 exclude-newer = "7 days"
 
 [tool.uv.exclude-newer-package]
-# fastokens 0.2.0 was published on 2026-05-17 and contains the
-# ``unpatch_transformers`` fix (crusoecloud/fastokens#32) needed for
-# MiniMax-M2's slow→fast tokenizer conversion path. Exempting it from
-# the project-wide 7-day cutoff lets the lockfile pick it up immediately
-# while the rest of the dependency graph stays gated.
-fastokens = false
 # PrimeIntellect-published packages in this project's dependency closure —
 # fast-track so first-party releases can land same-day. Only packages that
 # appear in `uv tree` are listed.

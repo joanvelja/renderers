@@ -101,6 +101,68 @@ class _FakeClient:
         )
 
 
+class _MissingLogprobsClient(_FakeClient):
+    async def post(self, path, *, cast_to=dict, body=None, options=None):
+        response = await super().post(path, cast_to=cast_to, body=body, options=options)
+        payload = json.loads(response.content)
+        payload["choices"][0].pop("logprobs")
+        return httpx.Response(
+            200,
+            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        )
+
+
+class _MissingTokenIdsClient(_FakeClient):
+    async def post(self, path, *, cast_to=dict, body=None, options=None):
+        response = await super().post(path, cast_to=cast_to, body=body, options=options)
+        payload = json.loads(response.content)
+        payload["choices"][0].pop("token_ids")
+        payload["choices"][0]["logprobs"]["content"] = []
+        return httpx.Response(
+            200,
+            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        )
+
+
+class _InvalidTokenIdsClient(_FakeClient):
+    def __init__(self, token_ids):
+        super().__init__()
+        self.token_ids = token_ids
+
+    async def post(self, path, *, cast_to=dict, body=None, options=None):
+        response = await super().post(path, cast_to=cast_to, body=body, options=options)
+        payload = json.loads(response.content)
+        payload["choices"][0]["token_ids"] = self.token_ids
+        return httpx.Response(
+            200,
+            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        )
+
+
+class _ShortLogprobsClient(_FakeClient):
+    async def post(self, path, *, cast_to=dict, body=None, options=None):
+        response = await super().post(path, cast_to=cast_to, body=body, options=options)
+        payload = json.loads(response.content)
+        payload["choices"][0]["logprobs"]["content"] = [
+            {"token": "token_id:7", "logprob": -0.1},
+        ]
+        return httpx.Response(
+            200,
+            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        )
+
+
+class _NonFiniteLogprobsClient(_FakeClient):
+    async def post(self, path, *, cast_to=dict, body=None, options=None):
+        response = await super().post(path, cast_to=cast_to, body=body, options=options)
+        payload = json.loads(response.content)
+        payload["choices"][0]["logprobs"]["content"][1]["logprob"] = "nan"
+        return httpx.Response(
+            200,
+            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        )
+
+
 def test_generate_builds_request_body_and_parses_response():
     client = _FakeClient()
     renderer = _FakeRenderer()
@@ -137,7 +199,7 @@ def test_generate_builds_request_body_and_parses_response():
             "max_tokens": 7,
             "min_tokens": 2,
             "stop_token_ids": [99],
-            "logprobs": 1,
+            "logprobs": 0,
             "skip_special_tokens": False,
         },
     }
@@ -173,6 +235,77 @@ def test_generate_builds_request_body_and_parses_response():
     assert tc.name == "echo"
     assert tc.arguments == {"text": "hello"}
     assert tc.status == ToolCallParseStatus.OK
+
+
+def test_generate_rejects_missing_completion_logprobs():
+    with pytest.raises(ValueError, match="completion logprobs length"):
+        asyncio.run(
+            generate(
+                client=_MissingLogprobsClient(),
+                renderer=_FakeRenderer(),
+                messages=[{"role": "user", "content": "hi"}],
+                model="test-model",
+                tools=[{"type": "function", "function": {"name": "echo"}}],
+                sampling_params={"temperature": 0.3, "max_tokens": 7},
+            )
+        )
+
+
+def test_generate_rejects_missing_completion_token_ids():
+    with pytest.raises(ValueError, match="completion token ids"):
+        asyncio.run(
+            generate(
+                client=_MissingTokenIdsClient(),
+                renderer=_FakeRenderer(),
+                messages=[{"role": "user", "content": "hi"}],
+                model="test-model",
+                tools=[{"type": "function", "function": {"name": "echo"}}],
+                sampling_params={"temperature": 0.3, "max_tokens": 7},
+            )
+        )
+
+
+@pytest.mark.parametrize("token_ids", [[7, True], [7, "8"], [7, -1]])
+def test_generate_rejects_invalid_completion_token_ids(token_ids):
+    with pytest.raises(ValueError, match="completion token ids"):
+        asyncio.run(
+            generate(
+                client=_InvalidTokenIdsClient(token_ids),
+                renderer=_FakeRenderer(),
+                messages=[{"role": "user", "content": "hi"}],
+                model="test-model",
+                tools=[{"type": "function", "function": {"name": "echo"}}],
+                sampling_params={"temperature": 0.3, "max_tokens": 7},
+            )
+        )
+
+
+def test_generate_rejects_short_completion_logprobs():
+    with pytest.raises(ValueError, match="completion logprobs length"):
+        asyncio.run(
+            generate(
+                client=_ShortLogprobsClient(),
+                renderer=_FakeRenderer(),
+                messages=[{"role": "user", "content": "hi"}],
+                model="test-model",
+                tools=[{"type": "function", "function": {"name": "echo"}}],
+                sampling_params={"temperature": 0.3, "max_tokens": 7},
+            )
+        )
+
+
+def test_generate_rejects_non_finite_completion_logprobs():
+    with pytest.raises(ValueError, match="finite completion logprobs"):
+        asyncio.run(
+            generate(
+                client=_NonFiniteLogprobsClient(),
+                renderer=_FakeRenderer(),
+                messages=[{"role": "user", "content": "hi"}],
+                model="test-model",
+                tools=[{"type": "function", "function": {"name": "echo"}}],
+                sampling_params={"temperature": 0.3, "max_tokens": 7},
+            )
+        )
 
 
 class _MalformedToolRenderer(_FakeRenderer):

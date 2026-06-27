@@ -380,26 +380,6 @@ class Nemotron3RendererConfig(BaseRendererConfig):
     """When ``True``, the generation prompt includes ``<think>``. Mirrors
     the chat template's ``enable_thinking`` kwarg."""
 
-    ultra: bool | None = None
-    """Select the Nemotron-3 **Ultra** chat-template variant.
-
-    ``None`` (default) auto-detects from the model name (see
-    ``renderers.nemotron3._ULTRA_DEFAULTS``): the Ultra checkpoints resolve
-    to ``True``; Nano / Super and unknown checkpoints to ``False``. Set
-    explicitly to force a variant — e.g. an Ultra fine-tune or a
-    locally-pathed checkpoint whose ``name_or_path`` isn't in the table.
-
-    Ultra's template differs from Nano/Super: the reasoning block is glued
-    as ``<think>\\n{reasoning}</think>{content}`` (no ``\\n`` around
-    ``</think>``), truncated historical turns collapse to
-    ``<think></think>{content}`` (no ``\\n``), and the thinking-truncation
-    boundary follows the template's ``loop.index0 < last_user_idx`` rule
-    (drop thinking on every assistant turn before the last user message).
-
-    Not a chat-template kwarg — it picks which template the renderer
-    mirrors, not a variable passed into one — so it's listed in
-    ``_internal_fields`` and excluded from ``template_field_names()``."""
-
     truncate_history_thinking: bool = True
     """When ``False``, keep ``<think>{reasoning}</think>`` on past-cycle
     assistant turns instead of dropping them. Mirrors the chat

@@ -160,6 +160,8 @@ async def generate(
     tools: list[ToolSpec] | None = None,
     sampling_params: dict[str, Any] | None = None,
     cache_salt: str | None = None,
+    kv_session_key: str | None = None,
+    kv_continuation_expected: bool | None = None,
     priority: int | None = None,
     extra_headers: dict[str, str] | None = None,
     max_prompt_len: int | None = None,
@@ -264,6 +266,11 @@ async def generate(
         body["features"] = features
     if cache_salt is not None:
         body["cache_salt"] = cache_salt
+    if kv_session_key is not None:
+        body["kv_session_key"] = kv_session_key
+        if kv_continuation_expected is None:
+            raise ValueError("kv_session_key requires kv_continuation_expected")
+        body["kv_continuation_expected"] = kv_continuation_expected
     if priority is not None:
         body["priority"] = priority
 

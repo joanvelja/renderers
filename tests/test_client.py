@@ -176,6 +176,8 @@ def test_generate_builds_request_body_and_parses_response():
             tools=[{"type": "function", "function": {"name": "echo"}}],
             sampling_params={"temperature": 0.3, "max_tokens": 7, "min_tokens": 2},
             cache_salt="ckpt-42",
+            kv_session_key="episode-1:alice",
+            kv_continuation_expected=True,
         )
     )
 
@@ -194,6 +196,8 @@ def test_generate_builds_request_body_and_parses_response():
         "model": "test-model",
         "token_ids": [1, 2, 3],
         "cache_salt": "ckpt-42",
+        "kv_session_key": "episode-1:alice",
+        "kv_continuation_expected": True,
         "sampling_params": {
             "temperature": 0.3,
             "max_tokens": 7,

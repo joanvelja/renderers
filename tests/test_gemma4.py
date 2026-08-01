@@ -3,7 +3,6 @@ from __future__ import annotations
 from functools import lru_cache
 
 import pytest
-
 from renderers import (
     Gemma4Renderer,
     Gemma4RendererConfig,
@@ -11,7 +10,6 @@ from renderers import (
     create_renderer,
 )
 from renderers.base import MODEL_RENDERER_MAP, ToolCallParseStatus, load_tokenizer
-
 
 GEMMA4_MODELS = {
     "google/gemma-4-E2B",
@@ -90,7 +88,7 @@ MULTI_TOOLS = [
 
 @lru_cache(maxsize=1)
 def _gemma4():
-    tokenizer = load_tokenizer("google/gemma-4-E2B-it", use_fastokens=False)
+    tokenizer = load_tokenizer("google/gemma-4-E2B-it")
     renderer = create_renderer(tokenizer)
     return tokenizer, renderer
 
@@ -170,7 +168,7 @@ def test_gemma4_generation_prompt_parity_across_it_sizes(
     gemma4_model_name,
     enable_thinking,
 ):
-    tokenizer = load_tokenizer(gemma4_model_name, use_fastokens=False)
+    tokenizer = load_tokenizer(gemma4_model_name)
     renderer = create_renderer(
         tokenizer,
         Gemma4RendererConfig(enable_thinking=enable_thinking),
@@ -187,10 +185,8 @@ def test_gemma4_generation_prompt_parity_across_it_sizes(
 
 @pytest.mark.parametrize("enable_thinking", [True, False])
 def test_gemma4_text_and_tool_chat_parity_with_hf_template(enable_thinking):
-    tokenizer = load_tokenizer("google/gemma-4-E2B-it", use_fastokens=False)
-    renderer = create_renderer(
-        tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking)
-    )
+    tokenizer = load_tokenizer("google/gemma-4-E2B-it")
+    renderer = create_renderer(tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking))
     cases = [
         ([{"role": "user", "content": "Hello!"}], {"add_generation_prompt": True}),
         (
@@ -307,10 +303,7 @@ def test_gemma4_tool_metadata_and_masks():
             rendered.sampled_mask,
         )
     )
-    assert not any(
-        idx == 2 and sampled
-        for idx, sampled in zip(rendered.message_indices, rendered.sampled_mask)
-    )
+    assert not any(idx == 2 and sampled for idx, sampled in zip(rendered.message_indices, rendered.sampled_mask))
 
 
 def test_gemma4_parse_tool_calls_and_reasoning():
@@ -383,10 +376,8 @@ def test_gemma4_render_accepts_openai_json_string_arguments():
 
 @pytest.mark.parametrize("enable_thinking", [True, False])
 def test_gemma4_bridge_matches_full_render(enable_thinking):
-    tokenizer = load_tokenizer("google/gemma-4-E2B-it", use_fastokens=False)
-    renderer = create_renderer(
-        tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking)
-    )
+    tokenizer = load_tokenizer("google/gemma-4-E2B-it")
+    renderer = create_renderer(tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking))
     first = [{"role": "user", "content": "A"}]
     assistant = {"role": "assistant", "content": "B"}
     next_turn = [{"role": "user", "content": "C"}]
@@ -406,6 +397,12 @@ def test_gemma4_bridge_matches_full_render(enable_thinking):
         add_generation_prompt=True,
     )
     assert bridged.message_tool_names == [None]
+
+    drop_renderer = create_renderer(
+        tokenizer,
+        Gemma4RendererConfig(enable_thinking=enable_thinking, thinking_retention="tool_cycle"),
+    )
+    assert drop_renderer.bridge_to_next_turn(previous_prompt_ids, previous_completion_ids, next_turn) is None
 
 
 def test_gemma4_rejects_non_text_multimodal_parts_until_sidecar_exists():

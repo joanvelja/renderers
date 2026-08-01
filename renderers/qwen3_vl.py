@@ -45,6 +45,8 @@ from renderers.base import (
     attribute_text_segments,
     extract_message_tool_names,
     reject_assistant_in_extension,
+    resolve_thinking_retention,
+    should_rerender_for_thinking_retention,
     trim_to_turn_close,
 )
 from renderers.configs import Qwen3VLRendererConfig
@@ -302,9 +304,9 @@ class Qwen3VLRenderer:
             keyed off ``tokenizer.name_or_path`` the first time a
             multimodal part is seen.
 
-    ``preserve_all_thinking`` / ``preserve_thinking_between_tool_calls``
-    on the config are no-ops here — the chat template drops past
-    ``<think>`` blocks unconditionally. Stored for Protocol parity.
+    Qwen3-VL has no historical reasoning channel in this renderer. The
+    default bridge policy therefore resolves to ``"all"``; explicit
+    ``thinking_retention`` still controls whether the bridge is attempted.
     """
 
     def __init__(
@@ -317,6 +319,10 @@ class Qwen3VLRenderer:
         self._tokenizer = tokenizer
         self._processor = processor
         self.config = config or Qwen3VLRendererConfig()
+        self.effective_thinking_retention = resolve_thinking_retention(
+            self.config,
+            "all",
+        )
 
         self._im_start = self._token_id("<|im_start|>")
         self._im_end = self._token_id("<|im_end|>")
@@ -409,6 +415,16 @@ class Qwen3VLRenderer:
                     raise ValueError(f"Unexpected content item: {item}")
             return "".join(parts)
         raise TypeError(f"Unexpected content type: {type(content)}")
+
+    @staticmethod
+    def _is_user_query_message(msg: Message) -> bool:
+        if msg.get("role") != "user":
+            return False
+        content = Qwen3VLRenderer._render_text_content(msg.get("content")).strip()
+        return not (
+            content.startswith("<tool_response>")
+            and content.endswith("</tool_response>")
+        )
 
     def _process_image(self, part: dict[str, Any]):
         """Resolve, process, and characterize a single image part.
@@ -665,6 +681,12 @@ class Qwen3VLRenderer:
             or reject_assistant_in_extension(new_messages)
         ):
             return None
+        if should_rerender_for_thinking_retention(
+            self.effective_thinking_retention,
+            new_messages,
+            is_user_query=self._is_user_query_message,
+        ):
+            return None
 
         previous_ids = trim_to_turn_close(
             previous_prompt_ids,
@@ -806,19 +828,21 @@ class Qwen3VLRenderer:
         em.text("assistant\n", is_sampled=False, is_content=False)
         em.finalize()
 
-        # Merge prev mm_data with the new turn's items.
+        # Merge prev mm_data with the new turn's items. Copy the per-modality
+        # lists (not just the outer dict) so appending below never mutates the
+        # caller's previous_multi_modal_data.
         merged_hashes = (
-            dict(previous_multi_modal_data.mm_hashes)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_hashes.items()}
             if previous_multi_modal_data
             else {}
         )
         merged_placeholders = (
-            dict(previous_multi_modal_data.mm_placeholders)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_placeholders.items()}
             if previous_multi_modal_data
             else {}
         )
         merged_items = (
-            dict(previous_multi_modal_data.mm_items)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_items.items()}
             if previous_multi_modal_data
             else {}
         )

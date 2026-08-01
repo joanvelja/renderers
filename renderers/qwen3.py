@@ -5,6 +5,15 @@ Key differences from Qwen3.5:
 - Tool calls use JSON format: {"name": "...", "arguments": ...}
 - Thinking blocks only inserted when loop.last OR reasoning_content present
 - Generation prompt does NOT add <think> by default
+
+One documented deviation from the Jinja template: with
+``enable_thinking=False`` the empty ``<think>\n\n</think>\n\n`` wrapper is
+re-emitted on historical assistant turns without ``reasoning_content`` (the
+template strips it from turns at or before the last user query). The
+generation prompt prefills that wrapper, so every turn sampled with thinking
+disabled contains it — stripping it on re-render would make the same
+conversation produce different tokens depending on when it is rendered.
+See ``tests/test_disabled_thinking_stability.py``.
 """
 
 from __future__ import annotations
@@ -21,7 +30,8 @@ from renderers.base import (
     attribute_text_segments,
     extract_message_tool_names,
     reject_assistant_in_extension,
-    should_preserve_past_thinking,
+    resolve_thinking_retention,
+    should_rerender_for_thinking_retention,
     trim_to_turn_close,
 )
 from renderers.configs import Qwen3RendererConfig
@@ -54,6 +64,10 @@ class Qwen3Renderer:
     ):
         self._tokenizer = tokenizer
         self.config = config or Qwen3RendererConfig()
+        self.effective_thinking_retention = resolve_thinking_retention(
+            self.config,
+            "all" if not self.config.enable_thinking else "tool_cycle",
+        )
 
         self._im_start = self._token_id("<|im_start|>")
         self._im_end = self._token_id("<|im_end|>")
@@ -77,18 +91,33 @@ class Qwen3Renderer:
         return self._tokenizer.encode(text, add_special_tokens=False)
 
     @staticmethod
+    def _query_boundary_text(content) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+            return "".join(parts).strip()
+        return ""
+
+    @staticmethod
+    def _is_user_query_message(msg: Message) -> bool:
+        if msg.get("role") != "user":
+            return False
+        content = Qwen3Renderer._query_boundary_text(msg.get("content"))
+        return not (
+            content.startswith("<tool_response>")
+            and content.endswith("</tool_response>")
+        )
+
+    @staticmethod
     def _last_query_index(messages: list[Message]) -> int:
         for i in range(len(messages) - 1, -1, -1):
-            msg = messages[i]
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content")
-            if not isinstance(content, str):
-                continue
-            if not (
-                content.startswith("<tool_response>")
-                and content.endswith("</tool_response>")
-            ):
+            if Qwen3Renderer._is_user_query_message(messages[i]):
                 return i
         return len(messages) - 1
 
@@ -206,19 +235,12 @@ class Qwen3Renderer:
                 emit_text("\n", i, is_sampled=False, is_content=False)
 
             elif role == "assistant":
-                preserve_thinking = should_preserve_past_thinking(
-                    messages,
-                    i,
-                    preserve_all_thinking=self.config.preserve_all_thinking,
-                    preserve_thinking_between_tool_calls=self.config.preserve_thinking_between_tool_calls,
-                )
                 self._render_assistant(
                     msg,
                     i,
                     content,
                     last_qi,
                     i == num_messages - 1,
-                    preserve_thinking=preserve_thinking,
                     emit_special=emit_special,
                     emit_text=emit_text,
                     emit_text_segments=emit_text_segments,
@@ -295,6 +317,13 @@ class Qwen3Renderer:
             not previous_prompt_ids
             or not new_messages
             or reject_assistant_in_extension(new_messages)
+        ):
+            return None
+
+        if should_rerender_for_thinking_retention(
+            self.effective_thinking_retention,
+            new_messages,
+            is_user_query=self._is_user_query_message,
         ):
             return None
 
@@ -418,7 +447,6 @@ class Qwen3Renderer:
         last_query_index,
         is_last,
         *,
-        preserve_thinking: bool = False,
         emit_special,
         emit_text,
         emit_text_segments,
@@ -458,8 +486,17 @@ class Qwen3Renderer:
         emit_in_template_window = msg_idx > last_query_index and (
             is_last or reasoning_content
         )
-        emit_via_override = preserve_thinking and bool(reasoning_content)
-        if emit_in_template_window or emit_via_override:
+        # With thinking disabled, the generation prompt prefilled the empty
+        # ``<think>\n\n</think>\n\n`` wrapper, so it is part of every sampled
+        # turn's token stream. Re-emit it on historical turns — deviating
+        # from the Jinja template, which strips it from turns at or before
+        # the last user query — so re-renders stay token-stable with what
+        # the model actually sampled. Turns that carry reasoning_content
+        # were not sampled under this config; those stay template-faithful.
+        emit_thinking = emit_in_template_window or (
+            not self.config.enable_thinking and not reasoning_content
+        )
+        if emit_thinking:
             body = (
                 "<think>\n"
                 + reasoning_content.strip("\n")

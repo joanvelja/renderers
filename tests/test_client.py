@@ -5,13 +5,14 @@ import json
 import httpx
 import numpy as np
 import pytest
+from renderers import MalformedGenerateResponseError
 from renderers.base import (
     ParsedResponse,
     ParsedToolCall,
     RenderedTokens,
     ToolCallParseStatus,
 )
-from renderers.client import generate
+from renderers.client import generate, parse_generate_response
 
 
 class _FakeRenderer:
@@ -32,16 +33,12 @@ class _FakeRenderer:
         )
 
     def render_ids(self, messages, *, tools=None, add_generation_prompt=False):
-        return self.render(
-            messages, tools=tools, add_generation_prompt=add_generation_prompt
-        ).token_ids
+        return self.render(messages, tools=tools, add_generation_prompt=add_generation_prompt).token_ids
 
     def get_stop_token_ids(self):
         return [99]
 
-    def parse_response(
-        self, completion_ids: list[int], *, tools=None
-    ) -> ParsedResponse:
+    def parse_response(self, completion_ids: list[int], *, tools=None) -> ParsedResponse:
         assert completion_ids == [7, 8]
         # Stores tools so tests can assert the client plumbed them through.
         self._last_parse_tools = tools
@@ -67,33 +64,28 @@ class _FakeClient:
     def __init__(self):
         self.calls = []
         self.base_url = "http://fake-host:8000/v1"
+        routed_experts = np.array([[[1]], [[2]]], dtype=np.uint8)
+        self.choice = {
+            "index": 0,
+            "token_ids": [7, 8],
+            "logprobs": {
+                "content": [
+                    {"token": "token_id:7", "logprob": -0.1},
+                    {"token": "token_id:8", "logprob": -0.2},
+                ]
+            },
+            "finish_reason": "stop",
+            "routed_experts": {
+                "data": base64.b64encode(routed_experts.tobytes()).decode("ascii"),
+                "shape": list(routed_experts.shape),
+            },
+        }
 
     async def post(self, path, *, cast_to=dict, body=None, options=None):
-        self.calls.append(
-            {"path": path, "cast_to": cast_to, "body": body, "options": options}
-        )
-        routed_experts = np.array([[[1]], [[2]]], dtype=np.uint8)
+        self.calls.append({"path": path, "cast_to": cast_to, "body": body, "options": options})
         payload = {
             "request_id": "gen-test",
-            "choices": [
-                {
-                    "index": 0,
-                    "token_ids": [7, 8],
-                    "logprobs": {
-                        "content": [
-                            {"token": "token_id:7", "logprob": -0.1},
-                            {"token": "token_id:8", "logprob": -0.2},
-                        ]
-                    },
-                    "finish_reason": "stop",
-                    "routed_experts": {
-                        "data": base64.b64encode(routed_experts.tobytes()).decode(
-                            "ascii"
-                        ),
-                        "shape": list(routed_experts.shape),
-                    },
-                }
-            ],
+            "choices": [self.choice],
         }
         return httpx.Response(
             200,
@@ -101,66 +93,16 @@ class _FakeClient:
         )
 
 
-class _MissingLogprobsClient(_FakeClient):
-    async def post(self, path, *, cast_to=dict, body=None, options=None):
-        response = await super().post(path, cast_to=cast_to, body=body, options=options)
-        payload = json.loads(response.content)
-        payload["choices"][0].pop("logprobs")
-        return httpx.Response(
-            200,
-            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+def _run_generate(client, renderer=None):
+    return asyncio.run(
+        generate(
+            client=client,
+            renderer=renderer or _FakeRenderer(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "echo"}}],
         )
-
-
-class _MissingTokenIdsClient(_FakeClient):
-    async def post(self, path, *, cast_to=dict, body=None, options=None):
-        response = await super().post(path, cast_to=cast_to, body=body, options=options)
-        payload = json.loads(response.content)
-        payload["choices"][0].pop("token_ids")
-        payload["choices"][0]["logprobs"]["content"] = []
-        return httpx.Response(
-            200,
-            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-        )
-
-
-class _InvalidTokenIdsClient(_FakeClient):
-    def __init__(self, token_ids):
-        super().__init__()
-        self.token_ids = token_ids
-
-    async def post(self, path, *, cast_to=dict, body=None, options=None):
-        response = await super().post(path, cast_to=cast_to, body=body, options=options)
-        payload = json.loads(response.content)
-        payload["choices"][0]["token_ids"] = self.token_ids
-        return httpx.Response(
-            200,
-            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-        )
-
-
-class _ShortLogprobsClient(_FakeClient):
-    async def post(self, path, *, cast_to=dict, body=None, options=None):
-        response = await super().post(path, cast_to=cast_to, body=body, options=options)
-        payload = json.loads(response.content)
-        payload["choices"][0]["logprobs"]["content"] = [
-            {"token": "token_id:7", "logprob": -0.1},
-        ]
-        return httpx.Response(
-            200,
-            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-        )
-
-
-class _NonFiniteLogprobsClient(_FakeClient):
-    async def post(self, path, *, cast_to=dict, body=None, options=None):
-        response = await super().post(path, cast_to=cast_to, body=body, options=options)
-        payload = json.loads(response.content)
-        payload["choices"][0]["logprobs"]["content"][1]["logprob"] = "nan"
-        return httpx.Response(
-            200,
-            content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-        )
+    )
 
 
 def test_generate_builds_request_body_and_parses_response():
@@ -181,9 +123,7 @@ def test_generate_builds_request_body_and_parses_response():
 
     # The client must plumb `tools` through to parse_response so XML-style
     # parsers can preserve declared-string args verbatim.
-    assert renderer._last_parse_tools == [
-        {"type": "function", "function": {"name": "echo"}}
-    ]
+    assert renderer._last_parse_tools == [{"type": "function", "function": {"name": "echo"}}]
 
     assert len(client.calls) == 1
     # /inference/v1/generate is mounted at the server root, so we post to
@@ -212,11 +152,8 @@ def test_generate_builds_request_body_and_parses_response():
     assert result["completion_ids"] == [7, 8]
     assert result["completion_logprobs"] == [-0.1, -0.2]
     assert result["routed_experts"]["shape"] == [2, 1, 1]
-    # The renderer copies the routed_experts slice out of the HTTP body and
-    # decodes b64 once, so "data" is raw uint8 bytes (no memoryview pin, no
-    # downstream b64 decode).
     assert isinstance(result["routed_experts"]["data"], bytes)
-    assert result["routed_experts"]["data"] == b"\x01\x02"
+    assert result["routed_experts"]["data"] == base64.b64encode(b"\x01\x02")
     assert result["multi_modal_data"] is None
     assert result["request_id"] == "gen-test"
     # Per-token attribution from the renderer surfaces on the result so
@@ -237,83 +174,130 @@ def test_generate_builds_request_body_and_parses_response():
     assert tc.status == ToolCallParseStatus.OK
 
 
-def test_generate_rejects_missing_completion_logprobs():
-    with pytest.raises(ValueError, match="completion logprobs length"):
-        asyncio.run(
-            generate(
-                client=_MissingLogprobsClient(),
-                renderer=_FakeRenderer(),
-                messages=[{"role": "user", "content": "hi"}],
-                model="test-model",
-                tools=[{"type": "function", "function": {"name": "echo"}}],
-                sampling_params={"temperature": 0.3, "max_tokens": 7},
-            )
-        )
+def test_parse_generate_response_copies_all_large_base64_fields():
+    routed_data = base64.b64encode(b"routing")
+    kept_ids = base64.b64encode(b"kept")
+    raw = (
+        b'{"choices":[{"routed_experts":{"data":"'
+        + routed_data
+        + b'","shape":[1]},"kept_tokens":{"ids":"'
+        + kept_ids
+        + b'","counts":"AAAAAA=="}}]}'
+    )
+
+    payload = parse_generate_response(raw)
+
+    assert payload["choices"][0]["routed_experts"]["data"] == routed_data
+    assert payload["choices"][0]["kept_tokens"]["ids"] == kept_ids
+    assert type(payload["choices"][0]["routed_experts"]["data"]) is bytes
+    assert type(payload["choices"][0]["kept_tokens"]["ids"]) is bytes
 
 
-def test_generate_rejects_missing_completion_token_ids():
-    with pytest.raises(ValueError, match="completion token ids"):
-        asyncio.run(
-            generate(
-                client=_MissingTokenIdsClient(),
-                renderer=_FakeRenderer(),
-                messages=[{"role": "user", "content": "hi"}],
-                model="test-model",
-                tools=[{"type": "function", "function": {"name": "echo"}}],
-                sampling_params={"temperature": 0.3, "max_tokens": 7},
-            )
-        )
-
-
-@pytest.mark.parametrize("token_ids", [[7, True], [7, "8"], [7, -1]])
+@pytest.mark.parametrize("token_ids", [None, "7", [7, True], [7, "8"], [7, -1]])
 def test_generate_rejects_invalid_completion_token_ids(token_ids):
-    with pytest.raises(ValueError, match="completion token ids"):
-        asyncio.run(
-            generate(
-                client=_InvalidTokenIdsClient(token_ids),
-                renderer=_FakeRenderer(),
-                messages=[{"role": "user", "content": "hi"}],
-                model="test-model",
-                tools=[{"type": "function", "function": {"name": "echo"}}],
-                sampling_params={"temperature": 0.3, "max_tokens": 7},
-            )
-        )
+    client = _FakeClient()
+    client.choice["token_ids"] = token_ids
+
+    with pytest.raises(
+        MalformedGenerateResponseError,
+        match=r"choice\.token_ids must",
+    ):
+        _run_generate(client)
 
 
-def test_generate_rejects_short_completion_logprobs():
-    with pytest.raises(ValueError, match="completion logprobs length"):
-        asyncio.run(
-            generate(
-                client=_ShortLogprobsClient(),
-                renderer=_FakeRenderer(),
-                messages=[{"role": "user", "content": "hi"}],
-                model="test-model",
-                tools=[{"type": "function", "function": {"name": "echo"}}],
-                sampling_params={"temperature": 0.3, "max_tokens": 7},
-            )
-        )
+def test_generate_rejects_missing_completion_logprobs_before_parsing():
+    client = _FakeClient()
+    client.choice.pop("logprobs")
+    renderer = _FakeRenderer()
+
+    with pytest.raises(
+        MalformedGenerateResponseError,
+        match=r"choice\.logprobs must be an object",
+    ):
+        _run_generate(client, renderer)
+
+    assert not hasattr(renderer, "_last_parse_tools")
 
 
-def test_generate_rejects_non_finite_completion_logprobs():
-    with pytest.raises(ValueError, match="finite completion logprobs"):
-        asyncio.run(
-            generate(
-                client=_NonFiniteLogprobsClient(),
-                renderer=_FakeRenderer(),
-                messages=[{"role": "user", "content": "hi"}],
-                model="test-model",
-                tools=[{"type": "function", "function": {"name": "echo"}}],
-                sampling_params={"temperature": 0.3, "max_tokens": 7},
-            )
-        )
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"token": "token_id:7"},
+        {"token": "token_id:7", "logprob": None},
+        {"token": "token_id:7", "logprob": "-0.1"},
+        {"token": "token_id:7", "logprob": True},
+    ],
+    ids=["missing", "null", "string", "boolean"],
+)
+def test_generate_rejects_non_numeric_completion_logprobs(entry):
+    client = _FakeClient()
+    client.choice["logprobs"]["content"][0] = entry
+
+    with pytest.raises(
+        MalformedGenerateResponseError,
+        match=r"content\[0\]\.logprob must be a number",
+    ):
+        _run_generate(client)
+
+
+def test_generate_rejects_completion_logprob_count_mismatch():
+    client = _FakeClient()
+    client.choice["logprobs"]["content"] = [{"token": "token_id:7", "logprob": -0.1}]
+
+    with pytest.raises(
+        MalformedGenerateResponseError,
+        match=r"completion token count \(2\) does not match logprob count \(1\)",
+    ):
+        _run_generate(client)
+
+
+@pytest.mark.parametrize("logprob", [float("nan"), float("inf"), float("-inf")])
+def test_generate_rejects_non_finite_completion_logprobs(logprob):
+    client = _FakeClient()
+    client.choice["logprobs"]["content"][0]["logprob"] = logprob
+
+    with pytest.raises(
+        MalformedGenerateResponseError,
+        match=r"content\[0\]\.logprob must be finite",
+    ):
+        _run_generate(client)
+
+
+def test_generate_rejects_vllm_missing_logprob_sentinel():
+    client = _FakeClient()
+    client.choice["logprobs"]["content"][0]["logprob"] = -9999.0
+
+    with pytest.raises(
+        MalformedGenerateResponseError,
+        match=r"does not contain sampling evidence",
+    ):
+        _run_generate(client)
+
+
+def test_generate_rejects_logprob_token_id_mismatch():
+    client = _FakeClient()
+    client.choice["logprobs"]["content"][0]["token"] = "token_id:8"
+
+    with pytest.raises(
+        MalformedGenerateResponseError,
+        match=r"content\[0\]\.token must be 'token_id:7'",
+    ):
+        _run_generate(client)
+
+
+def test_generate_preserves_zero_completion_logprob():
+    client = _FakeClient()
+    client.choice["logprobs"]["content"][0]["logprob"] = 0.0
+
+    result = _run_generate(client)
+
+    assert result["completion_logprobs"] == [0.0, -0.2]
 
 
 class _MalformedToolRenderer(_FakeRenderer):
     """Returns only a malformed tool-call attempt — finish_reason must stay "stop"."""
 
-    def parse_response(
-        self, completion_ids: list[int], *, tools=None
-    ) -> ParsedResponse:
+    def parse_response(self, completion_ids: list[int], *, tools=None) -> ParsedResponse:
         return ParsedResponse(
             content="",
             reasoning_content=None,
@@ -424,9 +408,7 @@ def test_generate_threads_prompt_attribution_through_prebuilt_prompt_path():
     ],
     ids=["qwen3_vl", "qwen35"],
 )
-def test_generate_serializes_multimodal_features_for_qwen_vl_family(
-    model_id, renderer_class_path
-):
+def test_generate_serializes_multimodal_features_for_qwen_vl_family(model_id, renderer_class_path):
     """When the renderer emits ``MultiModalData``, ``generate`` translates
     it into vLLM's ``features`` payload (mm_hashes + mm_placeholders +
     base64-encoded kwargs_data) and sticks it in the request body. Covers

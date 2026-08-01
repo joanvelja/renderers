@@ -20,7 +20,8 @@ from renderers.base import (
     ToolSpec,
     _get_offset_tokenizer,
     extract_message_tool_names,
-    should_preserve_past_thinking,
+    resolve_thinking_retention,
+    should_rerender_for_thinking_retention,
     trim_to_turn_close,
 )
 from renderers.configs import Gemma4RendererConfig
@@ -67,6 +68,9 @@ class Gemma4Renderer:
     ):
         self._tokenizer = tokenizer
         self.config = config or Gemma4RendererConfig()
+        # Gemma's bridge reuses the previous sampled prefix verbatim unless
+        # the caller requests tool-cycle-only retention.
+        self.effective_thinking_retention = resolve_thinking_retention(self.config, "all")
         self._turn_end = self._token_id("<turn|>")
         self._tool_call = self._token_id("<|tool_call>")
         self._tool_call_end = self._token_id("<tool_call|>")
@@ -96,10 +100,7 @@ class Gemma4Renderer:
     @staticmethod
     def _uses_tooling(messages: list[Message], tools: list[ToolSpec] | None) -> bool:
         return bool(tools) or any(
-            msg.get("tool_calls")
-            or msg.get("tool_responses")
-            or msg.get("role") == "tool"
-            for msg in messages
+            msg.get("tool_calls") or msg.get("tool_responses") or msg.get("role") == "tool" for msg in messages
         )
 
     @staticmethod
@@ -117,9 +118,7 @@ class Gemma4Renderer:
         if isinstance(content, str):
             text = cls._strip_thinking(content) if role == "assistant" else content
             return text.strip()
-        if isinstance(content, Sequence) and not isinstance(
-            content, (str, bytes, bytearray)
-        ):
+        if isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
             parts: list[str] = []
             for item in content:
                 if isinstance(item, str):
@@ -146,9 +145,7 @@ class Gemma4Renderer:
             return ""
         if isinstance(content, str):
             return content.strip()
-        if isinstance(content, Sequence) and not isinstance(
-            content, (str, bytes, bytearray)
-        ):
+        if isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
             parts: list[str] = []
             for item in content:
                 if isinstance(item, Mapping):
@@ -164,9 +161,7 @@ class Gemma4Renderer:
 
     @classmethod
     def _tool_text(cls, content: Any) -> Any:
-        if isinstance(content, Sequence) and not isinstance(
-            content, (str, bytes, bytearray)
-        ):
+        if isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
             text_parts: list[str] = []
             for item in content:
                 if isinstance(item, Mapping):
@@ -204,28 +199,17 @@ class Gemma4Renderer:
         if isinstance(value, bool):
             return "true" if value else "false"
         if value is None:
-            return "None"
+            return "null"
         if isinstance(value, int | float):
             return str(value)
         if isinstance(value, Mapping):
             items = []
             for key, item in sorted(value.items()):
                 key_text = f"{_QUOTE}{key}{_QUOTE}" if escape_keys else str(key)
-                items.append(
-                    f"{key_text}:{cls._format_argument(item, escape_keys=escape_keys)}"
-                )
+                items.append(f"{key_text}:{cls._format_argument(item, escape_keys=escape_keys)}")
             return "{" + ",".join(items) + "}"
-        if isinstance(value, Sequence) and not isinstance(
-            value, (str, bytes, bytearray)
-        ):
-            return (
-                "["
-                + ",".join(
-                    cls._format_argument(item, escape_keys=escape_keys)
-                    for item in value
-                )
-                + "]"
-            )
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return "[" + ",".join(cls._format_argument(item, escape_keys=escape_keys) for item in value) + "]"
         return str(value)
 
     @classmethod
@@ -262,39 +246,25 @@ class Gemma4Renderer:
                             continue
                         if item_key == "properties" and isinstance(item_value, Mapping):
                             nested_required = (
-                                items.get("required")
-                                if isinstance(items.get("required"), Sequence)
-                                else []
+                                items.get("required") if isinstance(items.get("required"), Sequence) else []
                             )
                             item_pieces.append(
-                                "properties:{"
-                                + cls._format_parameters(item_value, nested_required)
-                                + "}"
+                                "properties:{" + cls._format_parameters(item_value, nested_required) + "}"
                             )
-                        elif item_key == "required" and isinstance(
-                            item_value, Sequence
-                        ):
+                        elif item_key == "required" and isinstance(item_value, Sequence):
                             item_pieces.append(
-                                "required:["
-                                + ",".join(
-                                    f"{_QUOTE}{req}{_QUOTE}" for req in item_value
-                                )
-                                + "]"
+                                "required:[" + ",".join(f"{_QUOTE}{req}{_QUOTE}" for req in item_value) + "]"
                             )
                         elif item_key == "type":
                             if isinstance(item_value, str):
                                 rendered_type = cls._format_argument(item_value.upper())
                             elif isinstance(item_value, Sequence):
-                                rendered_type = cls._format_argument(
-                                    [str(v).upper() for v in item_value]
-                                )
+                                rendered_type = cls._format_argument([str(v).upper() for v in item_value])
                             else:
                                 rendered_type = cls._format_argument(item_value)
                             item_pieces.append(f"type:{rendered_type}")
                         else:
-                            item_pieces.append(
-                                f"{item_key}:{cls._format_argument(item_value)}"
-                            )
+                            item_pieces.append(f"{item_key}:{cls._format_argument(item_value)}")
                     pieces.append("items:{" + ",".join(item_pieces) + "}")
 
             if value.get("nullable"):
@@ -303,22 +273,10 @@ class Gemma4Renderer:
             if type_upper == "OBJECT":
                 nested_props = value.get("properties")
                 if isinstance(nested_props, Mapping):
-                    nested_required = (
-                        value.get("required")
-                        if isinstance(value.get("required"), Sequence)
-                        else []
-                    )
-                    pieces.append(
-                        "properties:{"
-                        + cls._format_parameters(nested_props, nested_required)
-                        + "}"
-                    )
+                    nested_required = value.get("required") if isinstance(value.get("required"), Sequence) else []
+                    pieces.append("properties:{" + cls._format_parameters(nested_props, nested_required) + "}")
                 elif isinstance(value, Mapping):
-                    nested_required = (
-                        value.get("required")
-                        if isinstance(value.get("required"), Sequence)
-                        else []
-                    )
+                    nested_required = value.get("required") if isinstance(value.get("required"), Sequence) else []
                     pieces.append(
                         "properties:{"
                         + cls._format_parameters(
@@ -330,12 +288,7 @@ class Gemma4Renderer:
                     )
                 if value.get("required"):
                     pieces.append(
-                        "required:["
-                        + ",".join(
-                            f"{_QUOTE}{item}{_QUOTE}"
-                            for item in value.get("required", [])
-                        )
-                        + "]"
+                        "required:[" + ",".join(f"{_QUOTE}{item}{_QUOTE}" for item in value.get("required", [])) + "]"
                     )
 
             pieces.append(f"type:{_QUOTE}{type_upper}{_QUOTE}")
@@ -346,14 +299,10 @@ class Gemma4Renderer:
     def _format_function_declaration(cls, tool_data: Mapping[str, Any]) -> str:
         function = tool_data.get("function", tool_data)
         if not isinstance(function, Mapping):
-            raise ValueError(
-                f"Gemma4 tool declaration must be a mapping: {tool_data!r}"
-            )
+            raise ValueError(f"Gemma4 tool declaration must be a mapping: {tool_data!r}")
         name = function.get("name")
         if not isinstance(name, str) or not name:
-            raise ValueError(
-                f"Gemma4 tool declaration missing function name: {tool_data!r}"
-            )
+            raise ValueError(f"Gemma4 tool declaration missing function name: {tool_data!r}")
         description = function.get("description") or ""
         out = [f"declaration:{name}{{description:{_QUOTE}{description}{_QUOTE}"]
 
@@ -361,21 +310,11 @@ class Gemma4Renderer:
         if isinstance(params, Mapping) and params:
             param_pieces: list[str] = []
             props = params.get("properties")
-            required = (
-                params.get("required")
-                if isinstance(params.get("required"), Sequence)
-                else []
-            )
+            required = params.get("required") if isinstance(params.get("required"), Sequence) else []
             if isinstance(props, Mapping) and props:
-                param_pieces.append(
-                    "properties:{" + cls._format_parameters(props, required) + "}"
-                )
+                param_pieces.append("properties:{" + cls._format_parameters(props, required) + "}")
             if required:
-                param_pieces.append(
-                    "required:["
-                    + ",".join(f"{_QUOTE}{item}{_QUOTE}" for item in required)
-                    + "]"
-                )
+                param_pieces.append("required:[" + ",".join(f"{_QUOTE}{item}{_QUOTE}" for item in required) + "]")
             param_type = params.get("type")
             if param_type:
                 param_pieces.append(f"type:{_QUOTE}{str(param_type).upper()}{_QUOTE}")
@@ -386,9 +325,7 @@ class Gemma4Renderer:
         if isinstance(response, Mapping):
             response_text = ""
             if response.get("description"):
-                response_text += (
-                    f"description:{_QUOTE}{response['description']}{_QUOTE},"
-                )
+                response_text += f"description:{_QUOTE}{response['description']}{_QUOTE},"
             if str(response.get("type", "")).upper() == "OBJECT":
                 response_is_object = True
                 response_text += f"type:{_QUOTE}{str(response['type']).upper()}{_QUOTE}"
@@ -407,8 +344,7 @@ class Gemma4Renderer:
         response = cls._tool_text(response)
         if isinstance(response, Mapping):
             body = ",".join(
-                f"{key}:{cls._format_argument(value, escape_keys=False)}"
-                for key, value in sorted(response.items())
+                f"{key}:{cls._format_argument(value, escape_keys=False)}" for key, value in sorted(response.items())
             )
         else:
             body = f"value:{cls._format_argument(response, escape_keys=False)}"
@@ -489,10 +425,7 @@ class Gemma4Renderer:
                 continue
             while span_idx < len(spans) and start >= spans[span_idx][1]:
                 span_idx += 1
-            if (
-                span_idx < len(spans)
-                and spans[span_idx][0] <= start < spans[span_idx][1]
-            ):
+            if span_idx < len(spans) and spans[span_idx][0] <= start < spans[span_idx][1]:
                 token_segments.append(spans[span_idx][2])
             else:
                 token_segments.append(last_segment)
@@ -517,9 +450,7 @@ class Gemma4Renderer:
     ) -> list[_Segment]:
         segments: list[_Segment] = []
 
-        def emit(
-            text: str, msg_idx: int, *, is_sampled: bool, is_content: bool
-        ) -> None:
+        def emit(text: str, msg_idx: int, *, is_sampled: bool, is_content: bool) -> None:
             if text:
                 segments.append(_Segment(text, msg_idx, is_sampled, is_content))
 
@@ -529,9 +460,7 @@ class Gemma4Renderer:
         start_idx = 0
         first_role = messages[0].get("role") if messages else None
         if include_initial_block and (
-            self.config.enable_thinking
-            or bool(tools)
-            or first_role in {"system", "developer"}
+            self.config.enable_thinking or bool(tools) or first_role in {"system", "developer"}
         ):
             emit("<|turn>system\n", -1, is_sampled=False, is_content=False)
             if self.config.enable_thinking:
@@ -569,9 +498,7 @@ class Gemma4Renderer:
                 if prev.get("role") != "tool":
                     prev_non_tool_role = prev.get("role")
                     break
-            continue_same_model_turn = (
-                rendered_role == "model" and prev_non_tool_role == "assistant"
-            )
+            continue_same_model_turn = rendered_role == "model" and prev_non_tool_role == "assistant"
             if not continue_same_model_turn:
                 emit(
                     f"<|turn>{rendered_role}\n",
@@ -583,23 +510,8 @@ class Gemma4Renderer:
             is_assistant = role == "assistant"
             tool_calls = msg.get("tool_calls") or []
             thinking_text = msg.get("reasoning") or msg.get("reasoning_content")
-            preserve_thinking = is_assistant and should_preserve_past_thinking(
-                messages,
-                msg_idx,
-                preserve_all_thinking=self.config.preserve_all_thinking,
-                preserve_thinking_between_tool_calls=self.config.preserve_thinking_between_tool_calls,
-            )
-            native_thinking = (
-                is_assistant
-                and isinstance(thinking_text, str)
-                and local_idx > last_user
-                and bool(tool_calls)
-            )
-            if (
-                (native_thinking or preserve_thinking)
-                and isinstance(thinking_text, str)
-                and thinking_text
-            ):
+            native_thinking = is_assistant and isinstance(thinking_text, str) and local_idx > last_user
+            if native_thinking and thinking_text:
                 emit("<|channel>thought\n", msg_idx, is_sampled=True, is_content=True)
                 emit(thinking_text, msg_idx, is_sampled=True, is_content=True)
                 emit("\n<channel|>", msg_idx, is_sampled=True, is_content=True)
@@ -614,9 +526,7 @@ class Gemma4Renderer:
                     name = function.get("name")
                     if not isinstance(name, str) or not name:
                         continue
-                    arguments = self._normalize_arguments(
-                        function.get("arguments") or {}
-                    )
+                    arguments = self._normalize_arguments(function.get("arguments") or {})
                     if isinstance(arguments, Mapping):
                         args_text = ",".join(
                             f"{key}:{self._format_argument(value, escape_keys=False)}"
@@ -660,9 +570,7 @@ class Gemma4Renderer:
                         tool_name,
                         follow.get("content"),
                     ):
-                        emit(
-                            text, tool_msg_idx, is_sampled=False, is_content=is_content
-                        )
+                        emit(text, tool_msg_idx, is_sampled=False, is_content=is_content)
                     saw_tool_response = True
                     prev_message_type = "tool_response"
                     scan_idx += 1
@@ -687,10 +595,7 @@ class Gemma4Renderer:
             "tool_call",
         }:
             emit("<|turn>model\n", -1, is_sampled=False, is_content=False)
-            if (
-                self._add_empty_thought_generation_prompt
-                and not self.config.enable_thinking
-            ):
+            if self._add_empty_thought_generation_prompt and not self.config.enable_thinking:
                 emit(
                     "<|channel>thought\n<channel|>",
                     -1,
@@ -765,6 +670,7 @@ class Gemma4Renderer:
             or not new_messages
             or self._uses_tooling(new_messages, tools)
             or any(msg.get("role") == "assistant" for msg in new_messages)
+            or should_rerender_for_thinking_retention(self.effective_thinking_retention, new_messages)
         ):
             return None
 

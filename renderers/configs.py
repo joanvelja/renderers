@@ -4,14 +4,14 @@ discriminated union (``RendererConfig``).
 Each renderer accepts its own typed config; bad combinations (e.g.
 ``add_vision_id`` under ``name="qwen3"``) fail at config-load time with a
 pydantic ``ValidationError`` rather than at runtime via an allowlist
-check. The shared ``preserve_*`` flags live on ``BaseRendererConfig``
-and OR-compose with template-level toggles (e.g. GLM-5
-``clear_thinking``) inside each renderer — they extend retention, never
-override the template into a drop.
+check. The shared ``thinking_retention`` flag is optional: ``None`` means
+"derive bridge policy from this renderer's chat-template knobs"; an
+explicit value is a bridge-policy override.
 
 ``AutoRendererConfig`` is a placeholder variant: ``create_renderer``
 resolves it via ``MODEL_RENDERER_MAP`` and constructs the matching
-typed config with the auto config's ``preserve_*`` fields carried over.
+typed config with the auto config's ``thinking_retention`` field carried
+over when one was explicitly supplied.
 
 ``DefaultRendererConfig`` uses ``extra="allow"`` to accept arbitrary
 Jinja kwargs as ``model_extra`` — ``DefaultRenderer`` doesn't know which
@@ -22,8 +22,38 @@ from __future__ import annotations
 
 from typing import Annotated, ClassVar, Literal, Union
 
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, model_validator
 from pydantic_config import BaseConfig
+
+
+def _reject_thinking_retention_conflict(
+    config: BaseConfig,
+    kwarg_name: str,
+    *,
+    true_implies: "ResolvedThinkingRetention",
+    false_implies: "ResolvedThinkingRetention",
+) -> None:
+    """Raise if explicit template and renderer retention knobs disagree."""
+    fields_set = config.__pydantic_fields_set__
+    requested = getattr(config, "thinking_retention", None)
+    if kwarg_name in fields_set and requested is not None:
+        implied = (
+            false_implies if getattr(config, kwarg_name) is False else true_implies
+        )
+        if requested == implied:
+            return
+        raise ValueError(
+            f"{kwarg_name}={getattr(config, kwarg_name)!r} implies "
+            f"thinking_retention={implied!r}, which conflicts with explicit "
+            f"thinking_retention={requested!r}."
+        )
+
+
+ThinkingRetention = Literal["tool_cycle", "all"]
+"""User-facing historical thinking/analysis retention override."""
+
+ResolvedThinkingRetention = Literal["template", "tool_cycle", "all"]
+"""Internal bridge policy after template kwargs have been resolved."""
 
 
 class BaseRendererConfig(BaseConfig):
@@ -35,28 +65,27 @@ class BaseRendererConfig(BaseConfig):
     this class adds ``frozen=True`` so configs are hashable value
     objects.
 
-    ``preserve_all_thinking`` and ``preserve_thinking_between_tool_calls``
-    are renderer-internal behaviour flags — they don't map to any Jinja
-    chat-template kwarg. They OR-compose with template-level toggles on
-    renderers that expose one (GLM-5 ``clear_thinking``, Nemotron-3
-    ``truncate_history_thinking``): either flag saying "keep this
-    thinking" wins. preserve_* can only ever extend retention; setting
-    ``preserve_all_thinking=True`` always keeps past thinking, regardless
-    of the template kwarg. See ``renderers.base.should_preserve_past_thinking``.
+    ``thinking_retention`` is an optional renderer-level retention override.
+    Leave it ``None`` to derive the effective policy from the renderer's own
+    chat-template knobs. Set it explicitly to request retention beyond the
+    template default; renderers fail loudly when an explicit template knob says
+    the opposite thing.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    preserve_all_thinking: bool = False
-    """Restore ``reasoning_content`` on every past assistant turn, even
-    when the chat template would drop it. Strict superset of
-    ``preserve_thinking_between_tool_calls``."""
+    thinking_retention: ThinkingRetention | None = None
+    """Explicit retention override, or ``None`` to derive from template knobs:
 
-    preserve_thinking_between_tool_calls: bool = False
-    """Restore ``reasoning_content`` only inside the in-flight tool cycle:
-    the contiguous A-T-...-A block after the most recent ``user`` turn,
-    and only if it contains at least one ``tool`` response. A new user
-    turn closes the block and drops its thinking (template default)."""
+    - ``None`` — derive the effective bridge policy from this renderer's
+      chat-template knobs while keeping full renders template-faithful.
+    - ``"tool_cycle"`` — bridge within the current tool cycle; re-render when
+      a new user query arrives.
+    - ``"all"`` — allow bridges across user-query boundaries.
+
+    This does not change full ``render()`` output; full renders stay faithful
+    to the Python chat-template implementation and its explicit template
+    kwargs."""
 
     # Fields that are renderer-internal — not forwarded to (or mirrored
     # by) ``apply_chat_template``. Override in subclasses that hold
@@ -87,9 +116,10 @@ class BaseRendererConfig(BaseConfig):
 
 class AutoRendererConfig(BaseRendererConfig):
     """Resolve the renderer from ``tokenizer.name_or_path`` at construction
-    time via ``MODEL_RENDERER_MAP``. Carries only the shared ``preserve_*``
-    fields; template kwargs require an explicit renderer choice so that
-    template-dependent behaviour stays visible at the call site."""
+    time via ``MODEL_RENDERER_MAP``. Carries only the shared
+    ``thinking_retention`` field when explicitly set; template kwargs require
+    an explicit renderer choice so template-dependent behaviour stays visible
+    at the call site."""
 
     name: Literal["auto"] = "auto"
 
@@ -119,6 +149,26 @@ class DefaultRendererConfig(BaseRendererConfig):
     # template. Jinja kwargs live in ``model_extra`` (extra="allow").
     _internal_fields = frozenset({"tool_parser", "reasoning_parser"})
 
+    @model_validator(mode="after")
+    def _reject_legacy_preserve_flags(self):
+        # ``extra="allow"`` would otherwise swallow the removed ``preserve_*``
+        # bools into ``model_extra`` and forward them to apply_chat_template,
+        # silently dropping the user's intent (DefaultRenderer can't
+        # selectively re-emit reasoning_content). Reject them like every other
+        # config's ``extra="forbid"`` does, pointing at the replacement.
+        legacy = {
+            "preserve_all_thinking",
+            "preserve_thinking_between_tool_calls",
+        } & set(self.model_extra or {})
+        if legacy:
+            raise ValueError(
+                f"{sorted(legacy)} were replaced by thinking_retention. "
+                "DefaultRenderer falls back to apply_chat_template and can't "
+                "selectively re-emit reasoning_content — use thinking_retention "
+                "on a model-specific renderer."
+            )
+        return self
+
 
 class Qwen3RendererConfig(BaseRendererConfig):
     """Qwen3 (text-only) renderer config."""
@@ -128,7 +178,19 @@ class Qwen3RendererConfig(BaseRendererConfig):
     enable_thinking: bool = True
     """When ``True``, the generation prompt includes ``<think>`` so the
     model continues into a thinking block. Mirrors the chat template's
-    ``enable_thinking`` kwarg."""
+    ``enable_thinking`` kwarg.
+
+    When ``False``, the renderer deliberately deviates from the template
+    on historical assistant turns without ``reasoning_content``: the empty
+    ``<think>\\n\\n</think>\\n\\n`` wrapper the generation prompt prefilled
+    is re-emitted instead of stripped, keeping re-renders token-stable with
+    the sampled stream (see ``renderers/qwen3.py`` module docstring)."""
+
+
+class PrimeQwen3RendererConfig(BaseRendererConfig):
+    """PrimeIntellect Qwen3 renderer config."""
+
+    name: Literal["prime-qwen3"] = "prime-qwen3"
 
 
 class Qwen35RendererConfig(BaseRendererConfig):
@@ -140,7 +202,14 @@ class Qwen35RendererConfig(BaseRendererConfig):
     """When ``True``, the generation prompt includes ``<think>``. ``None``
     auto-detects from the tokenizer's chat-template default — Instruct
     checkpoints default off, Thinking checkpoints default on. Mirrors
-    the chat template's ``enable_thinking`` kwarg."""
+    the chat template's ``enable_thinking`` kwarg.
+
+    When resolved ``False``, the renderer deliberately deviates from the
+    template on historical assistant turns without ``reasoning_content``:
+    the empty ``<think>\\n\\n</think>\\n\\n`` wrapper the generation prompt
+    prefilled is re-emitted instead of stripped, keeping re-renders
+    token-stable with the sampled stream (see ``renderers/qwen35.py``
+    module docstring)."""
 
     add_vision_id: bool = False
     """When ``True``, prefix each ``<|vision_start|>`` placeholder with
@@ -166,10 +235,25 @@ class Qwen36RendererConfig(BaseRendererConfig):
     add_vision_id: bool = False
     """See :class:`Qwen35RendererConfig.add_vision_id`."""
 
+    preserve_thinking: bool = False
+    """When ``True``, keep historical ``<think>`` blocks even before the
+    last real user query. Mirrors the Qwen3.6 chat template's native
+    ``preserve_thinking`` kwarg."""
+
     image_cache_max: int = 256
     """See :class:`Qwen35RendererConfig.image_cache_max`."""
 
     _internal_fields = frozenset({"image_cache_max"})
+
+    @model_validator(mode="after")
+    def _check_thinking_retention(self):
+        _reject_thinking_retention_conflict(
+            self,
+            "preserve_thinking",
+            true_implies="all",
+            false_implies="tool_cycle",
+        )
+        return self
 
 
 class Qwen3VLRendererConfig(BaseRendererConfig):
@@ -198,9 +282,18 @@ class GLM5RendererConfig(BaseRendererConfig):
     clear_thinking: bool = True
     """When ``False``, the renderer keeps ``<think>{reasoning}</think>``
     on past-cycle assistant turns instead of dropping them. Mirrors the
-    chat template's ``clear_thinking`` toggle. OR-composes with
-    ``preserve_all_thinking`` / ``preserve_thinking_between_tool_calls``
-    — see :class:`BaseRendererConfig` for the contract."""
+    chat template's ``clear_thinking`` toggle and resolves bridge policy
+    to ``"all"``."""
+
+    @model_validator(mode="after")
+    def _check_thinking_retention(self):
+        _reject_thinking_retention_conflict(
+            self,
+            "clear_thinking",
+            true_implies="tool_cycle",
+            false_implies="all",
+        )
+        return self
 
 
 class GLM51RendererConfig(BaseRendererConfig):
@@ -215,6 +308,16 @@ class GLM51RendererConfig(BaseRendererConfig):
     clear_thinking: bool = True
     """See :class:`GLM5RendererConfig.clear_thinking`."""
 
+    @model_validator(mode="after")
+    def _check_thinking_retention(self):
+        _reject_thinking_retention_conflict(
+            self,
+            "clear_thinking",
+            true_implies="tool_cycle",
+            false_implies="all",
+        )
+        return self
+
 
 class GLM45RendererConfig(BaseRendererConfig):
     """GLM-4.5 Air renderer config."""
@@ -224,6 +327,70 @@ class GLM45RendererConfig(BaseRendererConfig):
     enable_thinking: bool = True
     """When ``True``, the generation prompt includes ``<think>``. Mirrors
     the chat template's ``enable_thinking`` kwarg."""
+
+
+class Hy3RendererConfig(BaseRendererConfig):
+    """Tencent Hunyuan Hy3 renderer config.
+
+    Hy3 reasons via a ``reasoning_effort`` gate rather than a boolean
+    ``enable_thinking``. ``"no_think"`` (the template default) prefills an
+    empty ``<think></think>`` at the generation prompt so the model answers
+    directly; ``"low"`` / ``"high"`` prefill only the ``<think>`` opener so
+    the model streams reasoning up to a ``</think>`` it emits itself.
+
+    ``preserved_thinking`` mirrors the template kwarg of the same name:
+    ``True`` keeps ``<think>{reasoning}</think>`` on every historical
+    assistant turn; ``False`` collapses past-cycle reasoning to
+    ``<think></think>``, keeping it only on the in-flight turn (after the
+    last user query). ``None`` (default) follows the template's own
+    default — ``True`` when ``tools`` are supplied at render time, ``False``
+    otherwise. Bridge policy tracks the same resolution: ``"all"`` whenever
+    ``preserved_thinking`` resolves to ``True`` for the tools at hand,
+    ``"tool_cycle"`` otherwise.
+    """
+
+    name: Literal["hy3"] = "hy3"
+
+    reasoning_effort: Literal["no_think", "low", "high"] = "no_think"
+    """Reasoning gate. Mirrors the chat template's ``reasoning_effort`` kwarg.
+    ``"no_think"`` prefills ``<think></think>`` at the generation prompt;
+    ``"low"`` / ``"high"`` prefill just ``<think>``."""
+
+    preserved_thinking: bool | None = None
+    """Keep historical assistant reasoning. Mirrors the template's
+    ``preserved_thinking`` kwarg. ``None`` defers to the template default
+    (``True`` with tools, ``False`` without). Bridge policy is ``"all"``
+    whenever this resolves to ``True`` for the tools at hand."""
+
+    is_training: bool = False
+    """Mirrors the template's ``is_training`` kwarg. ``True`` renders SFT
+    targets: reasoning is kept on every assistant turn (regardless of
+    ``preserved_thinking`` / position) and the final assistant is terminated
+    with ``<｜hy_eos｜>``. Leave ``False`` for inference-faithful renders;
+    the training loss mask is normally derived via ``build_training_sample``
+    rather than this flag."""
+
+    raw_last_assistant: bool = False
+    """Mirrors the template's ``raw_last_assistant`` kwarg. When ``True`` a
+    trailing non-tool assistant message is emitted as raw visible content —
+    no ``<think>`` wrap, no ``<｜hy_eos｜>`` — for prefill / continuation."""
+
+    fallback_strategy: Literal["reasoning_toolcall_retry"] | None = None
+    """Mirrors the template's ``fallback_strategy`` kwarg. The sole active
+    value, ``"reasoning_toolcall_retry"``, forces ``reasoning_effort="high"``
+    and suppresses the generation prompt (``add_generation_prompt=False``)."""
+
+    @model_validator(mode="after")
+    def _check_thinking_retention(self):
+        if self.preserved_thinking is not None and self.thinking_retention is not None:
+            implied = "all" if self.preserved_thinking else "tool_cycle"
+            if self.thinking_retention != implied:
+                raise ValueError(
+                    f"preserved_thinking={self.preserved_thinking!r} implies "
+                    f"thinking_retention={implied!r}, which conflicts with "
+                    f"explicit thinking_retention={self.thinking_retention!r}."
+                )
+        return self
 
 
 class GptOssRendererConfig(BaseRendererConfig):
@@ -260,9 +427,29 @@ class GptOssRendererConfig(BaseRendererConfig):
     """Override the model-identity line in the preamble. ``None`` uses
     harmony's built-in default."""
 
+    auto_drop_analysis: bool = True
+    """Harmony ``RenderConversationConfig.auto_drop_analysis`` behaviour.
+    ``True`` keeps live tool-cycle analysis but drops stale analysis from
+    history; ``False`` keeps analysis in all history."""
+
     _internal_fields = frozenset(
-        {"use_system_prompt", "knowledge_cutoff", "model_identity"}
+        {
+            "use_system_prompt",
+            "knowledge_cutoff",
+            "model_identity",
+            "auto_drop_analysis",
+        }
     )
+
+    @model_validator(mode="after")
+    def _check_thinking_retention(self):
+        _reject_thinking_retention_conflict(
+            self,
+            "auto_drop_analysis",
+            true_implies="tool_cycle",
+            false_implies="all",
+        )
+        return self
 
 
 class Gemma4RendererConfig(BaseRendererConfig):
@@ -329,13 +516,33 @@ class LagunaXS2RendererConfig(BaseRendererConfig):
     chat template's ``render_assistant_messages_raw`` gate."""
 
 
+class LagunaXS21RendererConfig(BaseRendererConfig):
+    """Laguna XS-2.1 renderer config.
+
+    XS-2.1's chat template reads a single kwarg, ``enable_thinking``,
+    which gates both the generation prompt (``<think>`` vs ``</think>``)
+    and whether assistant reasoning is rendered into the history at all.
+    Served by :class:`renderers.laguna_xs2.LagunaXS21Renderer`.
+    """
+
+    name: Literal["laguna-xs-2.1"] = "laguna-xs-2.1"
+
+    enable_thinking: bool = False
+    """When ``True``, the generation prompt ends with ``<think>`` and
+    every assistant turn renders ``<think>{reasoning}</think>``; when
+    ``False``, turns open with a bare ``</think>`` and reasoning is not
+    rendered. Mirrors the template's ``enable_thinking`` kwarg and its
+    upstream default."""
+
+
 class Llama3RendererConfig(BaseRendererConfig):
     """Llama-3.x Instruct renderer config.
 
-    Llama-3 ships no reasoning channel, so the base ``preserve_*_thinking``
-    flags don't apply: ``Llama3Renderer`` raises ``NotImplementedError``
-    if either is set (matching ``DefaultRenderer``'s contract for the
-    same case). Both fields below mirror real ``apply_chat_template``
+    Llama-3 ships no reasoning channel, so the base ``thinking_retention``
+    flag is a no-op: there's never any past-assistant thinking to retain
+    or drop, so any level leaves the token stream unchanged (same contract
+    as Kimi-K2 / Qwen3-VL). Both fields below mirror real
+    ``apply_chat_template``
     kwargs.
     """
 
@@ -383,9 +590,18 @@ class Nemotron3RendererConfig(BaseRendererConfig):
     truncate_history_thinking: bool = True
     """When ``False``, keep ``<think>{reasoning}</think>`` on past-cycle
     assistant turns instead of dropping them. Mirrors the chat
-    template's ``truncate_history_thinking`` toggle. OR-composes with
-    ``preserve_all_thinking`` / ``preserve_thinking_between_tool_calls``
-    — see :class:`BaseRendererConfig` for the contract."""
+    template's ``truncate_history_thinking`` toggle and resolves bridge
+    policy to ``"all"``."""
+
+    @model_validator(mode="after")
+    def _check_thinking_retention(self):
+        _reject_thinking_retention_conflict(
+            self,
+            "truncate_history_thinking",
+            true_implies="tool_cycle",
+            false_implies="all",
+        )
+        return self
 
     low_effort: bool = False
     """When ``True``, append ``\\n\\n{reasoning effort: low}`` to the last user
@@ -415,6 +631,16 @@ class Nemotron3UltraRendererConfig(BaseRendererConfig):
     truncate_history_thinking: bool = True
     """See :class:`Nemotron3RendererConfig.truncate_history_thinking`."""
 
+    @model_validator(mode="after")
+    def _check_thinking_retention(self):
+        _reject_thinking_retention_conflict(
+            self,
+            "truncate_history_thinking",
+            true_implies="tool_cycle",
+            false_implies="all",
+        )
+        return self
+
     medium_effort: bool = False
     """When ``True``, append ``\\n\\n{reasoning effort: efficient}`` to the last
     user message. Mirrors the Ultra chat template's ``medium_effort`` kwarg."""
@@ -437,9 +663,10 @@ class DeepSeekR1RendererConfig(BaseRendererConfig):
     R1 always reasons — its chat template unconditionally prefills
     ``<think>\\n`` at the generation prompt and strips ``</think>`` from
     historical assistant turns. There is therefore no ``enable_thinking``
-    knob (thinking is not optional), and ``preserve_*`` flags are no-ops
-    (history reasoning is always dropped); both stored for protocol
-    uniformity. Applies to full ``deepseek-ai/DeepSeek-R1`` / ``-R1-0528``
+    knob (thinking is not optional). With ``thinking_retention=None`` the
+    resolved bridge policy is ``"template"``; explicit ``"tool_cycle"`` /
+    ``"all"`` are bridge-policy overrides. Applies to full
+    ``deepseek-ai/DeepSeek-R1`` / ``-R1-0528``
     — NOT the R1-Distill-Qwen/Llama models, which use those base
     tokenizers and route to the Qwen3 / Llama-3 renderers.
     """
@@ -452,6 +679,7 @@ RendererConfig = Annotated[
         AutoRendererConfig,
         DefaultRendererConfig,
         Qwen3RendererConfig,
+        PrimeQwen3RendererConfig,
         Qwen35RendererConfig,
         Qwen36RendererConfig,
         Qwen3VLRendererConfig,
@@ -460,9 +688,11 @@ RendererConfig = Annotated[
         GLM45RendererConfig,
         GptOssRendererConfig,
         Gemma4RendererConfig,
+        Hy3RendererConfig,
         KimiK2RendererConfig,
         KimiK25RendererConfig,
         LagunaXS2RendererConfig,
+        LagunaXS21RendererConfig,
         Llama3RendererConfig,
         MiniMaxM2RendererConfig,
         Nemotron3RendererConfig,
@@ -485,11 +715,12 @@ that renderer supports. Bogus combinations (e.g. ``add_vision_id`` under
 # Map discriminator → config class. Used by ``create_renderer`` when
 # resolving ``AutoRendererConfig`` against ``MODEL_RENDERER_MAP``: the
 # resolved renderer name picks the corresponding typed config, and the
-# auto config's ``preserve_*`` fields are carried over.
+# auto config's ``thinking_retention`` field is carried over.
 _CONFIG_BY_NAME: dict[str, type[BaseRendererConfig]] = {
     "auto": AutoRendererConfig,
     "default": DefaultRendererConfig,
     "qwen3": Qwen3RendererConfig,
+    "prime-qwen3": PrimeQwen3RendererConfig,
     "qwen3.5": Qwen35RendererConfig,
     "qwen3.6": Qwen36RendererConfig,
     "qwen3-vl": Qwen3VLRendererConfig,
@@ -498,9 +729,11 @@ _CONFIG_BY_NAME: dict[str, type[BaseRendererConfig]] = {
     "glm-4.5": GLM45RendererConfig,
     "gpt-oss": GptOssRendererConfig,
     "gemma4": Gemma4RendererConfig,
+    "hy3": Hy3RendererConfig,
     "kimi-k2": KimiK2RendererConfig,
     "kimi-k2.5": KimiK25RendererConfig,
     "laguna-xs.2": LagunaXS2RendererConfig,
+    "laguna-xs-2.1": LagunaXS21RendererConfig,
     "llama-3": Llama3RendererConfig,
     "minimax-m2": MiniMaxM2RendererConfig,
     "nemotron-3": Nemotron3RendererConfig,
@@ -545,17 +778,22 @@ __all__ = [
     "GLM5RendererConfig",
     "Gemma4RendererConfig",
     "GptOssRendererConfig",
+    "Hy3RendererConfig",
     "KimiK25RendererConfig",
     "KimiK2RendererConfig",
     "LagunaXS2RendererConfig",
+    "LagunaXS21RendererConfig",
     "Llama3RendererConfig",
     "MiniMaxM2RendererConfig",
     "Nemotron3RendererConfig",
     "Nemotron3UltraRendererConfig",
+    "PrimeQwen3RendererConfig",
     "Qwen35RendererConfig",
     "Qwen36RendererConfig",
     "Qwen3RendererConfig",
     "Qwen3VLRendererConfig",
     "RendererConfig",
+    "ResolvedThinkingRetention",
+    "ThinkingRetention",
     "config_from_name",
 ]

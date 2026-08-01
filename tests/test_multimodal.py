@@ -37,12 +37,16 @@ from renderers.base import MODEL_RENDERER_MAP, load_tokenizer
 from renderers.configs import _config_class_for
 
 
+def _config_for_model(model_name: str, **kwargs):
+    renderer_name = MODEL_RENDERER_MAP[model_name]
+    return _config_class_for(renderer_name)(**kwargs)
+
+
 def _config_with_add_vision_id(model_name: str, add_vision_id: bool):
     """Build the typed config for ``model_name`` (resolved via
     ``MODEL_RENDERER_MAP``) with ``add_vision_id`` set. The qwen_vl
     family — Qwen3.5 and Qwen3-VL — both expose this field."""
-    renderer_name = MODEL_RENDERER_MAP[model_name]
-    return _config_class_for(renderer_name)(add_vision_id=add_vision_id)
+    return _config_for_model(model_name, add_vision_id=add_vision_id)
 
 
 pytest.importorskip("PIL", reason="Pillow required for multimodal tests")
@@ -433,6 +437,20 @@ def _build_tool_image_cases(make_part, image):
 # ---------------------------------------------------------------------------
 
 
+def _skip_for_disabled_thinking_deviation(renderer, case_id) -> bool:
+    """With ``enable_thinking=False`` (the resolved default on the small
+    Qwen3.5 sizes) the Qwen family re-emits the empty think wrapper on
+    historical assistant turns without reasoning — a documented deviation
+    from the template for sampled-token stability (see
+    ``test_disabled_thinking_stability.py``). Cases with an assistant turn
+    before the last user query therefore diverge from the processor oracle
+    by exactly those wrapper tokens; skip them for parity purposes."""
+    return getattr(renderer.config, "enable_thinking", True) is False and case_id in (
+        "multi_turn_two_images",
+        "multi_turn_tool_response_images",
+    )
+
+
 def _supports_tool_message_images(renderer) -> bool:
     """True iff this renderer emits image placeholders inside tool-response
     content. Renderers without the feature silently drop image parts in tool
@@ -462,6 +480,8 @@ def test_multimodal_byte_parity_vs_processor(mm_model_name, modality, tiny_image
 
     for case in _build_cases(kit["make_part"], tiny_image):
         messages, add_gp = case.values
+        if _skip_for_disabled_thinking_deviation(renderer, case.id):
+            continue
 
         # Ours.
         ours = renderer.render_ids(messages, add_generation_prompt=add_gp)
@@ -529,10 +549,9 @@ def test_multimodal_bridge_extends_and_carries_mm_data(
 ):
     """Bridge-to-next-turn invariants for the multimodal case.
 
-    Asserts three properties that should hold for every renderer
-    regardless of thinking-mode quirks (the prior bridge-vs-full
-    invariant was too strong — see commit log for the divergence
-    rationale on thinking renderers):
+    The renderer is forced to ``thinking_retention="all"`` so this test
+    isolates multimodal bridge mechanics from thinking-retention policy.
+    Asserts three properties:
 
     1. **Verbatim prefix**: ``bridged.token_ids`` begins with
        ``previous_prompt_ids + previous_completion_ids``. Whatever the
@@ -552,7 +571,13 @@ def test_multimodal_bridge_extends_and_carries_mm_data(
         pytest.skip(f"{mm_model_name}: HF snapshot not cached locally")
 
     kit = _modality_kit(modality, mm_model_name)
-    tokenizer, _, renderer = _load_processor_and_renderer(mm_model_name)
+    tokenizer, processor, _ = _load_processor_and_renderer(mm_model_name)
+    renderer = create_renderer(
+        tokenizer,
+        _config_for_model(mm_model_name, thinking_retention="all"),
+    )
+    if hasattr(renderer, "_processor") and renderer._processor is None:
+        renderer._processor = processor
 
     initial = [
         {
@@ -574,6 +599,12 @@ def test_multimodal_bridge_extends_and_carries_mm_data(
     ]
 
     initial_rendered = renderer.render(initial, add_generation_prompt=True)
+    prior_mm = initial_rendered.multi_modal_data
+    prior_counts = (
+        len(prior_mm.mm_placeholders.get(modality, [])),
+        len(prior_mm.mm_items.get(modality, [])),
+        len(prior_mm.mm_hashes.get(modality, [])),
+    )
     # ``previous_completion_ids`` mirrors what a sampler would emit
     # starting AFTER the prompt's assistant role opener — i.e. the
     # response text followed by ``<|im_end|>``.
@@ -622,6 +653,19 @@ def test_multimodal_bridge_extends_and_carries_mm_data(
     items = bridged_mm.mm_items.get(modality, [])
     hashes = bridged_mm.mm_hashes.get(modality, [])
     assert len(items) == 2 and len(hashes) == 2
+
+    # (2b) The prior turn's sidecar is unchanged — the bridge copies the
+    # per-modality lists, so the carried-forward item doesn't grow the
+    # caller's previous_multi_modal_data in place.
+    assert (
+        (
+            len(prior_mm.mm_placeholders.get(modality, [])),
+            len(prior_mm.mm_items.get(modality, [])),
+            len(prior_mm.mm_hashes.get(modality, [])),
+        )
+        == prior_counts
+        == (1, 1, 1)
+    ), f"{mm_model_name} / {modality}: bridge mutated previous_multi_modal_data"
 
     # (3) Extension contains the new turn's pad run, and its
     # placeholder offset lands inside the extension region.
@@ -681,6 +725,8 @@ def test_tool_response_image_byte_parity(mm_model_name, modality, tiny_image):
 
     for case in _build_tool_image_cases(kit["make_part"], tiny_image):
         messages, add_gp = case.values
+        if _skip_for_disabled_thinking_deviation(renderer, case.id):
+            continue
         ours = renderer.render_ids(messages, add_generation_prompt=add_gp)
         theirs = kit["processor_input_ids"](processor, messages, add_gp)
         assert ours == theirs, (
@@ -768,6 +814,8 @@ def test_add_vision_id_parity_vs_processor(
 
     for case in _build_cases(kit["make_part"], tiny_image):
         messages, add_gp = case.values
+        if _skip_for_disabled_thinking_deviation(renderer, case.id):
+            continue
         ours = renderer.render_ids(messages, add_generation_prompt=add_gp)
         theirs = _qwen_vl_processor_input_ids_with_kwargs(
             processor, messages, add_gp, add_vision_id=add_vision_id
@@ -806,9 +854,15 @@ def test_bridge_refuses_when_add_vision_id_loses_prior_count(
 
     kit = _modality_kit(modality, mm_model_name)
     tokenizer, processor, _ = _load_processor_and_renderer(mm_model_name)
+    # Force bridge-allowed retention so this test isolates add_vision_id
+    # counter state from the user-turn retention gate.
     renderer = create_renderer(
         tokenizer,
-        _config_with_add_vision_id(mm_model_name, True),
+        _config_for_model(
+            mm_model_name,
+            add_vision_id=True,
+            thinking_retention="all",
+        ),
     )
     if hasattr(renderer, "_processor") and renderer._processor is None:
         renderer._processor = processor

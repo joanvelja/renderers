@@ -3,6 +3,14 @@
 Produces token-for-token identical output to tokenizer.apply_chat_template() while
 also tracking which message produced each token (for per-token loss masks).
 
+One documented deviation: with ``enable_thinking=False`` the empty
+``<think>\n\n</think>\n\n`` wrapper is re-emitted on historical assistant
+turns without ``reasoning_content`` (the Jinja template strips it from turns
+at or before the last user query). The generation prompt prefills that
+wrapper, so every turn sampled with thinking disabled contains it — stripping
+it on re-render would make the same conversation produce different tokens
+depending on when it is rendered. See ``tests/test_disabled_thinking_stability.py``.
+
 Multimodal: the Qwen3.5 family is itself a VLM (HF tag ``image-text-to-text``;
 processor class ``Qwen3VLProcessor``). When a user/tool message carries an
 ``ImagePart``, the renderer emits the same ``<|vision_start|>``+N×``<|image_pad|>``
@@ -29,7 +37,8 @@ from renderers.base import (
     attribute_text_segments,
     extract_message_tool_names,
     reject_assistant_in_extension,
-    should_preserve_past_thinking,
+    resolve_thinking_retention,
+    should_rerender_for_thinking_retention,
     trim_to_turn_close,
 )
 from renderers.configs import Qwen35RendererConfig
@@ -131,6 +140,16 @@ class Qwen35Renderer:
                 update={"enable_thinking": _default_enable_thinking(tokenizer)}
             )
         self.config = cfg
+        if getattr(cfg, "preserve_thinking", False):
+            implied_thinking_retention = "all"
+        elif not cfg.enable_thinking:
+            implied_thinking_retention = "all"
+        else:
+            implied_thinking_retention = "tool_cycle"
+        self.effective_thinking_retention = resolve_thinking_retention(
+            cfg,
+            implied_thinking_retention,
+        )
 
         # Look up special token IDs from the tokenizer (not hardcoded)
         self._im_start = self._token_id("<|im_start|>")
@@ -261,6 +280,16 @@ class Qwen35Renderer:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _is_user_query_message(msg: Message) -> bool:
+        if msg.get("role") != "user":
+            return False
+        content = Qwen35Renderer._render_content(msg.get("content")).strip()
+        return not (
+            content.startswith("<tool_response>")
+            and content.endswith("</tool_response>")
+        )
+
+    @staticmethod
     def _last_query_index(messages: list[Message]) -> int:
         """Find the index of the last 'real' user query (not a tool_response wrapper).
 
@@ -272,14 +301,7 @@ class Qwen35Renderer:
         assistant-only inputs (e.g. the bridge's dummy-assistant render).
         """
         for i in range(len(messages) - 1, -1, -1):
-            msg = messages[i]
-            if msg.get("role") != "user":
-                continue
-            content = Qwen35Renderer._render_content(msg.get("content")).strip()
-            if not (
-                content.startswith("<tool_response>")
-                and content.endswith("</tool_response>")
-            ):
+            if Qwen35Renderer._is_user_query_message(messages[i]):
                 return i
         return len(messages)
 
@@ -508,18 +530,11 @@ class Qwen35Renderer:
                     emit_text("\n", i, is_sampled=False, is_content=False)
 
             elif role == "assistant":
-                preserve_thinking = should_preserve_past_thinking(
-                    messages,
-                    i,
-                    preserve_all_thinking=self.config.preserve_all_thinking,
-                    preserve_thinking_between_tool_calls=self.config.preserve_thinking_between_tool_calls,
-                )
                 self._render_assistant(
                     msg,
                     i,
                     content,
                     last_qi,
-                    preserve_thinking=preserve_thinking,
                     emit_special=emit_special,
                     emit_text=emit_text,
                     emit_ids=emit_ids,
@@ -616,6 +631,13 @@ class Qwen35Renderer:
             not previous_prompt_ids
             or not new_messages
             or reject_assistant_in_extension(new_messages)
+        ):
+            return None
+
+        if should_rerender_for_thinking_retention(
+            self.effective_thinking_retention,
+            new_messages,
+            is_user_query=self._is_user_query_message,
         ):
             return None
 
@@ -820,18 +842,20 @@ class Qwen35Renderer:
             emit_text("\n\n", -1)
 
         # Merge prev mm_data (images from earlier turns) with the new turn's.
+        # Copy the per-modality lists (not just the outer dict) so appending
+        # below never mutates the caller's previous_multi_modal_data.
         merged_hashes: dict[str, list[str]] = (
-            dict(previous_multi_modal_data.mm_hashes)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_hashes.items()}
             if previous_multi_modal_data
             else {}
         )
         merged_placeholders: dict[str, list[PlaceholderRange]] = (
-            dict(previous_multi_modal_data.mm_placeholders)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_placeholders.items()}
             if previous_multi_modal_data
             else {}
         )
         merged_items: dict[str, list[dict[str, Any]]] = (
-            dict(previous_multi_modal_data.mm_items)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_items.items()}
             if previous_multi_modal_data
             else {}
         )
@@ -903,7 +927,6 @@ class Qwen35Renderer:
         content: str,
         last_query_index: int,
         *,
-        preserve_thinking: bool = False,
         emit_special,
         emit_text,
         emit_ids,
@@ -944,8 +967,17 @@ class Qwen35Renderer:
         # call tags (``<function=...>``, ``<parameter=...>``, etc.) are
         # part of the model's emitted output too — keep them
         # ``is_content=True`` per the assistant rule.
-        emit_thinking = self._should_render_thinking(msg_idx, last_query_index) or (
-            preserve_thinking and bool(reasoning_content)
+        # With thinking disabled, the generation prompt prefilled the empty
+        # ``<think>\n\n</think>\n\n`` wrapper, so it is part of every sampled
+        # turn's token stream. Re-emit it on historical turns — deviating
+        # from the Jinja template, which strips it from turns at or before
+        # the last user query — so re-renders stay token-stable with what
+        # the model actually sampled. Turns that carry reasoning_content
+        # were not sampled under this config; those stay template-faithful.
+        emit_thinking = (
+            self._should_render_thinking(msg_idx, last_query_index)
+            or getattr(self.config, "preserve_thinking", False)
+            or (not self.config.enable_thinking and not reasoning_content)
         )
         if emit_thinking:
             # Include thinking block

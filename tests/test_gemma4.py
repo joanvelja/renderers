@@ -239,23 +239,6 @@ def test_gemma4_text_and_tool_chat_parity_with_hf_template(enable_thinking):
             ],
             {"tools": TOOLS, "add_generation_prompt": True},
         ),
-        (
-            [
-                {"role": "user", "content": "Call both."},
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {"function": {"name": "first", "arguments": {}}},
-                        {"function": {"name": "second", "arguments": {}}},
-                    ],
-                },
-                {"role": "tool", "content": "first result"},
-                {"role": "tool", "content": "second result"},
-                {"role": "assistant", "content": "done"},
-            ],
-            {"tools": MULTI_TOOLS},
-        ),
     ]
 
     for messages, kwargs in cases:
@@ -266,6 +249,36 @@ def test_gemma4_text_and_tool_chat_parity_with_hf_template(enable_thinking):
             messages,
             **expected_kwargs,
         )
+
+
+def test_gemma4_unnamed_tool_responses_use_ordered_call_names():
+    tokenizer, renderer = _gemma4()
+    messages = [
+        {"role": "user", "content": "Call both."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "first", "arguments": {}}},
+                {"function": {"name": "second", "arguments": {}}},
+            ],
+        },
+        {"role": "tool", "content": "first result"},
+        {"role": "tool", "content": "second result"},
+        {"role": "assistant", "content": "done"},
+    ]
+
+    rendered = tokenizer.decode(
+        renderer.render_ids(messages, tools=MULTI_TOOLS),
+        skip_special_tokens=False,
+    )
+
+    assert "<|tool_response>response:first{" in rendered
+    assert "<|tool_response>response:second{" in rendered
+    # The current HF template incorrectly labels both responses with the final
+    # call name. Ordered association is deterministic and avoids that bug.
+    hf_rendered = tokenizer.apply_chat_template(messages, tokenize=False, tools=MULTI_TOOLS)
+    assert hf_rendered.count("<|tool_response>response:second{") == 2
 
 
 def test_gemma4_tool_metadata_and_masks():
@@ -420,3 +433,136 @@ def test_gemma4_rejects_non_text_multimodal_parts_until_sidecar_exists():
                 }
             ]
         )
+
+
+@pytest.mark.parametrize(
+    ("messages", "match"),
+    [
+        ([{"role": "critic", "content": "No."}], "unsupported role"),
+        ([{"role": "user"}], "missing content"),
+        ([{"role": "user", "content": 7}], "content must be"),
+        (
+            [{"role": "assistant", "content": "", "reasoning_content": 7}],
+            "reasoning_content must be a string",
+        ),
+        (
+            [{"role": "user", "content": [{"text": "missing type"}]}],
+            "content part type",
+        ),
+        (
+            [{"role": "user", "content": [{"type": "citation", "text": "x"}]}],
+            "unsupported content part type",
+        ),
+        (
+            [{"role": "user", "content": [{"type": "text", "text": 7}]}],
+            "text must be a string",
+        ),
+        (
+            [{"role": "user", "content": [object()]}],
+            "content parts must be strings or mappings",
+        ),
+        (
+            [{"role": "assistant", "content": "", "tool_calls": ["bad"]}],
+            "tool call must be a mapping",
+        ),
+        (
+            [{"role": "assistant", "content": "", "tool_calls": [{}]}],
+            "function must be a mapping",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "", "arguments": {}}}],
+                }
+            ],
+            "function name",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "f", "arguments": []}}],
+                }
+            ],
+            "arguments must be",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_responses": [{"response": "ok"}],
+                }
+            ],
+            "response name",
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_responses": [{"name": "f"}],
+                }
+            ],
+            "missing response",
+        ),
+        (
+            [{"role": "tool", "name": "f", "content": "orphan"}],
+            "must immediately follow",
+        ),
+        (
+            [
+                {"role": "user", "content": "call"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {"name": "f", "arguments": {}},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_2", "content": "bad id"},
+            ],
+            "does not match",
+        ),
+        (
+            [
+                {"role": "user", "content": "call twice"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"function": {"name": "f", "arguments": {}}},
+                        {"function": {"name": "f", "arguments": {}}},
+                    ],
+                },
+                {"role": "tool", "content": "first"},
+                {"role": "tool", "content": "second"},
+                {"role": "tool", "content": "extra"},
+            ],
+            "has no issuing call at position 2",
+        ),
+        (
+            [
+                {"role": "user", "content": "call"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"function": {"name": "actual", "arguments": {}}}],
+                },
+                {"role": "tool", "name": "different", "content": "wrong call"},
+            ],
+            "does not match an issuing call",
+        ),
+    ],
+)
+def test_gemma4_rejects_malformed_messages(messages, match):
+    _, renderer = _gemma4()
+
+    with pytest.raises(ValueError, match=match):
+        renderer.render(messages)

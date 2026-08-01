@@ -40,6 +40,7 @@ _MULTIMODAL_PART_TYPES = {
     "video",
     "video_url",
 }
+_MESSAGE_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
 _EMPTY_THOUGHT_GENERATION_PROMPT_MODELS = frozenset(
     {
         "google/gemma-4-31B",
@@ -56,6 +57,13 @@ class _Segment:
     msg_idx: int
     is_sampled: bool
     is_content: bool
+
+
+@dataclass(frozen=True)
+class _ToolCallData:
+    name: str
+    arguments: Mapping[str, Any]
+    call_id: str | None
 
 
 class Gemma4Renderer:
@@ -111,68 +119,63 @@ class Gemma4Renderer:
                 f"{part_type!r} content parts require multimodal sidecar support."
             )
 
+    @staticmethod
+    def _message_role(msg: Any, *, message_idx: int) -> str:
+        if not isinstance(msg, Mapping):
+            raise ValueError(f"Gemma4 message {message_idx} must be a mapping.")
+        role = msg.get("role")
+        if role not in _MESSAGE_ROLES:
+            raise ValueError(f"Gemma4 unsupported role {role!r} at message {message_idx}.")
+        return role
+
+    @classmethod
+    def _content_parts(cls, content: Any, *, context: str) -> list[str]:
+        if content is None:
+            return []
+        if isinstance(content, str):
+            return [content]
+        if not isinstance(content, Sequence) or isinstance(content, (bytes, bytearray)):
+            raise ValueError(f"Gemma4 {context} content must be a string, a list of content parts, or null.")
+        parts: list[str] = []
+        for part_idx, item in enumerate(content):
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if not isinstance(item, Mapping):
+                raise ValueError(
+                    f"Gemma4 {context} content parts must be strings or mappings; "
+                    f"part {part_idx} is {type(item).__name__}."
+                )
+            part_type = item.get("type")
+            if not isinstance(part_type, str) or not part_type:
+                raise ValueError(f"Gemma4 {context} content part type must be a non-empty string.")
+            cls._reject_multimodal(part_type)
+            if part_type != "text":
+                raise ValueError(f"Gemma4 unsupported content part type {part_type!r} in {context} content.")
+            text = item.get("text")
+            if not isinstance(text, str):
+                raise ValueError(f"Gemma4 {context} text must be a string in content part {part_idx}.")
+            parts.append(text)
+        return parts
+
     @classmethod
     def _content_text(cls, content: Any, *, role: str) -> str:
-        if content is None:
-            return ""
-        if isinstance(content, str):
-            text = cls._strip_thinking(content) if role == "assistant" else content
-            return text.strip()
-        if isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, str):
-                    text = item
-                elif isinstance(item, Mapping):
-                    part_type = item.get("type")
-                    if isinstance(part_type, str):
-                        cls._reject_multimodal(part_type)
-                    if part_type != "text":
-                        continue
-                    text = str(item.get("text") or "")
-                else:
-                    continue
-                if role == "assistant":
-                    parts.append(cls._strip_thinking(text))
-                else:
-                    parts.append(text.strip())
-            return "".join(parts)
-        return str(content).strip()
+        parts = cls._content_parts(content, context=f"{role} message")
+        if role == "assistant":
+            return "".join(cls._strip_thinking(part) for part in parts)
+        return "".join(part.strip() for part in parts)
 
     @classmethod
     def _system_text(cls, content: Any) -> str:
-        if content is None:
-            return ""
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, Mapping):
-                    part_type = item.get("type")
-                    if isinstance(part_type, str):
-                        cls._reject_multimodal(part_type)
-                    if "text" in item:
-                        parts.append(str(item.get("text") or "").strip() + " ")
-                elif isinstance(item, str):
-                    parts.append(item.strip() + " ")
-            return "".join(parts)
-        return str(content).strip()
+        parts = cls._content_parts(content, context="system message")
+        if isinstance(content, str) or content is None:
+            return "".join(parts).strip()
+        return "".join(part.strip() + " " for part in parts)
 
     @classmethod
     def _tool_text(cls, content: Any) -> Any:
         if isinstance(content, Sequence) and not isinstance(content, (str, bytes, bytearray)):
-            text_parts: list[str] = []
-            for item in content:
-                if isinstance(item, Mapping):
-                    part_type = item.get("type")
-                    if isinstance(part_type, str):
-                        cls._reject_multimodal(part_type)
-                    if part_type == "text":
-                        text_parts.append(str(item.get("text") or ""))
-                elif isinstance(item, str):
-                    text_parts.append(item)
-            return "".join(text_parts)
+            return "".join(cls._content_parts(content, context="tool response"))
         return content
 
     @staticmethod
@@ -184,13 +187,6 @@ class Gemma4Renderer:
             else:
                 parts.append(part)
         return "".join(parts).strip()
-
-    @staticmethod
-    def _last_user_index(messages: list[Message]) -> int:
-        for idx in range(len(messages) - 1, -1, -1):
-            if messages[idx].get("role") == "user":
-                return idx
-        return -1
 
     @classmethod
     def _format_argument(cls, value: Any, *, escape_keys: bool = True) -> str:
@@ -354,29 +350,85 @@ class Gemma4Renderer:
             ("}<tool_response|>", False),
         ]
 
-    @staticmethod
-    def _tool_name_for_response(source: Message, tool_msg: Message) -> str:
-        name = tool_msg.get("name")
-        resolved = name if isinstance(name, str) and name else "unknown"
-        for tool_call in source.get("tool_calls") or []:
+    @classmethod
+    def _parse_tool_calls(cls, raw_tool_calls: Any, *, message_idx: int) -> list[_ToolCallData]:
+        if raw_tool_calls is None:
+            return []
+        if not isinstance(raw_tool_calls, Sequence) or isinstance(raw_tool_calls, (str, bytes, bytearray)):
+            raise ValueError(f"Gemma4 message {message_idx} tool_calls must be a list.")
+        parsed: list[_ToolCallData] = []
+        seen_ids: set[str] = set()
+        for call_idx, tool_call in enumerate(raw_tool_calls):
             if not isinstance(tool_call, Mapping):
-                continue
-            if tool_call.get("id") != tool_msg.get("tool_call_id"):
-                continue
+                raise ValueError(f"Gemma4 tool call must be a mapping at message {message_idx}, call {call_idx}.")
             function = tool_call.get("function")
-            if isinstance(function, Mapping) and isinstance(function.get("name"), str):
-                resolved = function["name"]
-        return resolved
+            if not isinstance(function, Mapping):
+                raise ValueError(
+                    f"Gemma4 tool call function must be a mapping at message {message_idx}, call {call_idx}."
+                )
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    f"Gemma4 tool call function name must be a non-empty string at "
+                    f"message {message_idx}, call {call_idx}."
+                )
+            arguments = cls._normalize_arguments(function.get("arguments", {}))
+            call_id = tool_call.get("id")
+            if call_id is not None and (not isinstance(call_id, str) or not call_id):
+                raise ValueError(
+                    f"Gemma4 tool call id must be a non-empty string at message {message_idx}, call {call_idx}."
+                )
+            if call_id in seen_ids:
+                raise ValueError(f"Gemma4 duplicate tool call id {call_id!r} at message {message_idx}.")
+            if call_id is not None:
+                seen_ids.add(call_id)
+            parsed.append(_ToolCallData(name, arguments, call_id))
+        return parsed
+
+    @staticmethod
+    def _tool_name_for_response(
+        tool_calls: list[_ToolCallData],
+        tool_msg: Message,
+        *,
+        response_idx: int,
+    ) -> str:
+        if response_idx >= len(tool_calls):
+            raise ValueError(f"Gemma4 tool response has no issuing call at position {response_idx}.")
+        name = tool_msg.get("name")
+        if name is not None and (not isinstance(name, str) or not name):
+            raise ValueError("Gemma4 tool response name must be a non-empty string.")
+        tool_call_id = tool_msg.get("tool_call_id")
+        if tool_call_id is not None and (not isinstance(tool_call_id, str) or not tool_call_id):
+            raise ValueError("Gemma4 tool_call_id must be a non-empty string.")
+        if tool_call_id is not None:
+            for tool_call in tool_calls:
+                if tool_call.call_id != tool_call_id:
+                    continue
+                if name is not None and name != tool_call.name:
+                    raise ValueError(
+                        f"Gemma4 tool response name {name!r} does not match tool_call_id "
+                        f"{tool_call_id!r} ({tool_call.name!r})."
+                    )
+                return tool_call.name
+            raise ValueError(f"Gemma4 tool response tool_call_id {tool_call_id!r} does not match an issuing call.")
+        if name is None:
+            return tool_calls[response_idx].name
+        if name not in {tool_call.name for tool_call in tool_calls}:
+            raise ValueError(f"Gemma4 tool response name {name!r} does not match an issuing call.")
+        return name
 
     @staticmethod
     def _normalize_arguments(arguments: Any) -> Any:
         if isinstance(arguments, str):
             try:
                 parsed = json.loads(arguments)
-            except json.JSONDecodeError:
-                return arguments
+            except json.JSONDecodeError as exc:
+                raise ValueError("Gemma4 tool call arguments must be valid JSON.") from exc
             if isinstance(parsed, Mapping):
                 return parsed
+            raise ValueError("Gemma4 tool call arguments JSON must decode to an object.")
+        if not isinstance(arguments, Mapping):
+            raise ValueError("Gemma4 tool call arguments must be a mapping or a JSON object string.")
         return arguments
 
     def _segments_to_rendered(
@@ -449,6 +501,7 @@ class Gemma4Renderer:
         include_initial_block: bool,
     ) -> list[_Segment]:
         segments: list[_Segment] = []
+        roles = [self._message_role(msg, message_idx=idx) for idx, msg in enumerate(messages)]
 
         def emit(text: str, msg_idx: int, *, is_sampled: bool, is_content: bool) -> None:
             if text:
@@ -458,7 +511,7 @@ class Gemma4Renderer:
             emit("<bos>", -1, is_sampled=False, is_content=False)
 
         start_idx = 0
-        first_role = messages[0].get("role") if messages else None
+        first_role = roles[0]
         if include_initial_block and (
             self.config.enable_thinking or bool(tools) or first_role in {"system", "developer"}
         ):
@@ -466,6 +519,10 @@ class Gemma4Renderer:
             if self.config.enable_thinking:
                 emit("<|think|>\n", -1, is_sampled=False, is_content=False)
             if messages and first_role in {"system", "developer"}:
+                if "content" not in messages[0]:
+                    raise ValueError("Gemma4 system message 0 is missing content.")
+                if messages[0].get("tool_calls") is not None or messages[0].get("tool_responses") is not None:
+                    raise ValueError("Gemma4 tool calls and responses are only valid on assistant messages.")
                 text = self._system_text(messages[0].get("content"))
                 emit(text, 0, is_sampled=False, is_content=bool(text))
                 start_idx = 1
@@ -481,22 +538,33 @@ class Gemma4Renderer:
             emit("<turn|>\n", -1, is_sampled=False, is_content=False)
 
         loop_messages = messages[start_idx:]
-        last_user = self._last_user_index(loop_messages)
+        loop_roles = roles[start_idx:]
+        last_user = max((idx for idx, role in enumerate(loop_roles) if role == "user"), default=-1)
         prev_message_type: str | None = None
+        consumed_tool_messages: set[int] = set()
 
         for local_idx, msg in enumerate(loop_messages):
             msg_idx = start_idx + local_idx
-            role = msg.get("role")
+            role = loop_roles[local_idx]
             if role == "tool":
+                if local_idx not in consumed_tool_messages:
+                    raise ValueError(
+                        f"Gemma4 tool message {msg_idx} must immediately follow an assistant tool-call message."
+                    )
                 continue
+
+            if role != "assistant" and (msg.get("tool_calls") is not None or msg.get("tool_responses") is not None):
+                raise ValueError("Gemma4 tool calls and responses are only valid on assistant messages.")
+            if role != "assistant" and "content" not in msg:
+                raise ValueError(f"Gemma4 {role} message {msg_idx} is missing content.")
 
             prev_message_type = None
             rendered_role = "model" if role == "assistant" else str(role)
 
             prev_non_tool_role: str | None = None
-            for prev in reversed(loop_messages[:local_idx]):
-                if prev.get("role") != "tool":
-                    prev_non_tool_role = prev.get("role")
+            for previous_role in reversed(loop_roles[:local_idx]):
+                if previous_role != "tool":
+                    prev_non_tool_role = previous_role
                     break
             continue_same_model_turn = rendered_role == "model" and prev_non_tool_role == "assistant"
             if not continue_same_model_turn:
@@ -508,9 +576,22 @@ class Gemma4Renderer:
                 )
 
             is_assistant = role == "assistant"
-            tool_calls = msg.get("tool_calls") or []
+            tool_calls = self._parse_tool_calls(msg.get("tool_calls"), message_idx=msg_idx) if is_assistant else []
+            raw_tool_responses = msg.get("tool_responses")
+            if raw_tool_responses is not None and (
+                not isinstance(raw_tool_responses, Sequence) or isinstance(raw_tool_responses, (str, bytes, bytearray))
+            ):
+                raise ValueError(f"Gemma4 message {msg_idx} tool_responses must be a list.")
+            if tool_calls and raw_tool_responses:
+                raise ValueError(f"Gemma4 message {msg_idx} cannot contain both tool_calls and tool_responses.")
+
+            if is_assistant:
+                for field in ("reasoning", "reasoning_content"):
+                    value = msg.get(field)
+                    if value is not None and not isinstance(value, str):
+                        raise ValueError(f"Gemma4 assistant {field} must be a string at message {msg_idx}.")
             thinking_text = msg.get("reasoning") or msg.get("reasoning_content")
-            native_thinking = is_assistant and isinstance(thinking_text, str) and local_idx > last_user
+            native_thinking = is_assistant and local_idx > last_user
             if native_thinking and thinking_text:
                 emit("<|channel>thought\n", msg_idx, is_sampled=True, is_content=True)
                 emit(thinking_text, msg_idx, is_sampled=True, is_content=True)
@@ -518,26 +599,12 @@ class Gemma4Renderer:
 
             if is_assistant and tool_calls:
                 for tool_call in tool_calls:
-                    if not isinstance(tool_call, Mapping):
-                        continue
-                    function = tool_call.get("function")
-                    if not isinstance(function, Mapping):
-                        continue
-                    name = function.get("name")
-                    if not isinstance(name, str) or not name:
-                        continue
-                    arguments = self._normalize_arguments(function.get("arguments") or {})
-                    if isinstance(arguments, Mapping):
-                        args_text = ",".join(
-                            f"{key}:{self._format_argument(value, escape_keys=False)}"
-                            for key, value in sorted(arguments.items())
-                        )
-                    elif isinstance(arguments, str):
-                        args_text = arguments
-                    else:
-                        args_text = str(arguments)
+                    args_text = ",".join(
+                        f"{key}:{self._format_argument(value, escape_keys=False)}"
+                        for key, value in sorted(tool_call.arguments.items())
+                    )
                     emit(
-                        f"<|tool_call>call:{name}{{{args_text}}}<tool_call|>",
+                        f"<|tool_call>call:{tool_call.name}{{{args_text}}}<tool_call|>",
                         msg_idx,
                         is_sampled=True,
                         is_content=True,
@@ -545,15 +612,25 @@ class Gemma4Renderer:
                 prev_message_type = "tool_call"
 
             saw_tool_response = False
-            if is_assistant and msg.get("tool_responses"):
-                for tool_response in msg.get("tool_responses") or []:
+            if is_assistant and raw_tool_responses:
+                for response_idx, tool_response in enumerate(raw_tool_responses):
                     if not isinstance(tool_response, Mapping):
-                        continue
+                        raise ValueError(
+                            f"Gemma4 tool response must be a mapping at message {msg_idx}, response {response_idx}."
+                        )
                     name = tool_response.get("name")
-                    tool_name = name if isinstance(name, str) and name else "unknown"
+                    if not isinstance(name, str) or not name:
+                        raise ValueError(
+                            f"Gemma4 tool response name must be a non-empty string at "
+                            f"message {msg_idx}, response {response_idx}."
+                        )
+                    if "response" not in tool_response:
+                        raise ValueError(
+                            f"Gemma4 tool response missing response at message {msg_idx}, response {response_idx}."
+                        )
                     for text, is_content in self._format_tool_response_segments(
-                        tool_name,
-                        tool_response.get("response"),
+                        name,
+                        tool_response["response"],
                     ):
                         emit(text, msg_idx, is_sampled=False, is_content=is_content)
                     saw_tool_response = True
@@ -562,10 +639,16 @@ class Gemma4Renderer:
                 scan_idx = local_idx + 1
                 while scan_idx < len(loop_messages):
                     follow = loop_messages[scan_idx]
-                    if follow.get("role") != "tool":
+                    if loop_roles[scan_idx] != "tool":
                         break
                     tool_msg_idx = start_idx + scan_idx
-                    tool_name = self._tool_name_for_response(msg, follow)
+                    if "content" not in follow:
+                        raise ValueError(f"Gemma4 tool message {tool_msg_idx} is missing content.")
+                    tool_name = self._tool_name_for_response(
+                        tool_calls,
+                        follow,
+                        response_idx=scan_idx - local_idx - 1,
+                    )
                     for text, is_content in self._format_tool_response_segments(
                         tool_name,
                         follow.get("content"),
@@ -573,16 +656,16 @@ class Gemma4Renderer:
                         emit(text, tool_msg_idx, is_sampled=False, is_content=is_content)
                     saw_tool_response = True
                     prev_message_type = "tool_response"
+                    consumed_tool_messages.add(scan_idx)
                     scan_idx += 1
 
             content = self._content_text(msg.get("content"), role=str(role))
             if content:
                 emit(content, msg_idx, is_sampled=is_assistant, is_content=True)
 
-            has_content = bool(content.strip())
             if prev_message_type == "tool_call" and not saw_tool_response:
                 emit("<|tool_response>", msg_idx, is_sampled=True, is_content=False)
-            elif not (saw_tool_response and not has_content):
+            elif not saw_tool_response:
                 emit(
                     "<turn|>\n",
                     msg_idx,

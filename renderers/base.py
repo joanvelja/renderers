@@ -1086,6 +1086,8 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     "google/gemma-4-E2B-it": "gemma4",
     "google/gemma-4-E4B": "gemma4",
     "google/gemma-4-E4B-it": "gemma4",
+    "google/gemma-4-12B": "gemma4",
+    "google/gemma-4-12B-it": "gemma4",
     "google/gemma-4-31B": "gemma4",
     "google/gemma-4-31B-it": "gemma4",
     "google/gemma-4-26B-A4B": "gemma4",

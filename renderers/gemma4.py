@@ -43,6 +43,8 @@ _MULTIMODAL_PART_TYPES = {
 _MESSAGE_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
 _EMPTY_THOUGHT_GENERATION_PROMPT_MODELS = frozenset(
     {
+        "google/gemma-4-12B",
+        "google/gemma-4-12B-it",
         "google/gemma-4-31B",
         "google/gemma-4-31B-it",
         "google/gemma-4-26B-A4B",

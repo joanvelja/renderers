@@ -16,6 +16,8 @@ GEMMA4_MODELS = {
     "google/gemma-4-E2B-it",
     "google/gemma-4-E4B",
     "google/gemma-4-E4B-it",
+    "google/gemma-4-12B",
+    "google/gemma-4-12B-it",
     "google/gemma-4-31B",
     "google/gemma-4-31B-it",
     "google/gemma-4-26B-A4B",
@@ -127,6 +129,7 @@ def test_gemma4_rejects_empty_messages():
     [
         ("google/gemma-4-E2B", False),
         ("google/gemma-4-E4B", False),
+        ("google/gemma-4-12B", True),
         ("google/gemma-4-31B", True),
         ("google/gemma-4-26B-A4B", True),
     ],
@@ -159,6 +162,7 @@ def test_gemma4_base_checkpoint_prompt_variant_fallback_is_exact(
     [
         "google/gemma-4-E2B-it",
         "google/gemma-4-E4B-it",
+        "google/gemma-4-12B-it",
         "google/gemma-4-31B-it",
         "google/gemma-4-26B-A4B-it",
     ],

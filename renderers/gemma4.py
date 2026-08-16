@@ -78,9 +78,9 @@ class Gemma4Renderer:
     ):
         self._tokenizer = tokenizer
         self.config = config or Gemma4RendererConfig()
-        # Gemma's bridge reuses the previous sampled prefix verbatim unless
-        # the caller requests tool-cycle-only retention.
-        self.effective_thinking_retention = resolve_thinking_retention(self.config, "all")
+        # Gemma keeps reasoning within a tool cycle, but ordinary multi-turn
+        # history contains only prior public responses.
+        self.effective_thinking_retention = resolve_thinking_retention(self.config, "tool_cycle")
         self._turn_end = self._token_id("<turn|>")
         self._tool_call = self._token_id("<|tool_call>")
         self._tool_call_end = self._token_id("<tool_call|>")

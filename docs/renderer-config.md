@@ -133,6 +133,7 @@ the knobs its template actually exposes:
 | GLM-4.5 | `enable_thinking=False -> all`, else `tool_cycle` |
 | gpt-oss | `auto_drop_analysis=False -> all`, else `tool_cycle` |
 | Hy3 | `preserved_thinking=True -> all`, else `tool_cycle` |
+| Gemma 4 | `tool_cycle` |
 | Kimi K2.5 / 2.6 | `thinking=False -> all`, else `tool_cycle` |
 | Nemotron-3 | `truncate_history_thinking=False -> all`; else `enable_thinking=False -> all`; else `tool_cycle` |
 | DeepSeek R1 | `template` |

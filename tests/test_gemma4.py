@@ -392,7 +392,7 @@ def test_gemma4_render_accepts_openai_json_string_arguments():
 
 
 @pytest.mark.parametrize("enable_thinking", [True, False])
-def test_gemma4_bridge_matches_full_render(enable_thinking):
+def test_gemma4_bridge_drops_thinking_at_new_user_turn(enable_thinking):
     tokenizer = load_tokenizer("google/gemma-4-E2B-it")
     renderer = create_renderer(tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking))
     first = [{"role": "user", "content": "A"}]
@@ -408,18 +408,23 @@ def test_gemma4_bridge_matches_full_render(enable_thinking):
         next_turn,
     )
 
-    assert bridged is not None
-    assert bridged.token_ids == renderer.render_ids(
+    assert bridged is None
+
+    retain_renderer = create_renderer(
+        tokenizer,
+        Gemma4RendererConfig(enable_thinking=enable_thinking, thinking_retention="all"),
+    )
+    retained = retain_renderer.bridge_to_next_turn(
+        previous_prompt_ids,
+        previous_completion_ids,
+        next_turn,
+    )
+    assert retained is not None
+    assert retained.token_ids == retain_renderer.render_ids(
         first + [assistant] + next_turn,
         add_generation_prompt=True,
     )
-    assert bridged.message_tool_names == [None]
-
-    drop_renderer = create_renderer(
-        tokenizer,
-        Gemma4RendererConfig(enable_thinking=enable_thinking, thinking_retention="tool_cycle"),
-    )
-    assert drop_renderer.bridge_to_next_turn(previous_prompt_ids, previous_completion_ids, next_turn) is None
+    assert retained.message_tool_names == [None]
 
 
 def test_gemma4_rejects_non_text_multimodal_parts_until_sidecar_exists():

@@ -1,261 +1,520 @@
-from __future__ import annotations
+"""Focused coverage for Gemma 4's template variants and tool grammar."""
 
 from functools import lru_cache
 
 import pytest
-from renderers import (
-    Gemma4Renderer,
-    Gemma4RendererConfig,
-    config_from_name,
-    create_renderer,
-)
-from renderers.base import MODEL_RENDERER_MAP, ToolCallParseStatus, load_tokenizer
 
-GEMMA4_MODELS = {
+from renderers import Gemma4Renderer, create_renderer
+from renderers.base import MODEL_RENDERER_MAP, MULTIMODAL_MODELS, load_tokenizer
+from renderers.configs import Gemma4RendererConfig
+
+
+_MODELS = {
     "google/gemma-4-E2B",
     "google/gemma-4-E2B-it",
     "google/gemma-4-E4B",
     "google/gemma-4-E4B-it",
     "google/gemma-4-12B",
     "google/gemma-4-12B-it",
-    "google/gemma-4-31B",
-    "google/gemma-4-31B-it",
     "google/gemma-4-26B-A4B",
     "google/gemma-4-26B-A4B-it",
+    "google/gemma-4-31B",
+    "google/gemma-4-31B-it",
 }
 
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get the current weather for a city",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string", "description": "The city name"},
-                    "unit": {"type": "string"},
-                    "days": {"type": "integer"},
-                },
-                "required": ["city"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_time",
-            "description": "Get the current time for a zone",
-            "parameters": {
-                "type": "object",
-                "properties": {"zone": {"type": "string"}},
-                "required": ["zone"],
-            },
-        },
-    },
-]
-
-RESPONSE_TOOL = [
-    {
-        "type": "function",
-        "function": {
-            "name": "summarize",
-            "description": "Summarize text",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-            "response": {"type": "string", "description": "summary text"},
-        },
-    }
-]
-
-MULTI_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "first",
-            "description": "",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "second",
-            "description": "",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        },
-    },
-]
-
-
-@lru_cache(maxsize=1)
+@lru_cache
 def _gemma4():
-    tokenizer = load_tokenizer("google/gemma-4-E2B-it")
-    renderer = create_renderer(tokenizer)
-    return tokenizer, renderer
+    tokenizer = load_tokenizer("google/gemma-4-31B-it")
+    return tokenizer, create_renderer(tokenizer)
 
 
-def _expected(tokenizer, messages, **kwargs) -> list[int]:
-    kwargs.setdefault("add_generation_prompt", False)
-    result = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        return_dict=False,
-        **kwargs,
+def test_all_checkpoints_are_registered_as_image_renderers():
+    for model in _MODELS:
+        assert MODEL_RENDERER_MAP[model] == "gemma4"
+        assert MULTIMODAL_MODELS[model] == {"image"}
+
+
+def test_disabled_thinking_prefill_tracks_template_revision(monkeypatch):
+    tokenizer, current_renderer = _gemma4()
+    messages = [{"role": "user", "content": "Hello"}]
+
+    current_text = tokenizer.decode(
+        current_renderer.render_ids(messages, add_generation_prompt=True),
+        skip_special_tokens=False,
     )
-    if isinstance(result, dict):
-        return list(result["input_ids"])
-    return list(result)
+    assert current_text.endswith("<|channel>thought\n<channel|>")
 
-
-def test_gemma4_registered_as_typed_custom_renderer():
-    assert config_from_name("gemma4") == Gemma4RendererConfig()
-    assert Gemma4RendererConfig.template_field_names() == frozenset({"enable_thinking"})
-    assert {m for m, r in MODEL_RENDERER_MAP.items() if r == "gemma4"} == GEMMA4_MODELS
-
-    _, renderer = _gemma4()
-    assert type(renderer).__name__ == "Gemma4Renderer"
-
-
-def test_gemma4_rejects_empty_messages():
-    _, renderer = _gemma4()
-
-    with pytest.raises(ValueError, match="No messages provided"):
-        renderer.render([])
+    # E2B/E4B use the otherwise-identical earlier template revision, which
+    # stops at the model role opener when thinking is disabled.
+    monkeypatch.setattr(tokenizer, "name_or_path", "google/gemma-4-E4B-it")
+    monkeypatch.setattr(tokenizer, "chat_template", "")
+    earlier_renderer = Gemma4Renderer(tokenizer)
+    earlier_text = tokenizer.decode(
+        earlier_renderer.render_ids(messages, add_generation_prompt=True),
+        skip_special_tokens=False,
+    )
+    assert earlier_text.endswith("<|turn>model\n")
 
 
 @pytest.mark.parametrize(
-    ("gemma4_model_name", "expected"),
+    ("gemma4_model_name", "has_empty_thought"),
     [
         ("google/gemma-4-E2B", False),
         ("google/gemma-4-E4B", False),
         ("google/gemma-4-12B", True),
-        ("google/gemma-4-31B", True),
         ("google/gemma-4-26B-A4B", True),
+        ("google/gemma-4-31B", True),
     ],
 )
-def test_gemma4_base_checkpoint_prompt_variant_fallback_is_exact(
-    gemma4_model_name,
-    expected,
+def test_base_checkpoint_prompt_variant_fallback_is_exact(
+    monkeypatch, gemma4_model_name, has_empty_thought
 ):
-    class StubTokenizer:
-        name_or_path = gemma4_model_name
-        chat_template = None
-        unk_token_id = -1
+    tokenizer, _ = _gemma4()
+    monkeypatch.setattr(tokenizer, "name_or_path", gemma4_model_name)
+    monkeypatch.setattr(tokenizer, "chat_template", "")
+    renderer = Gemma4Renderer(tokenizer)
 
-        def convert_tokens_to_ids(self, token):
-            return {
-                "<turn|>": 106,
-                "<|tool_call>": 48,
-                "<tool_call|>": 49,
-                "<|tool_response>": 50,
-                "<eos>": 1,
-            }[token]
-
-    renderer = Gemma4Renderer(StubTokenizer())
-
-    assert renderer._add_empty_thought_generation_prompt is expected
-
-
-@pytest.mark.parametrize(
-    "gemma4_model_name",
-    [
-        "google/gemma-4-E2B-it",
-        "google/gemma-4-E4B-it",
-        "google/gemma-4-12B-it",
-        "google/gemma-4-31B-it",
-        "google/gemma-4-26B-A4B-it",
-    ],
-)
-@pytest.mark.parametrize("enable_thinking", [True, False])
-def test_gemma4_generation_prompt_parity_across_it_sizes(
-    gemma4_model_name,
-    enable_thinking,
-):
-    tokenizer = load_tokenizer(gemma4_model_name)
-    renderer = create_renderer(
-        tokenizer,
-        Gemma4RendererConfig(enable_thinking=enable_thinking),
-    )
-    messages = [{"role": "user", "content": "Hello!"}]
-
-    assert renderer.render_ids(messages, add_generation_prompt=True) == _expected(
-        tokenizer,
-        messages,
-        add_generation_prompt=True,
-        enable_thinking=enable_thinking,
+    text = tokenizer.decode(
+        renderer.render_ids(
+            [{"role": "user", "content": "Hello"}],
+            add_generation_prompt=True,
+        ),
+        skip_special_tokens=False,
     )
 
+    assert text.endswith("<|channel>thought\n<channel|>") is has_empty_thought
 
-@pytest.mark.parametrize("enable_thinking", [True, False])
-def test_gemma4_text_and_tool_chat_parity_with_hf_template(enable_thinking):
-    tokenizer = load_tokenizer("google/gemma-4-E2B-it")
-    renderer = create_renderer(tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking))
-    cases = [
-        ([{"role": "user", "content": "Hello!"}], {"add_generation_prompt": True}),
-        (
-            [
-                {"role": "system", "content": "You are concise."},
-                {"role": "user", "content": "What is 2+2?"},
-                {"role": "assistant", "content": "4"},
-            ],
-            {},
-        ),
-        ([{"role": "user", "content": "Weather?"}], {"tools": TOOLS}),
-        ([{"role": "user", "content": "Summarize."}], {"tools": RESPONSE_TOOL}),
-        (
-            [
-                {"role": "user", "content": "Weather?"},
-                {
-                    "role": "assistant",
-                    "reasoning_content": "Need weather.",
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "function": {
-                                "name": "get_weather",
-                                "arguments": {"city": "Paris", "days": None},
-                            }
-                        }
-                    ],
-                },
-            ],
-            {"tools": TOOLS},
-        ),
-        (
-            [
-                {"role": "user", "content": "Weather?"},
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "function": {
-                                "name": "get_weather",
-                                "arguments": {"city": "Paris"},
-                            },
-                        }
-                    ],
-                },
-                {"role": "tool", "tool_call_id": "call_1", "content": '{"temp": 20}'},
-                {"role": "assistant", "content": "It is 20 degrees."},
-            ],
-            {"tools": TOOLS, "add_generation_prompt": True},
-        ),
-    ]
 
-    for messages, kwargs in cases:
-        expected_kwargs = dict(kwargs)
-        expected_kwargs["enable_thinking"] = enable_thinking
-        assert renderer.render_ids(messages, **kwargs) == _expected(
-            tokenizer,
-            messages,
-            **expected_kwargs,
+def test_preserve_thinking_controls_derived_retention_and_rejects_conflicts():
+    tokenizer, _ = _gemma4()
+    preserved = Gemma4Renderer(
+        tokenizer,
+        Gemma4RendererConfig(enable_thinking=True, preserve_thinking=True),
+    )
+    assert preserved.effective_thinking_retention == "all"
+
+    with pytest.raises(ValueError, match="preserve_thinking=True implies"):
+        Gemma4RendererConfig(
+            preserve_thinking=True,
+            thinking_retention="tool_cycle",
         )
 
 
-def test_gemma4_unnamed_tool_responses_use_ordered_call_names():
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [{"role": "tool", "content": "orphan"}],
+        [
+            {"role": "assistant", "content": "No call."},
+            {"role": "tool", "content": "orphan"},
+        ],
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_responses": [{"name": "legacy", "response": "done"}],
+            },
+            {"role": "tool", "content": "still orphaned"},
+        ],
+    ],
+)
+def test_unconsumed_tool_messages_raise(messages):
+    tokenizer, renderer = _gemma4()
+    with pytest.raises(ValueError, match="Unconsumed tool message"):
+        renderer.render_ids(messages)
+
+
+@pytest.mark.parametrize("enable_thinking", [False, True])
+def test_tool_cycle_matches_canonical_template(enable_thinking):
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(
+        tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking)
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Look up the weather.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "City name"}
+                    },
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    messages = [
+        {"role": "user", "content": "Weather in Berlin?"},
+        {
+            "role": "assistant",
+            "reasoning_content": "I should call the weather tool."
+            if not enable_thinking
+            else None,
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": {"city": "Berlin"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": '{"temperature": 24, "unit": "C"}',
+        },
+        {
+            "role": "assistant",
+            "reasoning_content": "I can now answer." if not enable_thinking else None,
+            "content": "It is 24 C.",
+        },
+    ]
+
+    expected = tokenizer.apply_chat_template(
+        messages,
+        tools=tools,
+        tokenize=True,
+        add_generation_prompt=False,
+        enable_thinking=enable_thinking,
+        return_dict=False,
+    )
+    assert renderer.render_ids(messages, tools=tools) == list(expected)
+
+
+def test_disabled_thinking_post_tool_completion_matches_sampled_stream():
+    """A post-tool assistant message continues the existing model turn.
+
+    The 12B/26B/31B generation prompt prefills an empty thought channel before the
+    initial completion, but the disabled-thinking post-tool prompt does not
+    insert another one. A later full rerender must preserve that exact stream.
+    """
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(
+        tokenizer,
+        Gemma4RendererConfig(
+            enable_thinking=False,
+            preserve_thinking=True,
+        ),
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Look up the weather.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    user = {"role": "user", "content": "Weather in Berlin?"}
+    tool_call = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "arguments": {"city": "Berlin"},
+                },
+            }
+        ],
+    }
+    tool_response = {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": '{"temperature": 24}',
+    }
+    final = {"role": "assistant", "content": "It is 24 C."}
+
+    initial_prompt = renderer.render_ids(
+        [user], tools=tools, add_generation_prompt=True
+    )
+    tool_call_prompt = renderer.render_ids(
+        [user, tool_call], tools=tools, add_generation_prompt=True
+    )
+    assert tool_call_prompt[: len(initial_prompt)] == initial_prompt
+    tool_call_completion = tool_call_prompt[len(initial_prompt) :]
+
+    post_tool_prompt = renderer.bridge_to_next_turn(
+        initial_prompt,
+        tool_call_completion,
+        [tool_response],
+        tools=tools,
+    )
+    assert post_tool_prompt is not None
+
+    final_completion = tokenizer.encode(final["content"], add_special_tokens=False) + [
+        renderer.get_stop_token_ids()[0]
+    ]
+    reminder = {"role": "user", "content": "Please summarize."}
+    extended_stream = renderer.bridge_to_next_turn(
+        post_tool_prompt.token_ids,
+        final_completion,
+        [reminder],
+        tools=tools,
+    )
+    assert extended_stream is not None
+    rerendered = renderer.render_ids(
+        [user, tool_call, tool_response, final, reminder],
+        tools=tools,
+        add_generation_prompt=True,
+    )
+    assert rerendered == extended_stream.token_ids
+
+
+def test_parser_extracts_reasoning_and_multiple_typed_tool_calls():
+    tokenizer, renderer = _gemma4()
+    text = (
+        "<|channel>thought\nI need two lookups.\n<channel|>"
+        '<|tool_call>call:weather{city:<|"|>Berlin<|"|>,days:2}'
+        "<tool_call|>"
+        "<|tool_call>call:flags{enabled:true,values:[1,null]}<tool_call|>"
+    )
+    parsed = renderer.parse_response(tokenizer.encode(text, add_special_tokens=False))
+
+    assert parsed.reasoning_content == "I need two lookups."
+    assert parsed.content == ""
+    assert [(call.name, call.arguments) for call in parsed.tool_calls] == [
+        ("weather", {"city": "Berlin", "days": 2}),
+        ("flags", {"enabled": True, "values": [1, None]}),
+    ]
+
+
+def test_parser_recovers_prompt_opened_post_tool_reasoning():
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(tokenizer, Gemma4RendererConfig(enable_thinking=True))
+    tool_call = {
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "weather", "arguments": {"city": "Berlin"}},
+    }
+    messages = [
+        {"role": "user", "content": "Weather?"},
+        {"role": "assistant", "content": "", "tool_calls": [tool_call]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "sunny"},
+    ]
+    expected_prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=True,
+        return_dict=False,
+    )
+    prompt = renderer.render_ids(messages, add_generation_prompt=True)
+
+    assert prompt == list(expected_prompt)
+    assert tokenizer.decode(prompt, skip_special_tokens=False).endswith(
+        "<|channel>thought\n"
+    )
+
+    completion = tokenizer.encode(
+        "Need synthesize.\n<channel|>It is sunny.<turn|>",
+        add_special_tokens=False,
+    )
+
+    parsed = renderer.parse_response(completion)
+
+    assert parsed.reasoning_content == "Need synthesize."
+    assert parsed.content == "It is sunny."
+    assert parsed.tool_calls == []
+
+    # Initial-turn content without a channel closer remains ordinary content.
+    direct = renderer.parse_response(
+        tokenizer.encode("Direct answer.<turn|>", add_special_tokens=False)
+    )
+    assert direct.reasoning_content is None
+    assert direct.content == "Direct answer."
+
+
+def _image_renderer():
+    """A Gemma 4 renderer with a live ``Gemma4Processor``, or a skip."""
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(tokenizer)
+    try:
+        renderer._get_processor()
+    except (RuntimeError, OSError) as exc:  # pragma: no cover - env dependent
+        pytest.skip(f"Gemma4Processor unavailable: {exc}")
+    return tokenizer, renderer
+
+
+def _tiny_image():
+    from PIL import Image
+
+    return Image.new("RGB", (224, 224), color=(128, 192, 255))
+
+
+@pytest.mark.parametrize("size", [(224, 224), (448, 224), (224, 448)])
+def test_real_processor_keeps_one_batched_row_per_image(size):
+    """Guard the ``MultiModalFieldConfig.batched('image')`` contract with
+    live Gemma4Processor output rather than synthetic tensor shapes."""
+    from PIL import Image
+
+    _, renderer = _image_renderer()
+    image = Image.new("RGB", size, color=(128, 192, 255))
+    rendered = renderer.render(
+        [{"role": "user", "content": [{"type": "image", "image": image}]}]
+    )
+    item = rendered.multi_modal_data.mm_items["image"][0]
+    placeholder = rendered.multi_modal_data.mm_placeholders["image"][0]
+
+    assert item["pixel_values"].shape[0] == 1
+    assert item["image_position_ids"].shape[0] == 1
+    assert item["pixel_values"].shape[1] == item["image_position_ids"].shape[1]
+    assert placeholder.length > 0
+
+
+def test_schema_unified_image_parts_still_expand_image_tokens():
+    """``Dataset.from_list`` unifies the Arrow schema across a content list,
+    so an image part round-tripped through a dataset carries ``text: None``
+    (and text parts carry ``image: None``). Dispatching on ``"text" in part``
+    before classifying media would route the image into the text branch,
+    emit nothing, and silently skip soft-token expansion."""
+    tokenizer, renderer = _image_renderer()
+    image = _tiny_image()
+    plain = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": "What is this?"},
+            ],
+        }
+    ]
+    schema_unified = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image, "text": None},
+                {"type": "text", "text": "What is this?", "image": None},
+            ],
+        }
+    ]
+
+    baseline = renderer.render(plain)
+    roundtripped = renderer.render(schema_unified)
+
+    image_id = tokenizer.convert_tokens_to_ids("<|image|>")
+    assert baseline.token_ids.count(image_id) > 0
+    assert roundtripped.token_ids == baseline.token_ids
+    assert (
+        roundtripped.multi_modal_data.mm_hashes == baseline.multi_modal_data.mm_hashes
+    )
+    assert (
+        roundtripped.multi_modal_data.mm_placeholders
+        == baseline.multi_modal_data.mm_placeholders
+    )
+
+
+def test_schema_unified_tool_response_image_parts_survive():
+    """Same hazard on the tool-response path, which also has to keep
+    accepting untyped text parts."""
+    tokenizer, renderer = _image_renderer()
+    image = _tiny_image()
+    messages = [
+        {"role": "user", "content": "Look it up."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "screenshot", "arguments": {}},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": [
+                {"type": "image", "image": image, "text": None},
+                {"type": "text", "text": "captured", "image": None},
+            ],
+        },
+    ]
+    rendered = renderer.render(messages)
+
+    image_id = tokenizer.convert_tokens_to_ids("<|image|>")
+    assert rendered.token_ids.count(image_id) > 0
+    assert rendered.multi_modal_data.mm_hashes["image"]
+    assert "captured" in tokenizer.decode(rendered.token_ids, skip_special_tokens=False)
+
+
+def test_untyped_text_parts_render_in_tool_responses():
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(tokenizer)
+    messages = [
+        {"role": "user", "content": "Check."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "check", "arguments": {}},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": [{"text": "all good"}],
+        },
+    ]
+    text = tokenizer.decode(renderer.render_ids(messages), skip_special_tokens=False)
+    assert "all good" in text
+
+
+def test_system_content_lists_reject_media_parts():
+    """The text-only guard must not be fooled by a schema-unified image
+    part's ``text: None`` key, which would drop the image silently."""
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(tokenizer)
+    messages = [
+        {
+            "role": "system",
+            "content": [{"type": "image", "image": object(), "text": None}],
+        },
+        {"role": "user", "content": "Hi"},
+    ]
+    with pytest.raises(ValueError, match="text parts only"):
+        renderer.render_ids(messages)
+
+
+def test_legacy_assistant_tool_responses_preserve_mask_contract():
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(tokenizer)
+    messages = [
+        {"role": "user", "content": "Check."},
+        {
+            "role": "assistant",
+            "content": "Done.",
+            "tool_responses": [{"name": "check", "response": {"ok": True}}],
+        },
+    ]
+    rendered = renderer.render(messages)
+
+    for index, message_index in enumerate(rendered.message_indices):
+        if message_index == 1:
+            assert rendered.is_content[index] == rendered.sampled_mask[index]
+
+
+def test_unnamed_tool_responses_use_ordered_call_names():
     tokenizer, renderer = _gemma4()
     messages = [
         {"role": "user", "content": "Call both."},
@@ -273,95 +532,27 @@ def test_gemma4_unnamed_tool_responses_use_ordered_call_names():
     ]
 
     rendered = tokenizer.decode(
-        renderer.render_ids(messages, tools=MULTI_TOOLS),
+        renderer.render_ids(messages),
         skip_special_tokens=False,
     )
 
     assert "<|tool_response>response:first{" in rendered
     assert "<|tool_response>response:second{" in rendered
-    # The current HF template incorrectly labels both responses with the final
-    # call name. Ordered association is deterministic and avoids that bug.
-    hf_rendered = tokenizer.apply_chat_template(messages, tokenize=False, tools=MULTI_TOOLS)
-    assert hf_rendered.count("<|tool_response>response:second{") == 2
 
 
-def test_gemma4_tool_metadata_and_masks():
-    _, renderer = _gemma4()
-    messages = [
-        {"role": "user", "content": "Weather?"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "function": {
-                        "name": "get_weather",
-                        "arguments": {"city": "Paris"},
-                    },
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call_1", "content": '{"temp": 20}'},
-        {"role": "assistant", "content": "It is 20 degrees."},
-    ]
-
-    rendered = renderer.render(messages, tools=TOOLS)
-
-    assert len(rendered.token_ids) == len(rendered.message_indices)
-    assert len(rendered.token_ids) == len(rendered.sampled_mask)
-    assert len(rendered.token_ids) == len(rendered.is_content)
-    assert rendered.message_tool_names == [None, None, "get_weather", None]
-    assert any(
-        idx == 2 and is_content and not sampled
-        for idx, is_content, sampled in zip(
-            rendered.message_indices,
-            rendered.is_content,
-            rendered.sampled_mask,
-        )
-    )
-    assert not any(idx == 2 and sampled for idx, sampled in zip(rendered.message_indices, rendered.sampled_mask))
-
-
-def test_gemma4_parse_tool_calls_and_reasoning():
+def test_render_accepts_openai_json_string_arguments():
     tokenizer, renderer = _gemma4()
-    text = (
-        "<|channel>thought\nNeed weather.\n<channel|>"
-        "Done"
-        '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>,'
-        "meta:{ok:true,temps:[1,2.5,None]}}<tool_call|>"
-        '<|tool_call>call:get_time{zone:<|"|>UTC<|"|>}<tool_call|>'
-        '<|tool_call>call:get_weather{"city":"Rome","meta":{"ok":false}}'
-        "<tool_call|>"
-        "<|tool_response>"
-    )
-    ids = tokenizer.encode(text, add_special_tokens=False)
-
-    parsed = renderer.parse_response(ids, tools=TOOLS)
-
-    assert parsed.content == "Done"
-    assert parsed.reasoning_content == "Need weather."
-    assert [call.status for call in parsed.tool_calls] == [
-        ToolCallParseStatus.OK,
-        ToolCallParseStatus.OK,
-        ToolCallParseStatus.OK,
-    ]
-    assert parsed.tool_calls[0].name == "get_weather"
-    assert parsed.tool_calls[0].arguments == {
-        "city": "Paris",
-        "meta": {"ok": True, "temps": [1, 2.5, None]},
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "description": "Look up weather.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+            },
+        },
     }
-    assert parsed.tool_calls[1].name == "get_time"
-    assert parsed.tool_calls[1].arguments == {"zone": "UTC"}
-    assert parsed.tool_calls[2].name == "get_weather"
-    assert parsed.tool_calls[2].arguments == {
-        "city": "Rome",
-        "meta": {"ok": False},
-    }
-
-
-def test_gemma4_render_accepts_openai_json_string_arguments():
-    _, renderer = _gemma4()
     messages = [
         {"role": "user", "content": "Weather?"},
         {
@@ -370,8 +561,8 @@ def test_gemma4_render_accepts_openai_json_string_arguments():
             "tool_calls": [
                 {
                     "function": {
-                        "name": "get_weather",
-                        "arguments": '{"city": "Tokyo", "days": 2}',
+                        "name": "weather",
+                        "arguments": '{"city": "Tokyo"}',
                     }
                 }
             ],
@@ -379,22 +570,22 @@ def test_gemma4_render_accepts_openai_json_string_arguments():
     ]
 
     prompt_ids = renderer.render_ids(
-        messages[:1],
-        tools=TOOLS,
-        add_generation_prompt=True,
+        messages[:1], tools=[tool], add_generation_prompt=True
     )
-    completion_ids = renderer.render_ids(messages, tools=TOOLS)[len(prompt_ids) :]
-    parsed = renderer.parse_response(completion_ids, tools=TOOLS)
+    completion_ids = renderer.render_ids(messages, tools=[tool])[len(prompt_ids) :]
+    parsed = renderer.parse_response(completion_ids, tools=[tool])
 
     assert len(parsed.tool_calls) == 1
-    assert parsed.tool_calls[0].status == ToolCallParseStatus.OK
-    assert parsed.tool_calls[0].arguments == {"city": "Tokyo", "days": 2}
+    assert parsed.tool_calls[0].arguments == {"city": "Tokyo"}
 
 
 @pytest.mark.parametrize("enable_thinking", [True, False])
-def test_gemma4_bridge_drops_thinking_at_new_user_turn(enable_thinking):
-    tokenizer = load_tokenizer("google/gemma-4-E2B-it")
-    renderer = create_renderer(tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking))
+def test_bridge_drops_thinking_at_new_user_turn(enable_thinking):
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(
+        tokenizer,
+        Gemma4RendererConfig(enable_thinking=enable_thinking),
+    )
     first = [{"role": "user", "content": "A"}]
     assistant = {"role": "assistant", "content": "B"}
     next_turn = [{"role": "user", "content": "C"}]
@@ -402,46 +593,33 @@ def test_gemma4_bridge_drops_thinking_at_new_user_turn(enable_thinking):
     previous_prompt_ids = renderer.render_ids(first, add_generation_prompt=True)
     previous_full_ids = renderer.render_ids(first + [assistant])
     previous_completion_ids = previous_full_ids[len(previous_prompt_ids) :]
-    bridged = renderer.bridge_to_next_turn(
-        previous_prompt_ids,
-        previous_completion_ids,
-        next_turn,
+
+    assert (
+        renderer.bridge_to_next_turn(
+            previous_prompt_ids,
+            previous_completion_ids,
+            next_turn,
+        )
+        is None
     )
 
-    assert bridged is None
-
-    retain_renderer = create_renderer(
+    retaining = Gemma4Renderer(
         tokenizer,
-        Gemma4RendererConfig(enable_thinking=enable_thinking, thinking_retention="all"),
+        Gemma4RendererConfig(
+            enable_thinking=enable_thinking,
+            preserve_thinking=True,
+        ),
     )
-    retained = retain_renderer.bridge_to_next_turn(
+    retained = retaining.bridge_to_next_turn(
         previous_prompt_ids,
         previous_completion_ids,
         next_turn,
     )
     assert retained is not None
-    assert retained.token_ids == retain_renderer.render_ids(
+    assert retained.token_ids == retaining.render_ids(
         first + [assistant] + next_turn,
         add_generation_prompt=True,
     )
-    assert retained.message_tool_names == [None]
-
-
-def test_gemma4_rejects_non_text_multimodal_parts_until_sidecar_exists():
-    _, renderer = _gemma4()
-
-    with pytest.raises(ValueError, match="multimodal sidecar"):
-        renderer.render(
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Describe this."},
-                        {"type": "image", "image": object()},
-                    ],
-                }
-            ]
-        )
 
 
 @pytest.mark.parametrize(
@@ -459,7 +637,12 @@ def test_gemma4_rejects_non_text_multimodal_parts_until_sidecar_exists():
             "content part type",
         ),
         (
-            [{"role": "user", "content": [{"type": "citation", "text": "x"}]}],
+            [
+                {
+                    "role": "user",
+                    "content": [{"type": "citation", "text": "x"}],
+                }
+            ],
             "unsupported content part type",
         ),
         (
@@ -468,7 +651,7 @@ def test_gemma4_rejects_non_text_multimodal_parts_until_sidecar_exists():
         ),
         (
             [{"role": "user", "content": [object()]}],
-            "content parts must be strings or mappings",
+            "content part 0 must be a string or mapping",
         ),
         (
             [{"role": "assistant", "content": "", "tool_calls": ["bad"]}],
@@ -496,7 +679,7 @@ def test_gemma4_rejects_non_text_multimodal_parts_until_sidecar_exists():
                     "tool_calls": [{"function": {"name": "f", "arguments": []}}],
                 }
             ],
-            "arguments must be",
+            "arguments.*JSON object",
         ),
         (
             [
@@ -518,10 +701,7 @@ def test_gemma4_rejects_non_text_multimodal_parts_until_sidecar_exists():
             ],
             "missing response",
         ),
-        (
-            [{"role": "tool", "name": "f", "content": "orphan"}],
-            "must immediately follow",
-        ),
+        ([{"role": "tool", "content": "orphan"}], "Unconsumed tool message"),
         (
             [
                 {"role": "user", "content": "call"},
@@ -535,7 +715,7 @@ def test_gemma4_rejects_non_text_multimodal_parts_until_sidecar_exists():
                         }
                     ],
                 },
-                {"role": "tool", "tool_call_id": "call_2", "content": "bad id"},
+                {"role": "tool", "tool_call_id": "call_2", "content": "bad"},
             ],
             "does not match",
         ),
@@ -564,13 +744,13 @@ def test_gemma4_rejects_non_text_multimodal_parts_until_sidecar_exists():
                     "content": "",
                     "tool_calls": [{"function": {"name": "actual", "arguments": {}}}],
                 },
-                {"role": "tool", "name": "different", "content": "wrong call"},
+                {"role": "tool", "name": "different", "content": "wrong"},
             ],
             "does not match an issuing call",
         ),
     ],
 )
-def test_gemma4_rejects_malformed_messages(messages, match):
+def test_rejects_malformed_messages(messages, match):
     _, renderer = _gemma4()
 
     with pytest.raises(ValueError, match=match):

@@ -1,10 +1,11 @@
 """Typed renderer configs — one pydantic model per renderer, unified by a
 discriminated union (``RendererConfig``).
 
-Each renderer accepts its own typed config; bad combinations (e.g.
-``add_vision_id`` under ``name="qwen3"``) fail at config-load time with a
-pydantic ``ValidationError`` rather than at runtime via an allowlist
-check. The shared ``thinking_retention`` flag is optional: ``None`` means
+Each renderer accepts its own typed config and declares an explicit
+``_template_fields`` allowlist for fields that may arrive through
+``chat_template_kwargs``. Bad combinations (e.g. ``add_vision_id`` under
+``name="qwen3"``) fail before renderer construction. The shared
+``thinking_retention`` flag is optional: ``None`` means
 "derive bridge policy from this renderer's chat-template knobs"; an
 explicit value is a bridge-policy override.
 
@@ -87,31 +88,36 @@ class BaseRendererConfig(BaseConfig):
     to the Python chat-template implementation and its explicit template
     kwargs."""
 
-    # Fields that are renderer-internal — not forwarded to (or mirrored
-    # by) ``apply_chat_template``. Override in subclasses that hold
-    # non-template config (e.g. ``image_cache_max``, GptOss's
-    # ``use_system_prompt`` / ``knowledge_cutoff`` / ``model_identity``,
-    # or fields that exist as renderer conventions without a Jinja
-    # analogue like DeepSeek V3 / Kimi K2 ``enable_thinking``).
-    #
-    # Used by parity tests to compute the field subset that, when
-    # changed, must produce token streams matching
-    # ``apply_chat_template`` — see :meth:`template_field_names`. The
-    # renderer is the only end-to-end consumer of these fields, so this
-    # is a renderer-side bookkeeping concern rather than a public API.
+    # Every renderer-specific field must be classified exactly once: either
+    # as a chat-template kwarg or as renderer-internal configuration.
+    _template_fields: ClassVar[frozenset[str]] = frozenset()
     _internal_fields: ClassVar[frozenset[str]] = frozenset()
+    _allow_opaque_template_kwargs: ClassVar[bool] = False
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs) -> None:
+        super().__pydantic_init_subclass__(**kwargs)
+        base_fields = frozenset(BaseRendererConfig.model_fields)
+        renderer_fields = frozenset(cls.model_fields) - base_fields - {"name"}
+        overlap = cls._template_fields & cls._internal_fields
+        missing = renderer_fields - cls._template_fields - cls._internal_fields
+        unknown = (cls._template_fields | cls._internal_fields) - renderer_fields
+        if overlap or missing or unknown:
+            raise TypeError(
+                f"{cls.__name__} has an invalid renderer-field classification: "
+                f"overlap={sorted(overlap)}, missing={sorted(missing)}, "
+                f"unknown={sorted(unknown)}"
+            )
 
     @classmethod
     def template_field_names(cls) -> frozenset[str]:
         """Subset of fields that mirror Jinja chat-template kwargs.
 
-        Default: every non-base field except ``name`` and any field
-        listed in ``_internal_fields``. Used by the parity test matrix
-        (``tests/test_renderer_config_parity.py``) to discover the
-        cells that must agree with ``apply_chat_template``.
+        Used both as the runtime allowlist for ``chat_template_kwargs`` and
+        by parity tests to discover the cells that must agree with
+        ``apply_chat_template``.
         """
-        base = frozenset(BaseRendererConfig.model_fields)
-        return frozenset(cls.model_fields) - base - {"name"} - cls._internal_fields
+        return cls._template_fields
 
 
 class AutoRendererConfig(BaseRendererConfig):
@@ -122,6 +128,7 @@ class AutoRendererConfig(BaseRendererConfig):
     at the call site."""
 
     name: Literal["auto"] = "auto"
+    _template_fields = frozenset()
 
 
 class DefaultRendererConfig(BaseRendererConfig):
@@ -148,6 +155,8 @@ class DefaultRendererConfig(BaseRendererConfig):
     # DefaultRenderer's parsing pipeline, not the underlying Jinja
     # template. Jinja kwargs live in ``model_extra`` (extra="allow").
     _internal_fields = frozenset({"tool_parser", "reasoning_parser"})
+    _template_fields = frozenset()
+    _allow_opaque_template_kwargs = True
 
     @model_validator(mode="after")
     def _reject_legacy_preserve_flags(self):
@@ -174,6 +183,7 @@ class Qwen3RendererConfig(BaseRendererConfig):
     """Qwen3 (text-only) renderer config."""
 
     name: Literal["qwen3"] = "qwen3"
+    _template_fields = frozenset({"enable_thinking"})
 
     enable_thinking: bool = True
     """When ``True``, the generation prompt includes ``<think>`` so the
@@ -191,12 +201,14 @@ class PrimeQwen3RendererConfig(BaseRendererConfig):
     """PrimeIntellect Qwen3 renderer config."""
 
     name: Literal["prime-qwen3"] = "prime-qwen3"
+    _template_fields = frozenset()
 
 
 class Qwen35RendererConfig(BaseRendererConfig):
     """Qwen3.5 renderer config."""
 
     name: Literal["qwen3.5"] = "qwen3.5"
+    _template_fields = frozenset({"enable_thinking", "add_vision_id"})
 
     enable_thinking: bool | None = None
     """When ``True``, the generation prompt includes ``<think>``. ``None``
@@ -228,6 +240,9 @@ class Qwen36RendererConfig(BaseRendererConfig):
     """Qwen3.6 renderer config. Inherits Qwen3.5's template surface."""
 
     name: Literal["qwen3.6"] = "qwen3.6"
+    _template_fields = frozenset(
+        {"enable_thinking", "add_vision_id", "preserve_thinking"}
+    )
 
     enable_thinking: bool | None = None
     """See :class:`Qwen35RendererConfig.enable_thinking`."""
@@ -256,10 +271,57 @@ class Qwen36RendererConfig(BaseRendererConfig):
         return self
 
 
+class Qwen38RendererConfig(BaseRendererConfig):
+    """Qwen3.8 renderer config.
+
+    Qwen3.8 keeps Qwen3.6's multimodal/tool template and adds native
+    reasoning-effort instructions. Historical thinking is preserved by
+    default in the upstream template.
+    """
+
+    name: Literal["qwen3.8"] = "qwen3.8"
+    _template_fields = frozenset(
+        {
+            "enable_thinking",
+            "add_vision_id",
+            "preserve_thinking",
+            "reasoning_effort",
+        }
+    )
+
+    enable_thinking: bool | None = None
+    """See :class:`Qwen35RendererConfig.enable_thinking`."""
+
+    add_vision_id: bool = False
+    """See :class:`Qwen35RendererConfig.add_vision_id`."""
+
+    preserve_thinking: bool = True
+    """Keep historical ``<think>`` blocks. Mirrors Qwen3.8's default."""
+
+    reasoning_effort: Literal["xhigh", "medium", "low"] = "xhigh"
+    """Reasoning depth hint injected into the system prompt when enabled."""
+
+    image_cache_max: int = 256
+    """See :class:`Qwen35RendererConfig.image_cache_max`."""
+
+    _internal_fields = frozenset({"image_cache_max"})
+
+    @model_validator(mode="after")
+    def _check_thinking_retention(self):
+        _reject_thinking_retention_conflict(
+            self,
+            "preserve_thinking",
+            true_implies="all",
+            false_implies="tool_cycle",
+        )
+        return self
+
+
 class Qwen3VLRendererConfig(BaseRendererConfig):
     """Qwen3-VL renderer config."""
 
     name: Literal["qwen3-vl"] = "qwen3-vl"
+    _template_fields = frozenset({"add_vision_id"})
 
     add_vision_id: bool = False
     """See :class:`Qwen35RendererConfig.add_vision_id`."""
@@ -270,10 +332,39 @@ class Qwen3VLRendererConfig(BaseRendererConfig):
     _internal_fields = frozenset({"image_cache_max"})
 
 
+class Gemma4RendererConfig(BaseRendererConfig):
+    """Gemma 4 renderer config."""
+
+    name: Literal["gemma4"] = "gemma4"
+    _template_fields = frozenset({"enable_thinking", "preserve_thinking"})
+
+    enable_thinking: bool = False
+    """Enable Gemma 4's thinking mode. Mirrors the canonical template kwarg."""
+
+    preserve_thinking: bool = False
+    """Keep thinking on historical tool-call turns when the template permits it."""
+
+    image_cache_max: int = 256
+    """FIFO bound on processed image entries. Renderer-internal."""
+
+    _internal_fields = frozenset({"image_cache_max"})
+
+    @model_validator(mode="after")
+    def _check_thinking_retention(self):
+        _reject_thinking_retention_conflict(
+            self,
+            "preserve_thinking",
+            true_implies="all",
+            false_implies="tool_cycle",
+        )
+        return self
+
+
 class GLM5RendererConfig(BaseRendererConfig):
     """GLM-5 renderer config."""
 
     name: Literal["glm-5"] = "glm-5"
+    _template_fields = frozenset({"enable_thinking", "clear_thinking"})
 
     enable_thinking: bool = True
     """When ``True``, the generation prompt includes ``<think>``. Mirrors
@@ -301,6 +392,7 @@ class GLM51RendererConfig(BaseRendererConfig):
     discriminator so the registry can route to ``GLM51Renderer``."""
 
     name: Literal["glm-5.1"] = "glm-5.1"
+    _template_fields = frozenset({"enable_thinking", "clear_thinking"})
 
     enable_thinking: bool = True
     """See :class:`GLM5RendererConfig.enable_thinking`."""
@@ -323,6 +415,7 @@ class GLM45RendererConfig(BaseRendererConfig):
     """GLM-4.5 Air renderer config."""
 
     name: Literal["glm-4.5"] = "glm-4.5"
+    _template_fields = frozenset({"enable_thinking"})
 
     enable_thinking: bool = True
     """When ``True``, the generation prompt includes ``<think>``. Mirrors
@@ -350,6 +443,15 @@ class Hy3RendererConfig(BaseRendererConfig):
     """
 
     name: Literal["hy3"] = "hy3"
+    _template_fields = frozenset(
+        {
+            "reasoning_effort",
+            "preserved_thinking",
+            "is_training",
+            "raw_last_assistant",
+            "fallback_strategy",
+        }
+    )
 
     reasoning_effort: Literal["no_think", "low", "high"] = "no_think"
     """Reasoning gate. Mirrors the chat template's ``reasoning_effort`` kwarg.
@@ -393,6 +495,69 @@ class Hy3RendererConfig(BaseRendererConfig):
         return self
 
 
+# Inkling ``reasoning_effort`` label → float (the template's own effort_map).
+INKLING_EFFORT_MAP: dict[str, float] = {
+    "none": 0.0,
+    "minimal": 0.1,
+    "low": 0.2,
+    "medium": 0.7,
+    "high": 0.9,
+    "max": 0.99,
+}
+
+
+class InklingRendererConfig(BaseRendererConfig):
+    """Renderer config for Inkling and Inkling-Small.
+
+    Inkling gates reasoning depth via a ``reasoning_effort`` knob rather
+    than a boolean ``enable_thinking``. It accepts either a string label
+    from :data:`INKLING_EFFORT_MAP` (``none`` … ``max``) or a raw float in
+    ``[0.0, 0.99]``; the renderer emits ``Thinking effort level: {N}`` in a
+    leading system message exactly as the chat template does (label mapped
+    to its float, ``0.0`` printed as ``"0"``). The template default —
+    applied when no ``reasoning_effort`` is passed — is ``0.9``, which this
+    config mirrors.
+
+    Reasoning is preserved on every historical assistant turn (the template
+    has no history-dropping knob), so the effective bridge policy is
+    ``"all"``.
+    """
+
+    name: Literal["inkling"] = "inkling"
+    _template_fields = frozenset({"reasoning_effort"})
+
+    reasoning_effort: str | float = 0.9
+    """Reasoning-effort gate. Mirrors the chat template's ``reasoning_effort``
+    kwarg: a label in :data:`INKLING_EFFORT_MAP` or a float in ``[0.0, 0.99]``.
+    Default ``0.9`` matches the template's own default (equivalent to
+    ``"high"``)."""
+
+    image_cache_max: int = 256
+    """FIFO bound on the per-renderer image-processor cache. Renderer-
+    internal — not a Jinja chat-template kwarg."""
+
+    audio_cache_max: int = 256
+    """FIFO bound on the per-renderer audio-processor cache. Renderer-
+    internal — not a Jinja chat-template kwarg."""
+
+    _internal_fields = frozenset({"image_cache_max", "audio_cache_max"})
+
+    @model_validator(mode="after")
+    def _check_reasoning_effort(self):
+        eff = self.reasoning_effort
+        if isinstance(eff, str):
+            if eff.strip() not in INKLING_EFFORT_MAP:
+                raise ValueError(
+                    f"reasoning_effort={eff!r} is not a known label. "
+                    f"Use one of {sorted(INKLING_EFFORT_MAP)} or a float in [0.0, 0.99]."
+                )
+        else:
+            num = float(eff)
+            if num < 0.0 or num > 0.99:
+                raise ValueError(f"reasoning_effort={eff!r} must be in [0.0, 0.99].")
+        return self
+
+
 class GptOssRendererConfig(BaseRendererConfig):
     """OpenAI gpt-oss (harmony) renderer config.
 
@@ -406,6 +571,7 @@ class GptOssRendererConfig(BaseRendererConfig):
     """
 
     name: Literal["gpt-oss"] = "gpt-oss"
+    _template_fields = frozenset({"reasoning_effort", "conversation_start_date"})
 
     reasoning_effort: Literal["low", "medium", "high"] = "medium"
     """Harmony reasoning-effort tag. Mirrors the ``apply_chat_template``
@@ -452,17 +618,6 @@ class GptOssRendererConfig(BaseRendererConfig):
         return self
 
 
-class Gemma4RendererConfig(BaseRendererConfig):
-    """Gemma 4 renderer config."""
-
-    name: Literal["gemma4"] = "gemma4"
-
-    enable_thinking: bool = False
-    """When ``True``, the system prelude includes ``<|think|>``. Mirrors
-    the chat template's ``enable_thinking`` kwarg; default ``False`` matches
-    upstream when the kwarg is omitted."""
-
-
 class KimiK2RendererConfig(BaseRendererConfig):
     """Kimi K2 renderer config.
 
@@ -473,6 +628,7 @@ class KimiK2RendererConfig(BaseRendererConfig):
     """
 
     name: Literal["kimi-k2"] = "kimi-k2"
+    _template_fields = frozenset()
 
     enable_thinking: bool = True
     """No-op for Kimi K2 (template doesn't gate on it). Stored for
@@ -485,6 +641,7 @@ class KimiK25RendererConfig(BaseRendererConfig):
     """Kimi K2.5 renderer config."""
 
     name: Literal["kimi-k2.5"] = "kimi-k2.5"
+    _template_fields = frozenset({"thinking"})
 
     thinking: bool = True
     """When ``True``, the generation prompt prefills ``<think>``; when
@@ -502,6 +659,7 @@ class LagunaXS2RendererConfig(BaseRendererConfig):
     """Laguna XS.2 renderer config."""
 
     name: Literal["laguna-xs.2"] = "laguna-xs.2"
+    _template_fields = frozenset({"enable_thinking", "render_assistant_messages_raw"})
 
     enable_thinking: bool = False
     """When ``True``, the generation prompt includes ``<think>``. Mirrors
@@ -527,6 +685,7 @@ class LagunaM1RendererConfig(BaseRendererConfig):
     """
 
     name: Literal["laguna-m.1"] = "laguna-m.1"
+    _template_fields = frozenset({"enable_thinking", "render_assistant_messages_raw"})
 
     enable_thinking: bool = False
     """When ``True``, the generation prompt includes ``<think>``. Mirrors
@@ -548,6 +707,7 @@ class LagunaXS21RendererConfig(BaseRendererConfig):
     """
 
     name: Literal["laguna-xs-2.1"] = "laguna-xs-2.1"
+    _template_fields = frozenset({"enable_thinking"})
 
     enable_thinking: bool = False
     """When ``True``, the generation prompt ends with ``<think>`` and
@@ -555,6 +715,38 @@ class LagunaXS21RendererConfig(BaseRendererConfig):
     ``False``, turns open with a bare ``</think>`` and reasoning is not
     rendered. Mirrors the template's ``enable_thinking`` kwarg and its
     upstream default."""
+
+
+class LagunaS21RendererConfig(BaseRendererConfig):
+    """Laguna S-2.1 renderer config.
+
+    S-2.1 is a larger sibling of XS-2.1 sharing its tokenizer (same vocab,
+    special tokens, and merges), but its chat template is *not* byte-identical:
+    ``enable_thinking`` defaults to ``True`` (XS-2.1 defaults ``False``), and a
+    new ``preserve_thinking`` kwarg widens the reasoning-display gate to
+    ``enable_thinking or preserve_thinking``. The token format is otherwise
+    identical, so this is served by
+    :class:`renderers.laguna_s21.LagunaS21Renderer`, a thin subclass of
+    ``LagunaXS21Renderer`` that only overrides that gate.
+    """
+
+    name: Literal["laguna-s-2.1"] = "laguna-s-2.1"
+    _template_fields = frozenset({"enable_thinking", "preserve_thinking"})
+
+    enable_thinking: bool = True
+    """When ``True``, the generation prompt ends with ``<think>`` and every
+    assistant turn renders ``<think>{reasoning}</think>``; when ``False``,
+    turns open with a bare ``</think>``. Mirrors the template's
+    ``enable_thinking`` kwarg — note S-2.1's upstream default is ``True``,
+    unlike XS-2.1's ``False``."""
+
+    preserve_thinking: bool = False
+    """When ``True``, assistant turns keep their ``<think>{reasoning}</think>``
+    block even while ``enable_thinking`` is ``False`` — the template gates
+    reasoning display on ``enable_thinking or preserve_thinking``. With the
+    default ``False`` the gate collapses to ``enable_thinking`` and the
+    renderer matches XS-2.1 turn-for-turn. Mirrors the template's
+    ``preserve_thinking`` kwarg and its upstream default."""
 
 
 class Llama3RendererConfig(BaseRendererConfig):
@@ -569,6 +761,7 @@ class Llama3RendererConfig(BaseRendererConfig):
     """
 
     name: Literal["llama-3"] = "llama-3"
+    _template_fields = frozenset({"date_string", "tools_in_user_message"})
 
     date_string: str = "26 Jul 2024"
     """``Today Date`` value injected into the system preamble. Pinned to
@@ -587,6 +780,7 @@ class MiniMaxM2RendererConfig(BaseRendererConfig):
     """MiniMax M2 / M2.5 renderer config."""
 
     name: Literal["minimax-m2"] = "minimax-m2"
+    _template_fields = frozenset({"model_identity"})
 
     model_identity: str = "You are a helpful assistant. Your name is MiniMax-M2.5 and is built by MiniMax."
     """Fallback persona used when no system message is supplied. Mirrors
@@ -604,6 +798,9 @@ class Nemotron3RendererConfig(BaseRendererConfig):
     """
 
     name: Literal["nemotron-3"] = "nemotron-3"
+    _template_fields = frozenset(
+        {"enable_thinking", "truncate_history_thinking", "low_effort"}
+    )
 
     enable_thinking: bool = True
     """When ``True``, the generation prompt includes ``<think>``. Mirrors
@@ -646,6 +843,9 @@ class Nemotron3UltraRendererConfig(BaseRendererConfig):
     """
 
     name: Literal["nemotron-3-ultra"] = "nemotron-3-ultra"
+    _template_fields = frozenset(
+        {"enable_thinking", "truncate_history_thinking", "medium_effort"}
+    )
 
     enable_thinking: bool = True
     """See :class:`Nemotron3RendererConfig.enable_thinking`."""
@@ -668,6 +868,38 @@ class Nemotron3UltraRendererConfig(BaseRendererConfig):
     user message. Mirrors the Ultra chat template's ``medium_effort`` kwarg."""
 
 
+class Nemotron35RendererConfig(BaseRendererConfig):
+    """Nemotron-3.5 (Lightning) renderer config.
+
+    Nemotron 3.5's chat template is the Ultra variant's minus the effort
+    kwarg: same reasoning-block glue (no ``\\n`` around ``</think>``, no
+    trim on truncated tool-call history), but its Jinja defines no
+    reasoning-effort variable at all. It shares the
+    :class:`renderers.nemotron3.Nemotron3Renderer` implementation via the
+    :class:`renderers.nemotron3.Nemotron35Renderer` subclass and is reached
+    via the ``nemotron-3.5`` discriminator.
+    """
+
+    name: Literal["nemotron-3.5"] = "nemotron-3.5"
+    _template_fields = frozenset({"enable_thinking", "truncate_history_thinking"})
+
+    enable_thinking: bool = True
+    """See :class:`Nemotron3RendererConfig.enable_thinking`."""
+
+    truncate_history_thinking: bool = True
+    """See :class:`Nemotron3RendererConfig.truncate_history_thinking`."""
+
+    @model_validator(mode="after")
+    def _check_thinking_retention(self):
+        _reject_thinking_retention_conflict(
+            self,
+            "truncate_history_thinking",
+            true_implies="tool_cycle",
+            false_implies="all",
+        )
+        return self
+
+
 class DeepSeekV3RendererConfig(BaseRendererConfig):
     """DeepSeek-V3 renderer config (non-reasoning).
 
@@ -677,6 +909,7 @@ class DeepSeekV3RendererConfig(BaseRendererConfig):
     """
 
     name: Literal["deepseek-v3"] = "deepseek-v3"
+    _template_fields = frozenset()
 
 
 class DeepSeekR1RendererConfig(BaseRendererConfig):
@@ -694,6 +927,7 @@ class DeepSeekR1RendererConfig(BaseRendererConfig):
     """
 
     name: Literal["deepseek-r1"] = "deepseek-r1"
+    _template_fields = frozenset()
 
 
 RendererConfig = Annotated[
@@ -704,22 +938,26 @@ RendererConfig = Annotated[
         PrimeQwen3RendererConfig,
         Qwen35RendererConfig,
         Qwen36RendererConfig,
+        Qwen38RendererConfig,
         Qwen3VLRendererConfig,
+        Gemma4RendererConfig,
         GLM5RendererConfig,
         GLM51RendererConfig,
         GLM45RendererConfig,
         GptOssRendererConfig,
-        Gemma4RendererConfig,
         Hy3RendererConfig,
+        InklingRendererConfig,
         KimiK2RendererConfig,
         KimiK25RendererConfig,
         LagunaXS2RendererConfig,
         LagunaM1RendererConfig,
         LagunaXS21RendererConfig,
+        LagunaS21RendererConfig,
         Llama3RendererConfig,
         MiniMaxM2RendererConfig,
         Nemotron3RendererConfig,
         Nemotron3UltraRendererConfig,
+        Nemotron35RendererConfig,
         DeepSeekV3RendererConfig,
         DeepSeekR1RendererConfig,
     ],
@@ -746,22 +984,26 @@ _CONFIG_BY_NAME: dict[str, type[BaseRendererConfig]] = {
     "prime-qwen3": PrimeQwen3RendererConfig,
     "qwen3.5": Qwen35RendererConfig,
     "qwen3.6": Qwen36RendererConfig,
+    "qwen3.8": Qwen38RendererConfig,
     "qwen3-vl": Qwen3VLRendererConfig,
+    "gemma4": Gemma4RendererConfig,
     "glm-5": GLM5RendererConfig,
     "glm-5.1": GLM51RendererConfig,
     "glm-4.5": GLM45RendererConfig,
     "gpt-oss": GptOssRendererConfig,
-    "gemma4": Gemma4RendererConfig,
     "hy3": Hy3RendererConfig,
+    "inkling": InklingRendererConfig,
     "kimi-k2": KimiK2RendererConfig,
     "kimi-k2.5": KimiK25RendererConfig,
     "laguna-xs.2": LagunaXS2RendererConfig,
     "laguna-m.1": LagunaM1RendererConfig,
     "laguna-xs-2.1": LagunaXS21RendererConfig,
+    "laguna-s-2.1": LagunaS21RendererConfig,
     "llama-3": Llama3RendererConfig,
     "minimax-m2": MiniMaxM2RendererConfig,
     "nemotron-3": Nemotron3RendererConfig,
     "nemotron-3-ultra": Nemotron3UltraRendererConfig,
+    "nemotron-3.5": Nemotron35RendererConfig,
     "deepseek-v3": DeepSeekV3RendererConfig,
     "deepseek-r1": DeepSeekR1RendererConfig,
 }
@@ -803,18 +1045,23 @@ __all__ = [
     "Gemma4RendererConfig",
     "GptOssRendererConfig",
     "Hy3RendererConfig",
+    "INKLING_EFFORT_MAP",
+    "InklingRendererConfig",
     "KimiK25RendererConfig",
     "KimiK2RendererConfig",
     "LagunaM1RendererConfig",
+    "LagunaS21RendererConfig",
     "LagunaXS2RendererConfig",
     "LagunaXS21RendererConfig",
     "Llama3RendererConfig",
     "MiniMaxM2RendererConfig",
+    "Nemotron35RendererConfig",
     "Nemotron3RendererConfig",
     "Nemotron3UltraRendererConfig",
     "PrimeQwen3RendererConfig",
     "Qwen35RendererConfig",
     "Qwen36RendererConfig",
+    "Qwen38RendererConfig",
     "Qwen3RendererConfig",
     "Qwen3VLRendererConfig",
     "RendererConfig",

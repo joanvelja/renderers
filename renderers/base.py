@@ -794,10 +794,10 @@ class MultimodalRenderer(Renderer, Protocol):
     """A :class:`Renderer` that supports multimodal inputs (images, video).
 
     Concrete classes (``Qwen3VLRenderer``, ``Qwen35Renderer``,
-    ``Qwen36Renderer``, ``KimiK25Renderer``) implement this Protocol
-    structurally — no explicit inheritance required. Callers that need
-    to drive vLLM's ``multi_modal_data`` features field or carry images
-    forward across turns should dispatch on ``isinstance(r,
+    ``Qwen36Renderer``, ``Qwen38Renderer``, ``KimiK25Renderer``) implement
+    this Protocol structurally — no explicit inheritance required.
+    Callers that need to drive vLLM's ``multi_modal_data`` features field or
+    carry images forward across turns should dispatch on ``isinstance(r,
     MultimodalRenderer)`` and use the extended ``bridge_to_next_turn``
     signature below.
     """
@@ -1031,10 +1031,26 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     "Qwen/Qwen3.5-397B-A17B": "qwen3.5",
     # Qwen3.6.
     "Qwen/Qwen3.6-35B-A3B": "qwen3.6",
+    # Qwen3.8.
+    "Qwen/Qwen3.8-27B": "qwen3.8",
     # Qwen3-VL.
     "Qwen/Qwen3-VL-4B-Instruct": "qwen3-vl",
     "Qwen/Qwen3-VL-8B-Instruct": "qwen3-vl",
     "Qwen/Qwen3-VL-30B-A3B-Instruct": "qwen3-vl",
+    # Gemma 4 checkpoints share Google's canonical turn/tool grammar and
+    # dynamic Gemma4Processor image expansion. E2B/E4B omit the disabled-
+    # thinking empty-channel prefill used by the 12B/26B/31B revision;
+    # Gemma4Renderer detects that small template variant per tokenizer.
+    "google/gemma-4-E2B": "gemma4",
+    "google/gemma-4-E2B-it": "gemma4",
+    "google/gemma-4-E4B": "gemma4",
+    "google/gemma-4-E4B-it": "gemma4",
+    "google/gemma-4-12B": "gemma4",
+    "google/gemma-4-12B-it": "gemma4",
+    "google/gemma-4-26B-A4B": "gemma4",
+    "google/gemma-4-26B-A4B-it": "gemma4",
+    "google/gemma-4-31B": "gemma4",
+    "google/gemma-4-31B-it": "gemma4",
     # GLM-5 family (GLM-4.7 reuses the GLM-5 template).
     "zai-org/GLM-5": "glm-5",
     "zai-org/GLM-5-FP8": "glm-5",
@@ -1065,6 +1081,9 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "nemotron-3",
     "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16": "nemotron-3-ultra",
     "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8": "nemotron-3-ultra",
+    # Nemotron 3.5 (Lightning). Its template is the Ultra variant's minus the
+    # effort kwarg (``nemotron-3.5``).
+    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": "nemotron-3.5",
     # Llama 3.2 (Instruct). Tested against the gated meta-llama repos and
     # the unrestricted unsloth/... mirror, which ships a byte-identical
     # chat template. ``Llama3Renderer`` defaults ``date_string`` to
@@ -1073,27 +1092,19 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     # construction to pin a different date.
     "meta-llama/Llama-3.2-1B-Instruct": "llama-3",
     "meta-llama/Llama-3.2-3B-Instruct": "llama-3",
-    # Poolside Laguna. These checkpoints ship distinct chat templates,
-    # each mirrored by its own renderer class/config discriminator.
+    # Poolside Laguna. These checkpoints ship distinct chat templates, each
+    # mirrored by its own renderer class/config discriminator.
     "poolside/Laguna-XS.2": "laguna-xs.2",
     "poolside/Laguna-M.1": "laguna-m.1",
     "poolside/Laguna-XS-2.1": "laguna-xs-2.1",
+    "poolside/Laguna-S-2.1": "laguna-s-2.1",
     # GPT-OSS.
     "openai/gpt-oss-20b": "gpt-oss",
     "openai/gpt-oss-120b": "gpt-oss",
-    # Gemma 4. The renderer implements Gemma4's text/tool chat template.
-    # Non-text image/audio/video parts are rejected explicitly until a
-    # multimodal sidecar is implemented.
-    "google/gemma-4-E2B": "gemma4",
-    "google/gemma-4-E2B-it": "gemma4",
-    "google/gemma-4-E4B": "gemma4",
-    "google/gemma-4-E4B-it": "gemma4",
-    "google/gemma-4-12B": "gemma4",
-    "google/gemma-4-12B-it": "gemma4",
-    "google/gemma-4-31B": "gemma4",
-    "google/gemma-4-31B-it": "gemma4",
-    "google/gemma-4-26B-A4B": "gemma4",
-    "google/gemma-4-26B-A4B-it": "gemma4",
+    # Thinking Machines Inkling checkpoints share byte-identical tokenizer,
+    # chat-template, and processor assets (vision + audio; transformers >= 5.14).
+    "thinkingmachines/Inkling": "inkling",
+    "thinkingmachines/Inkling-Small": "inkling",
     # Tencent Hunyuan Hy3 (295B-A21B MoE). The FP8 checkpoint shares the same
     # tokenizer and chat template. Hy3-preview is deliberately unmapped: it
     # ships an older, incompatible template (un-suffixed special tokens,
@@ -1116,6 +1127,16 @@ MULTIMODAL_MODELS: dict[str, set[str]] = {
     "Qwen/Qwen3-VL-4B-Instruct": {"image"},
     "Qwen/Qwen3-VL-8B-Instruct": {"image"},
     "Qwen/Qwen3-VL-30B-A3B-Instruct": {"image"},
+    "google/gemma-4-E2B": {"image"},
+    "google/gemma-4-E2B-it": {"image"},
+    "google/gemma-4-E4B": {"image"},
+    "google/gemma-4-E4B-it": {"image"},
+    "google/gemma-4-12B": {"image"},
+    "google/gemma-4-12B-it": {"image"},
+    "google/gemma-4-26B-A4B": {"image"},
+    "google/gemma-4-26B-A4B-it": {"image"},
+    "google/gemma-4-31B": {"image"},
+    "google/gemma-4-31B-it": {"image"},
     # Qwen3.5 is itself a VLM family (HF tag ``image-text-to-text``,
     # processor class ``Qwen3VLProcessor``) — same vision tokens and
     # image-processor as Qwen3-VL, with a different tool-call format.
@@ -1129,6 +1150,8 @@ MULTIMODAL_MODELS: dict[str, set[str]] = {
     # Qwen3.6 extends Qwen3.5's chat template; same VL bits, only
     # tool-call argument serialization differs.
     "Qwen/Qwen3.6-35B-A3B": {"image"},
+    # Qwen3.8 adds reasoning-effort control and preserves thinking by default.
+    "Qwen/Qwen3.8-27B": {"image"},
     # Kimi K2.5 / K2.6 are unified VLMs (HF tag ``image-text-to-text``)
     # with custom processor (``KimiK25Processor`` + ``KimiK25VisionProcessor``).
     # Vision wrap is different from Qwen-VL:
@@ -1138,6 +1161,8 @@ MULTIMODAL_MODELS: dict[str, set[str]] = {
     # ``grid_thws``.
     "moonshotai/Kimi-K2.5": {"image"},
     "moonshotai/Kimi-K2.6": {"image"},
+    "thinkingmachines/Inkling": {"image", "audio"},
+    "thinkingmachines/Inkling-Small": {"image", "audio"},
 }
 
 
@@ -1332,13 +1357,15 @@ def _populate_registry():
     from renderers.deepseek_r1 import DeepSeekR1Renderer
     from renderers.deepseek_v3 import DeepSeekV3Renderer
     from renderers.default import DefaultRenderer
-    from renderers.gemma4 import Gemma4Renderer
     from renderers.glm5 import GLM5Renderer, GLM51Renderer
     from renderers.glm45 import GLM45Renderer
     from renderers.gpt_oss import GptOssRenderer
+    from renderers.gemma4 import Gemma4Renderer
     from renderers.hy3 import Hy3Renderer
+    from renderers.inkling import InklingRenderer
     from renderers.kimi_k2 import KimiK2Renderer
     from renderers.kimi_k25 import KimiK25Renderer
+    from renderers.laguna_s21 import LagunaS21Renderer
     from renderers.laguna_xs2 import (
         LagunaM1Renderer,
         LagunaXS2Renderer,
@@ -1346,22 +1373,28 @@ def _populate_registry():
     )
     from renderers.llama_3 import Llama3Renderer
     from renderers.minimax_m2 import MiniMaxM2Renderer
-    from renderers.nemotron3 import Nemotron3Renderer, Nemotron3UltraRenderer
+    from renderers.nemotron3 import (
+        Nemotron3Renderer,
+        Nemotron3UltraRenderer,
+        Nemotron35Renderer,
+    )
     from renderers.prime_qwen3 import PrimeQwen3Renderer
     from renderers.qwen3 import Qwen3Renderer
     from renderers.qwen3_vl import Qwen3VLRenderer
     from renderers.qwen35 import Qwen35Renderer
     from renderers.qwen36 import Qwen36Renderer
+    from renderers.qwen38 import Qwen38Renderer
 
     RENDERER_REGISTRY.update(
         {
             "default": DefaultRenderer,
-            "gemma4": Gemma4Renderer,
             "qwen3": Qwen3Renderer,
             "prime-qwen3": PrimeQwen3Renderer,
             "qwen3-vl": Qwen3VLRenderer,
+            "gemma4": Gemma4Renderer,
             "qwen3.5": Qwen35Renderer,
             "qwen3.6": Qwen36Renderer,
+            "qwen3.8": Qwen38Renderer,
             "glm-5": GLM5Renderer,
             "glm-5.1": GLM51Renderer,
             "glm-4.5": GLM45Renderer,
@@ -1369,14 +1402,17 @@ def _populate_registry():
             "deepseek-v3": DeepSeekV3Renderer,
             "deepseek-r1": DeepSeekR1Renderer,
             "hy3": Hy3Renderer,
+            "inkling": InklingRenderer,
             "kimi-k2": KimiK2Renderer,
             "kimi-k2.5": KimiK25Renderer,
             "laguna-xs.2": LagunaXS2Renderer,
             "laguna-m.1": LagunaM1Renderer,
             "laguna-xs-2.1": LagunaXS21Renderer,
+            "laguna-s-2.1": LagunaS21Renderer,
             "llama-3": Llama3Renderer,
             "nemotron-3": Nemotron3Renderer,
             "nemotron-3-ultra": Nemotron3UltraRenderer,
+            "nemotron-3.5": Nemotron35Renderer,
             "gpt-oss": GptOssRenderer,
         }
     )
@@ -1473,12 +1509,31 @@ def _merge_chat_template_kwargs(
         return config
     if not isinstance(chat_template_kwargs, Mapping):
         raise TypeError("chat_template_kwargs must be a mapping.")
+    kwargs = dict(chat_template_kwargs)
+    config_cls = type(config)
+    allowed = config_cls.template_field_names()
+    if config_cls._allow_opaque_template_kwargs:
+        reserved = frozenset(config_cls.model_fields) - allowed - {"name"}
+        unsupported = frozenset(kwargs) & reserved
+    else:
+        unsupported = frozenset(kwargs) - allowed
+    if unsupported:
+        allowed_text = (
+            "opaque Jinja kwargs"
+            if config_cls._allow_opaque_template_kwargs
+            else ", ".join(sorted(allowed)) or "(none)"
+        )
+        raise ValueError(
+            f"Unsupported chat_template_kwargs for {config.name!r}: "
+            f"{sorted(unsupported)}. Allowed: {allowed_text}. Pass "
+            "renderer-internal options through the typed config instead."
+        )
     data: dict[str, Any] = {"name": config.name}
     for field_name in config.__pydantic_fields_set__:
         data[field_name] = getattr(config, field_name)
     data.update(getattr(config, "model_extra", None) or {})
-    data.update(dict(chat_template_kwargs))
-    return type(config).model_validate(data)
+    data.update(kwargs)
+    return config_cls.model_validate(data)
 
 
 def _resolve_renderer_config(

@@ -57,7 +57,9 @@ class OverlongPromptError(Exception):
     def __init__(self, *, prompt_len: int, max_prompt_len: int) -> None:
         self.prompt_len = prompt_len
         self.max_prompt_len = max_prompt_len
-        super().__init__(f"Prompt length ({prompt_len}) exceeds maximum context length ({max_prompt_len}).")
+        super().__init__(
+            f"Prompt length ({prompt_len}) exceeds maximum context length ({max_prompt_len})."
+        )
 
 
 class MalformedGenerateResponseError(ValueError):
@@ -127,7 +129,9 @@ async def _maybe_offload(renderer: Renderer | RendererPool, fn):
     return fn()
 
 
-def _extract_base64_fields(raw: bytes, fields: Mapping[str, bytes]) -> tuple[bytes, dict[str, bytes]]:
+def _extract_base64_fields(
+    raw: bytes, fields: Mapping[str, bytes]
+) -> tuple[bytes, dict[str, bytes]]:
     """Copy large base64 values out and remove them from JSON in one pass."""
     spans: list[tuple[int, int]] = []
     extracted: dict[str, bytes] = {}
@@ -171,22 +175,33 @@ def parse_generate_response(raw: bytes) -> dict[str, Any]:
 def _parse_completion_ids(choice: Mapping[str, Any]) -> list[int]:
     raw_completion_ids = choice.get("token_ids")
     if not isinstance(raw_completion_ids, list):
-        raise MalformedGenerateResponseError("Engine response choice.token_ids must be a list.")
+        raise MalformedGenerateResponseError(
+            "Engine response choice.token_ids must be a list."
+        )
     if any(
-        isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0 for token_id in raw_completion_ids
+        isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0
+        for token_id in raw_completion_ids
     ):
-        raise MalformedGenerateResponseError("Engine response choice.token_ids must contain non-negative integers.")
+        raise MalformedGenerateResponseError(
+            "Engine response choice.token_ids must contain non-negative integers."
+        )
     return raw_completion_ids
 
 
-def _parse_completion_logprobs(choice: Mapping[str, Any], completion_ids: list[int]) -> list[float]:
+def _parse_completion_logprobs(
+    choice: Mapping[str, Any], completion_ids: list[int]
+) -> list[float]:
     raw_logprobs = choice.get("logprobs")
     if not isinstance(raw_logprobs, Mapping):
-        raise MalformedGenerateResponseError("Engine response choice.logprobs must be an object.")
+        raise MalformedGenerateResponseError(
+            "Engine response choice.logprobs must be an object."
+        )
 
     content = raw_logprobs.get("content")
     if not isinstance(content, list):
-        raise MalformedGenerateResponseError("Engine response choice.logprobs.content must be a list.")
+        raise MalformedGenerateResponseError(
+            "Engine response choice.logprobs.content must be a list."
+        )
     if len(content) != len(completion_ids):
         raise MalformedGenerateResponseError(
             "Engine response completion token count "
@@ -196,7 +211,9 @@ def _parse_completion_logprobs(choice: Mapping[str, Any], completion_ids: list[i
     completion_logprobs: list[float] = []
     for index, entry in enumerate(content):
         if not isinstance(entry, Mapping):
-            raise MalformedGenerateResponseError(f"Engine response choice.logprobs.content[{index}] must be an object.")
+            raise MalformedGenerateResponseError(
+                f"Engine response choice.logprobs.content[{index}] must be an object."
+            )
         expected_token = f"token_id:{completion_ids[index]}"
         if entry.get("token") != expected_token:
             raise MalformedGenerateResponseError(
@@ -313,12 +330,16 @@ async def generate(
             rendered,
         )
 
-    prompt_ids, stop_token_ids, mm_data, prompt_attr = await _maybe_offload(renderer, _prepare)
+    prompt_ids, stop_token_ids, mm_data, prompt_attr = await _maybe_offload(
+        renderer, _prepare
+    )
 
     if max_prompt_len is None:
         max_prompt_len = await _resolve_max_prompt_len(client, model)
     if max_prompt_len is not None and len(prompt_ids) > max_prompt_len:
-        raise OverlongPromptError(prompt_len=len(prompt_ids), max_prompt_len=max_prompt_len)
+        raise OverlongPromptError(
+            prompt_len=len(prompt_ids), max_prompt_len=max_prompt_len
+        )
 
     sp: dict[str, Any] = dict(sampling_params or {})
     sp["stop_token_ids"] = stop_token_ids
@@ -330,15 +351,19 @@ async def generate(
         "token_ids": prompt_ids,
         "sampling_params": sp,
     }
-    features = _build_mm_features(renderer, mm_data) if mm_data and not mm_data.is_empty() else None
+    features = (
+        _build_mm_features(renderer, mm_data)
+        if mm_data and not mm_data.is_empty()
+        else None
+    )
     if features is not None:
         body["features"] = features
     if cache_salt is not None:
         body["cache_salt"] = cache_salt
     if kv_session_key is not None:
-        body["kv_session_key"] = kv_session_key
         if kv_continuation_expected is None:
             raise ValueError("kv_session_key requires kv_continuation_expected")
+        body["kv_session_key"] = kv_session_key
         body["kv_continuation_expected"] = kv_continuation_expected
     if priority is not None:
         body["priority"] = priority
@@ -368,7 +393,9 @@ async def generate(
 
     completion_logprobs = _parse_completion_logprobs(choice, completion_ids)
 
-    parsed = await _maybe_offload(renderer, lambda: renderer.parse_response(completion_ids, tools=tools))
+    parsed = await _maybe_offload(
+        renderer, lambda: renderer.parse_response(completion_ids, tools=tools)
+    )
 
     routed_experts = choice.get("routed_experts")
     kept_tokens = choice.get("kept_tokens")
@@ -382,7 +409,9 @@ async def generate(
     # ``parsed.tool_calls`` so verifiers can inspect them, but they don't
     # trigger the tool-loop continuation.
     finish_reason = choice.get("finish_reason")
-    ok_tool_calls = [tc for tc in parsed.tool_calls if tc.status == ToolCallParseStatus.OK]
+    ok_tool_calls = [
+        tc for tc in parsed.tool_calls if tc.status == ToolCallParseStatus.OK
+    ]
     if ok_tool_calls and finish_reason == "stop":
         finish_reason = "tool_calls"
 
@@ -437,19 +466,24 @@ def _build_mm_features(
     (``MultiModalData``) is already framework-agnostic and does not need
     to change. Don't pre-build the abstraction with one engine in tree.
     """
+    from renderers.gemma4 import Gemma4Renderer
     from renderers.qwen3_vl import Qwen3VLRenderer
     from renderers.qwen35 import Qwen35Renderer
 
     # Type dispatch only needs the renderer class. Pools expose
     # ``renderer_cls`` as a snapshot attribute, so we don't have to check
     # out a slot just to read ``type(r)``.
-    renderer_cls = renderer.renderer_cls if isinstance(renderer, RendererPool) else type(renderer)
+    renderer_cls = (
+        renderer.renderer_cls if isinstance(renderer, RendererPool) else type(renderer)
+    )
 
     # Qwen3-VL and Qwen3.5 both ship ``pixel_values`` + ``image_grid_thw``
     # via the shared Qwen2-VL field factory. ``spatial_merge_size=2`` is
     # the family default and matches every Qwen-VL processor in tree.
     if issubclass(renderer_cls, (Qwen3VLRenderer, Qwen35Renderer)):
         return _build_qwen_vl_features(mm_data, spatial_merge_size=2)
+    if issubclass(renderer_cls, Gemma4Renderer):
+        return _build_gemma4_features(mm_data)
 
     raise NotImplementedError(
         f"Multimodal serialization not implemented for {renderer_cls.__name__}. "
@@ -457,7 +491,72 @@ def _build_mm_features(
     )
 
 
-def _build_qwen_vl_features(mm_data: MultiModalData, *, spatial_merge_size: int) -> dict[str, Any]:
+def _build_gemma4_features(mm_data: MultiModalData) -> dict[str, Any]:
+    """vLLM features payload for Gemma 4 image inputs.
+
+    Hugging Face names the position field ``image_position_ids`` while
+    vLLM's Gemma 4 processor schema calls it ``pixel_position_ids``. Keep
+    renderer output faithful to the HF processor and translate at this
+    engine-specific boundary.
+    """
+    try:
+        import torch
+        from transformers.feature_extraction_utils import BatchFeature
+        from vllm.entrypoints.scale_out.token_in_token_out.mm_serde import (
+            encode_mm_kwargs_item,
+        )
+        from vllm.multimodal.inputs import (
+            MultiModalFieldConfig,
+            MultiModalKwargsItems,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "Gemma 4 multimodal generate via /inference/v1/generate requires "
+            "a vLLM release with Gemma 4 support and `torch`."
+        ) from exc
+
+    out: dict[str, Any] = {
+        "mm_hashes": {},
+        "mm_placeholders": {},
+        "kwargs_data": {},
+    }
+    image_items = mm_data.mm_items.get("image") or []
+    if image_items:
+        pixel_values = torch.cat(
+            [torch.as_tensor(item["pixel_values"]) for item in image_items], dim=0
+        )
+        pixel_position_ids = torch.cat(
+            [torch.as_tensor(item["image_position_ids"]) for item in image_items],
+            dim=0,
+        )
+        hf_inputs = BatchFeature(
+            data={
+                "pixel_values": pixel_values,
+                "pixel_position_ids": pixel_position_ids,
+            }
+        )
+        field_config = {
+            "pixel_values": MultiModalFieldConfig.batched("image"),
+            "pixel_position_ids": MultiModalFieldConfig.batched("image"),
+        }
+        kwargs_items = MultiModalKwargsItems.from_hf_inputs(hf_inputs, field_config)
+        out["kwargs_data"]["image"] = [
+            encode_mm_kwargs_item(item) for item in kwargs_items["image"]
+        ]
+        out["mm_hashes"]["image"] = list(mm_data.mm_hashes.get("image") or [])
+        out["mm_placeholders"]["image"] = [
+            {"offset": placeholder.offset, "length": placeholder.length}
+            for placeholder in mm_data.mm_placeholders.get("image") or []
+        ]
+
+    if not any(out["kwargs_data"].values()):
+        out["kwargs_data"] = None
+    return out
+
+
+def _build_qwen_vl_features(
+    mm_data: MultiModalData, *, spatial_merge_size: int
+) -> dict[str, Any]:
     """vLLM features payload for the Qwen-VL family (Qwen2-VL / Qwen3-VL).
 
     Stacks per-image processor outputs back into a batched ``BatchFeature``,
@@ -494,16 +593,23 @@ def _build_qwen_vl_features(mm_data: MultiModalData, *, spatial_merge_size: int)
         # mm_items now ship numpy arrays (the renderer is torch-free);
         # convert at this vLLM-glue boundary where torch is already a
         # hard dependency.
-        pixel_values = torch.cat([torch.as_tensor(it["pixel_values"]) for it in image_items], dim=0)
-        image_grid_thw = torch.cat([torch.as_tensor(it["image_grid_thw"]) for it in image_items], dim=0)
-        hf_inputs = BatchFeature(data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw})
+        pixel_values = torch.cat(
+            [torch.as_tensor(it["pixel_values"]) for it in image_items], dim=0
+        )
+        image_grid_thw = torch.cat(
+            [torch.as_tensor(it["image_grid_thw"]) for it in image_items], dim=0
+        )
+        hf_inputs = BatchFeature(
+            data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw}
+        )
         config = _create_qwen2vl_field_factory(spatial_merge_size)(hf_inputs)
         kwargs_items = MultiModalKwargsItems.from_hf_inputs(hf_inputs, config)
         encoded = [encode_mm_kwargs_item(it) for it in kwargs_items["image"]]
         out["kwargs_data"]["image"] = encoded
         out["mm_hashes"]["image"] = list(mm_data.mm_hashes.get("image") or [])
         out["mm_placeholders"]["image"] = [
-            {"offset": p.offset, "length": p.length} for p in mm_data.mm_placeholders.get("image") or []
+            {"offset": p.offset, "length": p.length}
+            for p in mm_data.mm_placeholders.get("image") or []
         ]
 
     # If kwargs_data is empty across all modalities, drop the key so vLLM

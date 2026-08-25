@@ -40,7 +40,7 @@ next_prompt_ids = r.bridge_to_next_turn(
 )
 ```
 
-Hand-coded renderers ship for `qwen3`, `qwen3-vl`, `qwen3.5`, `qwen3.6`, `glm-5`, `glm-5.1`, `glm-4.5`, `minimax-m2`, `deepseek-v3`, `deepseek-r1`, `kimi-k2`, `kimi-k2.5` / `kimi-k2.6`, `laguna-xs.2`, `laguna-xs-2.1`, `laguna-m.1`, `nemotron-3`, `nemotron-3-ultra`, `llama-3`, `gpt-oss`, `hy3`, and `prime-qwen3`. Anything else falls back to `DefaultRenderer`, a generic `apply_chat_template` wrapper.
+Hand-coded renderers ship for `qwen3`, `qwen3-vl`, `qwen3.5`, `qwen3.6`, `qwen3.8`, `gemma4`, `glm-5`, `glm-5.1`, `glm-4.5`, `minimax-m2`, `deepseek-v3`, `deepseek-r1`, `kimi-k2`, `kimi-k2.5` / `kimi-k2.6`, `laguna-xs.2`, `laguna-xs-2.1`, `laguna-s-2.1`, `laguna-m.1`, `nemotron-3`, `nemotron-3-ultra`, `nemotron-3.5`, `llama-3`, `gpt-oss`, `hy3`, `inkling` / `inkling-small`, and `prime-qwen3`. Anything else falls back to `DefaultRenderer`, a generic `apply_chat_template` wrapper. `qwen3-vl`, `qwen3.5`, `qwen3.6`, `qwen3.8`, `gemma4`, `kimi-k2.5` / `kimi-k2.6`, and the Inkling checkpoints are multimodal (Inkling handles both image **and** audio).
 
 ## API
 
@@ -143,7 +143,7 @@ renderer = create_renderer(
 
 Discriminated union: every per-renderer config is a variant of `RendererConfig`, dispatched on the `name` field. Bogus combinations (e.g. `add_vision_id` under `name="qwen3"`) error at construction with a `pydantic.ValidationError`. Downstream pydantic configs (prime-rl orchestrator, verifiers `ClientConfig`) hold a single field typed as `RendererConfig` and inherit the same strict-per-variant validation.
 
-When `chat_template_kwargs` is passed with `config=None` / `AutoRendererConfig`, renderers first resolves the concrete renderer from the model name, then validates those kwargs against that renderer's config. `Auto + unknown model + chat_template_kwargs` fails loudly; use an explicit typed config or explicit `DefaultRendererConfig` for opaque fallback templates.
+When `chat_template_kwargs` is passed with `config=None` / `AutoRendererConfig`, renderers first resolves the concrete renderer from the model name, then validates each key against that renderer's explicit template-kwarg allowlist. Renderer-only fields such as `image_cache_max` must be passed through the typed config instead. `Auto + unknown model + chat_template_kwargs` fails loudly; use an explicit typed config or explicit `DefaultRendererConfig` for opaque fallback templates.
 
 One shared behaviour flag lives on typed renderer configs: `thinking_retention`, an optional bridge-policy override. Leave it unset to derive bridge behaviour from the chat template and its renderer-exposed kwargs.
 
@@ -151,7 +151,7 @@ One shared behaviour flag lives on typed renderer configs: `thinking_retention`,
 - `thinking_retention="tool_cycle"` — bridge within the in-flight tool cycle; a new user query falls back to a full re-render.
 - `thinking_retention="all"` — bridge across user-query boundaries when the bridge is otherwise structurally valid.
 
-Generic `thinking_retention` does **not** change full `render()` output: a full re-render always follows the Python chat-template implementation. Only real template knobs can change full-render thinking behaviour. GLM-5 `clear_thinking=False`, Nemotron-3 `truncate_history_thinking=False`, Qwen3.6 `preserve_thinking=True`, and GPT-OSS `auto_drop_analysis=False` all imply bridge policy `"all"`; no-thinking generation knobs also imply `"all"` when `thinking_retention` is unset. Setting a direct keep/drop template knob and a contradictory `thinking_retention` raises at config-load. The full per-renderer mapping lives in [`docs/renderer-config.md`](docs/renderer-config.md).
+Generic `thinking_retention` does **not** change full `render()` output: a full re-render always follows the Python chat-template implementation. Only real template knobs can change full-render thinking behaviour. GLM-5 `clear_thinking=False`, Nemotron-3 `truncate_history_thinking=False`, Qwen3.6 `preserve_thinking=True`, Gemma 4 `preserve_thinking=True`, and GPT-OSS `auto_drop_analysis=False` all imply bridge policy `"all"`. Some renderers also derive `"all"` from disabled generation-time thinking; Gemma 4 deliberately does not. Setting a direct keep/drop template knob and a contradictory `thinking_retention` raises at config-load. The full per-renderer mapping lives in [`docs/renderer-config.md`](docs/renderer-config.md).
 
 ## `DefaultRenderer`
 
@@ -159,7 +159,7 @@ Fallback for unsupported text-only models. Wraps `apply_chat_template` and accep
 
 ## Roadmap
 
-- **VLM expansion.** `ImagePart` support exists for Qwen3-VL and Qwen3.5-family multimodal templates. Remaining work: video support, broader VLM coverage, and more RL validation.
+- **VLM expansion.** `ImagePart` support exists for Qwen3-VL, Qwen3.5-family, Gemma 4, and Kimi K2.5 / K2.6 multimodal templates. Remaining work: audio/video support, broader VLM coverage, and more RL validation. Gemma 4 image preprocessing requires a Transformers release that provides `Gemma4Processor`.
 - **Patched chat templates.** Some shipped templates re-tokenize history or normalize JSON in ways that break token identity. Plan: a `use_patched` opt-in per renderer that renders the same surface form while avoiding known-bad patterns. (Auto-stripping thinking from past turns is *not* one of these — that's intended template behaviour the renderer reproduces; use `thinking_retention` to override it.)
 
 ## Testing

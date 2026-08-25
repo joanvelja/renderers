@@ -47,6 +47,8 @@ _RENDERER_MODELS = [
     ("Qwen/Qwen3-8B", "auto"),
     ("Qwen/Qwen3.5-9B", "auto"),
     ("Qwen/Qwen3.6-35B-A3B", "auto"),
+    ("Qwen/Qwen3.8-27B", "auto"),
+    ("google/gemma-4-31B-it", "auto"),
     ("zai-org/GLM-5", "auto"),
     ("zai-org/GLM-5.1", "auto"),
     ("zai-org/GLM-4.7-Flash", "auto"),
@@ -63,10 +65,16 @@ _RENDERER_MODELS = [
     # Ultra: auto-resolves to the ``nemotron-3-ultra`` config via the model
     # name; parity asserted against the Ultra apply_chat_template (``medium_effort``).
     ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", "auto"),
+    # Nemotron 3.5 (Lightning): Ultra's template minus the effort kwarg — its
+    # config declares only ``enable_thinking`` / ``truncate_history_thinking``.
+    ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "auto"),
     ("poolside/Laguna-XS.2", "auto"),
     ("poolside/Laguna-M.1", "auto"),
     ("poolside/Laguna-XS-2.1", "auto"),
+    ("poolside/Laguna-S-2.1", "auto"),
     ("tencent/Hy3", "auto"),
+    ("thinkingmachines/Inkling", "auto"),
+    ("thinkingmachines/Inkling-Small", "auto"),
     ("openai/gpt-oss-20b", "gpt-oss"),
     ("google/gemma-4-E2B-it", "auto"),
 ]
@@ -87,7 +95,7 @@ _KWARG_VALUES: dict[str, list[Any]] = {
     # gpt-oss accepts low/medium/high; Hy3 accepts no_think/low/high. The
     # union is listed here and the matrix builder drops values a given
     # renderer's typed config rejects (see ``_value_valid_for``).
-    "reasoning_effort": ["no_think", "low", "medium", "high"],
+    "reasoning_effort": ["no_think", "low", "medium", "high", "xhigh"],
     # Hy3 — keep <think>{reasoning}</think> on historical assistant turns
     # (True) vs collapse past-cycle reasoning to <think></think> (False).
     "preserved_thinking": [True, False],
@@ -125,10 +133,11 @@ _KWARG_VALUES: dict[str, list[Any]] = {
     # passthrough mode. The renderer paths diverge significantly under
     # this flag, so both values are exercised.
     "render_assistant_messages_raw": [True, False],
-    # Qwen3.5 / Qwen3.6 / Qwen3-VL — when True, prefix each image /
-    # video placeholder with ``Picture N: `` / ``Video N: ``.
+    # Qwen3.5 / Qwen3.6 / Qwen3.8 / Qwen3-VL — when True, prefix each
+    # image / video placeholder with ``Picture N: `` / ``Video N: ``.
     "add_vision_id": [True, False],
-    # Qwen3.6 — keep historical think blocks before the last real user query.
+    # Qwen3.6 / Qwen3.8 — keep historical think blocks before the last real
+    # user query. Qwen3.8 defaults this to True.
     "preserve_thinking": [True, False],
     # gpt-oss — pin to a fixed date so the renderer's preamble matches
     # the harmony oracle built with the same date. The default
@@ -421,25 +430,32 @@ def test_chat_template_kwarg_parity_hf(
     assert kwarg in type(renderer.config).template_field_names()
 
     # Documented deviation: with ``enable_thinking=False`` the Qwen family
-    # re-emits the empty ``<think>\n\n</think>\n\n`` wrapper on historical
-    # assistant turns without reasoning_content, where the Jinja template
-    # strips it. The generation prompt prefills the wrapper, so stripping
-    # it on re-render would make the sampled stream and the re-render of
+    # and Gemma 4's 26B/31B template revision re-emit their empty thought
+    # wrappers on historical assistant turns without reasoning_content, where
+    # the Jinja template strips them. The generation prompt prefills the
+    # wrapper, so stripping it on re-render would make the sampled stream and
+    # the re-render of
     # the same conversation disagree at the token level. ``multi_turn`` is
     # the only shape with such a turn — except on qwen3, whose template
     # window additionally requires ``is_last or reasoning_content``, so its
     # non-last tool-call turn in ``tool_cycle`` is stripped too. Stability
     # is pinned in ``test_disabled_thinking_stability.py``.
     resolved = _resolve_renderer_name(model, renderer_name)
-    deviating_shapes = (
+    qwen_deviating_shapes = (
         ("multi_turn", "tool_cycle") if resolved == "qwen3" else ("multi_turn",)
     )
-    if (
+    qwen_deviation = (
         resolved in ("qwen3", "qwen3.5", "qwen3.6")
         and kwarg == "enable_thinking"
         and value is False
-        and shape_id in deviating_shapes
-    ):
+        and shape_id in qwen_deviating_shapes
+    )
+    gemma4_deviation = (
+        resolved == "gemma4"
+        and not renderer.config.enable_thinking
+        and shape_id in ("single_turn", "multi_turn", "tool_cycle")
+    )
+    if qwen_deviation or gemma4_deviation:
         pytest.skip(
             "deliberate template deviation: empty think wrapper kept on "
             "historical turns for sampled-token stability"

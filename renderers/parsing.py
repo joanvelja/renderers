@@ -362,252 +362,6 @@ def parse_qwen35(
     )
 
 
-# ── Gemma 4: <|tool_call>call:name{arg:<|"|>value<|"|>}<tool_call|> ─────
-
-
-def parse_gemma4(
-    tokenizer,
-    token_ids: list[int],
-    *,
-    stop_ids: set[int],
-    tool_call_id: int,
-    tool_call_end_id: int,
-) -> ParsedResponse:
-    ids = _strip_stop_tokens(token_ids, stop_ids)
-
-    content_parts: list[str] = []
-    tool_calls: list[ParsedToolCall] = []
-    i = 0
-    while i < len(ids):
-        tc_start = _find(ids, tool_call_id, i)
-        if tc_start == -1:
-            content_parts.append(_decode(tokenizer, ids[i:]))
-            break
-        content_parts.append(_decode(tokenizer, ids[i:tc_start]))
-        tc_end = _find(ids, tool_call_end_id, tc_start + 1)
-        if tc_end == -1:
-            raw = _decode(tokenizer, ids[tc_start + 1 :]).strip()
-            tool_calls.append(
-                ParsedToolCall(
-                    raw=raw,
-                    token_span=(tc_start, len(ids)),
-                    status=ToolCallParseStatus.UNCLOSED_BLOCK,
-                )
-            )
-            break
-        raw = _decode(tokenizer, ids[tc_start + 1 : tc_end]).strip()
-        tool_calls.append(_parse_gemma4_tool_call(raw, (tc_start, tc_end + 1)))
-        i = tc_end + 1
-
-    text = "".join(content_parts)
-    prefix = "<|turn>model\n"
-    if text.startswith(prefix):
-        text = text[len(prefix) :]
-    visible, reasoning = _extract_gemma4_reasoning(text)
-    return ParsedResponse(
-        content=visible.strip(),
-        reasoning_content=reasoning,
-        tool_calls=tool_calls,
-    )
-
-
-def _extract_gemma4_reasoning(text: str) -> tuple[str, str | None]:
-    start_token = "<|channel>"
-    thought_prefix = "<|channel>thought\n"
-    end_token = "<channel|>"
-    visible: list[str] = []
-    reasoning: list[str] = []
-    i = 0
-    while i < len(text):
-        start = text.find(start_token, i)
-        if start == -1:
-            visible.append(text[i:])
-            break
-        visible.append(text[i:start])
-        end = text.find(end_token, start + len(start_token))
-        if end == -1:
-            visible.append(text[start:])
-            break
-        block = text[start : end + len(end_token)]
-        if block.startswith(thought_prefix):
-            body = block[len(thought_prefix) : -len(end_token)]
-            reasoning.append(body.removesuffix("\n"))
-        i = end + len(end_token)
-    return "".join(visible), "\n".join(reasoning) if reasoning else None
-
-
-def _parse_gemma4_tool_call(raw: str, token_span: tuple[int, int]) -> ParsedToolCall:
-    prefix = "call:"
-    if not raw.startswith(prefix):
-        return ParsedToolCall(
-            raw=raw,
-            token_span=token_span,
-            status=ToolCallParseStatus.MALFORMED_STRUCTURE,
-        )
-
-    name_start = len(prefix)
-    args_start = raw.find("{", name_start)
-    if args_start == -1 or not raw.endswith("}"):
-        name = raw[name_start:] or None
-        return ParsedToolCall(
-            raw=raw,
-            name=name,
-            token_span=token_span,
-            status=ToolCallParseStatus.MALFORMED_STRUCTURE,
-        )
-    name = raw[name_start:args_start].strip()
-    if not name:
-        return ParsedToolCall(
-            raw=raw,
-            arguments={},
-            token_span=token_span,
-            status=ToolCallParseStatus.MISSING_NAME,
-        )
-
-    parser = _Gemma4DslParser(raw[args_start:])
-    try:
-        arguments = parser.parse_object()
-        parser.expect_end()
-    except ValueError:
-        return ParsedToolCall(
-            raw=raw,
-            name=name,
-            token_span=token_span,
-            status=ToolCallParseStatus.INVALID_JSON,
-        )
-
-    return ParsedToolCall(
-        raw=raw,
-        name=name,
-        arguments=arguments,
-        token_span=token_span,
-        status=ToolCallParseStatus.OK,
-    )
-
-
-class _Gemma4DslParser:
-    _quote = '<|"|>'
-
-    def __init__(self, text: str):
-        self.text = text
-        self.i = 0
-
-    def expect_end(self) -> None:
-        self._skip_ws()
-        if self.i != len(self.text):
-            raise ValueError("trailing bytes")
-
-    def parse_object(self) -> dict[str, Any]:
-        self._consume("{")
-        out: dict[str, Any] = {}
-        self._skip_ws()
-        if self._peek("}"):
-            self.i += 1
-            return out
-        while True:
-            key = self._parse_key()
-            self._consume(":")
-            out[key] = self._parse_value()
-            self._skip_ws()
-            if self._peek("}"):
-                self.i += 1
-                return out
-            self._consume(",")
-
-    def _parse_array(self) -> list[Any]:
-        self._consume("[")
-        out: list[Any] = []
-        self._skip_ws()
-        if self._peek("]"):
-            self.i += 1
-            return out
-        while True:
-            out.append(self._parse_value())
-            self._skip_ws()
-            if self._peek("]"):
-                self.i += 1
-                return out
-            self._consume(",")
-
-    def _parse_value(self) -> Any:
-        self._skip_ws()
-        if self._peek(self._quote):
-            return self._parse_quoted()
-        if self._peek('"'):
-            return self._parse_json_string()
-        if self._peek("{"):
-            return self.parse_object()
-        if self._peek("["):
-            return self._parse_array()
-        token = self._parse_atom()
-        if token == "true":
-            return True
-        if token == "false":
-            return False
-        if token in {"null", "None"}:
-            return None
-        try:
-            return int(token)
-        except ValueError:
-            pass
-        try:
-            return float(token)
-        except ValueError:
-            return token
-
-    def _parse_quoted(self) -> str:
-        self._consume(self._quote)
-        end = self.text.find(self._quote, self.i)
-        if end == -1:
-            raise ValueError("unclosed quoted string")
-        value = self.text[self.i : end]
-        self.i = end + len(self._quote)
-        return value
-
-    def _parse_json_string(self) -> str:
-        value, end = json.JSONDecoder().raw_decode(self.text[self.i :])
-        if not isinstance(value, str):
-            raise ValueError("expected JSON string")
-        self.i += end
-        return value
-
-    def _parse_key(self) -> str:
-        self._skip_ws()
-        if self._peek(self._quote):
-            return self._parse_quoted()
-        if self._peek('"'):
-            return self._parse_json_string()
-        start = self.i
-        while self.i < len(self.text) and self.text[self.i] not in ":{}[],":
-            self.i += 1
-        key = self.text[start : self.i].strip()
-        if not key:
-            raise ValueError("missing key")
-        return key
-
-    def _parse_atom(self) -> str:
-        start = self.i
-        while self.i < len(self.text) and self.text[self.i] not in ",}]":
-            self.i += 1
-        token = self.text[start : self.i].strip()
-        if not token:
-            raise ValueError("missing value")
-        return token
-
-    def _consume(self, expected: str) -> None:
-        self._skip_ws()
-        if not self._peek(expected):
-            raise ValueError(f"expected {expected!r}")
-        self.i += len(expected)
-
-    def _peek(self, text: str) -> bool:
-        return self.text.startswith(text, self.i)
-
-    def _skip_ws(self) -> None:
-        while self.i < len(self.text) and self.text[self.i].isspace():
-            self.i += 1
-
-
 def _parse_xml_tool_calls(
     tokenizer,
     ids: list[int],
@@ -1913,3 +1667,135 @@ def parse_llama_3(
     # "malformed attempt" against, so it falls through to content rather
     # than producing a non-OK ParsedToolCall.
     return ParsedResponse(content=text, reasoning_content=None)
+
+
+def parse_inkling(
+    tokenizer,
+    token_ids: list[int],
+    *,
+    stop_ids: set[int],
+    message_model_id: int,
+    content_text_id: int,
+    content_thinking_id: int,
+    invoke_json_id: int,
+    invoke_text_id: int,
+    end_message_id: int,
+) -> ParsedResponse:
+    """Parse Inkling completion tokens.
+
+    Inkling's assistant turn is a sequence of ``<|end_message|>``-terminated
+    segments; the model re-emits ``<|message_model|>`` before each segment
+    after the first (the first's opener is the generation prompt). Each
+    segment is classified by its leading content marker:
+
+    - ``<|content_thinking|>{reasoning}`` → reasoning
+    - ``<|content_text|>{content}`` → visible content
+    - ``{name}<|content_invoke_tool_json|>{"name":…,"args":…}`` → tool call
+
+    Content and reasoning are decoded verbatim (the template renders them
+    without whitespace normalisation). Tool-call arguments arrive as native
+    JSON (the template ``tojson``-encodes them), so types are preserved
+    without the schema-driven coercion the XML formats need — ``tools`` is
+    accepted for signature uniformity but unused.
+
+    ``token_span`` on each ``ParsedToolCall`` is the half-open slice of the
+    stop-stripped stream covering that tool-call segment (from its leading
+    ``<|message_model|>`` through the terminating ``<|end_message|>``).
+    """
+    ids = _strip_stop_tokens(token_ids, stop_ids)
+
+    reasoning_parts: list[str] = []
+    content_parts: list[str] = []
+    tool_calls: list[ParsedToolCall] = []
+
+    pos = 0
+    n = len(ids)
+    while pos < n:
+        em = _find(ids, end_message_id, pos)
+        terminated = em != -1
+        seg_end = em if terminated else n
+        seg = ids[pos:seg_end]
+        # A non-first segment re-opens with <|message_model|>; drop it so the
+        # content marker is at the head. (The first segment's opener lives in
+        # the prompt, so it is usually already absent.)
+        s = 1 if seg and seg[0] == message_model_id else 0
+        body = seg[s:]
+
+        if not body:
+            pass
+        elif body[0] == content_thinking_id:
+            reasoning_parts.append(_decode(tokenizer, body[1:]))
+        elif body[0] == content_text_id:
+            content_parts.append(_decode(tokenizer, body[1:]))
+        else:
+            marker = _find_any(body, {invoke_json_id, invoke_text_id})
+            if marker != -1:
+                name = _decode(tokenizer, body[:marker]).strip()
+                payload = _decode(tokenizer, body[marker + 1 :])
+                tool_calls.append(
+                    _build_inkling_tool_call(
+                        name=name,
+                        payload=payload,
+                        token_span=(pos, seg_end + 1 if terminated else n),
+                        terminated=terminated,
+                    )
+                )
+            else:
+                # No content marker and no invoke marker — treat the decoded
+                # bytes as content rather than dropping them.
+                content_parts.append(_decode(tokenizer, body))
+
+        if not terminated:
+            break
+        pos = em + 1
+
+    return ParsedResponse(
+        content="".join(content_parts),
+        reasoning_content="".join(reasoning_parts) or None,
+        tool_calls=tool_calls,
+    )
+
+
+def _build_inkling_tool_call(
+    *, name: str, payload: str, token_span: tuple[int, int], terminated: bool
+) -> ParsedToolCall:
+    """Build a ``ParsedToolCall`` from an Inkling ``<|content_invoke_tool_json|>``
+    payload — ``{"name": …, "args": …}`` (native JSON, types preserved).
+
+    The function name inside the JSON is authoritative; the pre-marker text
+    (rendered as ``<|message_model|>{name}<|content_invoke_tool_json|>``) is a
+    fallback for a truncated / malformed payload.
+    """
+    parsed: Any = None
+    invalid_json = False
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        invalid_json = True
+
+    fn_name: str | None = None
+    arguments: dict[str, Any] | str | None = None
+    if isinstance(parsed, dict):
+        raw_name = parsed.get("name")
+        fn_name = raw_name if isinstance(raw_name, str) and raw_name else (name or None)
+        arguments = parsed.get("args", {})
+    else:
+        fn_name = name or None
+        arguments = payload
+
+    if not terminated:
+        status = ToolCallParseStatus.UNCLOSED_BLOCK
+    elif invalid_json:
+        status = ToolCallParseStatus.INVALID_JSON
+    elif fn_name is None:
+        status = ToolCallParseStatus.MISSING_NAME
+    else:
+        status = ToolCallParseStatus.OK
+
+    return ParsedToolCall(
+        raw=payload,
+        name=fn_name,
+        arguments=arguments,
+        token_span=token_span,
+        status=status,
+    )

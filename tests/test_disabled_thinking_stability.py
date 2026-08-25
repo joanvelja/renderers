@@ -1,4 +1,4 @@
-"""Sampled-token stability with thinking disabled (Qwen family).
+"""Sampled-token stability for renderers with disabled-thinking prefills.
 
 With ``enable_thinking=False`` the generation prompt prefills the empty
 ``<think>\\n\\n</think>\\n\\n`` wrapper, so the wrapper is part of every
@@ -12,8 +12,9 @@ any token-identity comparison on byte-identical messages.
 These tests pin the renderer-side guarantee that fixes this: with thinking
 disabled, historical assistant turns without ``reasoning_content`` re-emit
 the exact gen-prompt wrapper, so the tokens a turn was sampled with are a
-prefix of every later re-render of the grown conversation, and the bridge
-and a full re-render agree.
+prefix of every later re-render of the grown conversation. When a renderer's
+retention policy permits bridging across a user query, the bridge and full
+re-render also agree.
 
 This is a deliberate, documented deviation from ``apply_chat_template`` —
 see the carve-out in ``test_renderer_config_parity.py`` and the module
@@ -28,9 +29,11 @@ from functools import lru_cache
 from renderers import create_renderer
 from renderers.base import load_tokenizer
 from renderers.configs import (
+    Gemma4RendererConfig,
     Qwen3RendererConfig,
     Qwen35RendererConfig,
     Qwen36RendererConfig,
+    Qwen38RendererConfig,
 )
 
 # One representative model per affected renderer family, each with
@@ -39,9 +42,19 @@ _MODELS = [
     ("Qwen/Qwen3-8B", Qwen3RendererConfig(enable_thinking=False)),
     ("Qwen/Qwen3.5-9B", Qwen35RendererConfig(enable_thinking=False)),
     ("Qwen/Qwen3.6-35B-A3B", Qwen36RendererConfig(enable_thinking=False)),
+    (
+        "Qwen/Qwen3.8-27B",
+        Qwen38RendererConfig(enable_thinking=False),
+    ),
+    (
+        "google/gemma-4-26B-A4B-it",
+        Gemma4RendererConfig(enable_thinking=False),
+    ),
 ]
 
-_EMPTY_WRAPPER = "<think>\n\n</think>\n\n"
+_EMPTY_WRAPPERS = {
+    "google/gemma-4-26B-A4B-it": "<|channel>thought\n<channel|>",
+}
 
 
 @lru_cache(maxsize=None)
@@ -103,17 +116,19 @@ def test_wrapper_reemitted_on_historical_turn(dt_model, dt_config):
     )
     turn = [t for t, i in zip(rendered.token_ids, rendered.message_indices) if i == 1]
     text = tok.decode(turn)
-    assert _EMPTY_WRAPPER in text, (
+    expected_wrapper = _EMPTY_WRAPPERS.get(dt_model, "<think>\n\n</think>\n\n")
+    assert expected_wrapper in text, (
         f"{dt_model}: historical assistant turn rendered without the "
         f"prefilled empty think wrapper: {text!r}"
     )
 
 
-def test_bridge_and_rerender_agree(dt_model, dt_config):
-    """Extending a sampled turn via the bridge and re-rendering the same
-    conversation from messages must produce identical tokens — the property
-    whose violation shows up as token-level forks on byte-identical
-    trajectories."""
+def test_bridge_matches_derived_retention_policy(dt_model, dt_config):
+    """Cross-user bridging follows the renderer's derived retention policy.
+
+    When permitted, extending a sampled turn via the bridge and re-rendering
+    the same conversation from messages must produce identical tokens.
+    """
     tok = _load(dt_model)
     renderer = create_renderer(tok, dt_config)
 
@@ -126,9 +141,12 @@ def test_bridge_and_rerender_agree(dt_model, dt_config):
     reminder = {"role": "user", "content": "You are running low on budget."}
 
     bridged = renderer.bridge_to_next_turn(prompt_ids, completion_ids, [reminder])
+    if renderer.effective_thinking_retention != "all":
+        assert bridged is None
+        return
+
     assert bridged is not None, (
-        f"{dt_model}: bridge refused with thinking disabled (implied "
-        "thinking_retention='all' should allow it)"
+        f"{dt_model}: bridge refused despite derived thinking_retention='all'"
     )
 
     rerender = renderer.render_ids(

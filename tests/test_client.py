@@ -33,12 +33,16 @@ class _FakeRenderer:
         )
 
     def render_ids(self, messages, *, tools=None, add_generation_prompt=False):
-        return self.render(messages, tools=tools, add_generation_prompt=add_generation_prompt).token_ids
+        return self.render(
+            messages, tools=tools, add_generation_prompt=add_generation_prompt
+        ).token_ids
 
     def get_stop_token_ids(self):
         return [99]
 
-    def parse_response(self, completion_ids: list[int], *, tools=None) -> ParsedResponse:
+    def parse_response(
+        self, completion_ids: list[int], *, tools=None
+    ) -> ParsedResponse:
         assert completion_ids == [7, 8]
         # Stores tools so tests can assert the client plumbed them through.
         self._last_parse_tools = tools
@@ -82,7 +86,9 @@ class _FakeClient:
         }
 
     async def post(self, path, *, cast_to=dict, body=None, options=None):
-        self.calls.append({"path": path, "cast_to": cast_to, "body": body, "options": options})
+        self.calls.append(
+            {"path": path, "cast_to": cast_to, "body": body, "options": options}
+        )
         payload = {
             "request_id": "gen-test",
             "choices": [self.choice],
@@ -125,7 +131,9 @@ def test_generate_builds_request_body_and_parses_response():
 
     # The client must plumb `tools` through to parse_response so XML-style
     # parsers can preserve declared-string args verbatim.
-    assert renderer._last_parse_tools == [{"type": "function", "function": {"name": "echo"}}]
+    assert renderer._last_parse_tools == [
+        {"type": "function", "function": {"name": "echo"}}
+    ]
 
     assert len(client.calls) == 1
     # /inference/v1/generate is mounted at the server root, so we post to
@@ -301,7 +309,9 @@ def test_generate_preserves_zero_completion_logprob():
 class _MalformedToolRenderer(_FakeRenderer):
     """Returns only a malformed tool-call attempt — finish_reason must stay "stop"."""
 
-    def parse_response(self, completion_ids: list[int], *, tools=None) -> ParsedResponse:
+    def parse_response(
+        self, completion_ids: list[int], *, tools=None
+    ) -> ParsedResponse:
         return ParsedResponse(
             content="",
             reasoning_content=None,
@@ -409,10 +419,13 @@ def test_generate_threads_prompt_attribution_through_prebuilt_prompt_path():
     [
         ("Qwen/Qwen3-VL-4B-Instruct", "renderers.qwen3_vl:Qwen3VLRenderer"),
         ("Qwen/Qwen3.5-2B", "renderers.qwen35:Qwen35Renderer"),
+        ("Qwen/Qwen3.8-27B", "renderers.qwen38:Qwen38Renderer"),
     ],
-    ids=["qwen3_vl", "qwen35"],
+    ids=["qwen3_vl", "qwen35", "qwen38"],
 )
-def test_generate_serializes_multimodal_features_for_qwen_vl_family(model_id, renderer_class_path):
+def test_generate_serializes_multimodal_features_for_qwen_vl_family(
+    model_id, renderer_class_path
+):
     """When the renderer emits ``MultiModalData``, ``generate`` translates
     it into vLLM's ``features`` payload (mm_hashes + mm_placeholders +
     base64-encoded kwargs_data) and sticks it in the request body. Covers
@@ -491,6 +504,65 @@ def test_generate_serializes_multimodal_features_for_qwen_vl_family(model_id, re
     # Items are base64 strings (encode_mm_kwargs_item output).
     for item in features["kwargs_data"]["image"]:
         assert isinstance(item, str) and len(item) > 0
+
+
+def test_generate_serializes_multimodal_features_for_gemma4():
+    """Gemma 4's HF image positions are translated to vLLM's field name."""
+    pytest.importorskip("torch")
+    pytest.importorskip("vllm", reason="vllm needed for features serialization")
+
+    import torch as _torch
+    from renderers.base import MultiModalData, PlaceholderRange, load_tokenizer
+    from renderers.gemma4 import Gemma4Renderer
+
+    renderer = Gemma4Renderer(load_tokenizer("google/gemma-4-31B-it"))
+    mm_data = MultiModalData(
+        mm_hashes={"image": ["aaa", "bbb"]},
+        mm_placeholders={
+            "image": [
+                PlaceholderRange(offset=5, length=2),
+                PlaceholderRange(offset=12, length=2),
+            ]
+        },
+        mm_items={
+            "image": [
+                {
+                    "pixel_values": _torch.zeros(1, 4, 8),
+                    "image_position_ids": _torch.zeros(1, 4, 2, dtype=_torch.int64),
+                },
+                {
+                    "pixel_values": _torch.zeros(1, 4, 8),
+                    "image_position_ids": _torch.zeros(1, 4, 2, dtype=_torch.int64),
+                },
+            ]
+        },
+    )
+
+    client = _FakeClient()
+    asyncio.run(
+        generate(
+            client=client,
+            renderer=renderer,
+            messages=[],
+            model="gemma4",
+            prompt_ids=list(range(20)),
+            multi_modal_data=mm_data,
+            sampling_params={"max_tokens": 4},
+        )
+    )
+
+    features = client.calls[0]["body"]["features"]
+    assert features["mm_hashes"] == {"image": ["aaa", "bbb"]}
+    assert features["mm_placeholders"] == {
+        "image": [
+            {"offset": 5, "length": 2},
+            {"offset": 12, "length": 2},
+        ]
+    }
+    assert len(features["kwargs_data"]["image"]) == 2
+    assert all(
+        isinstance(item, str) and item for item in features["kwargs_data"]["image"]
+    )
 
 
 # ---------------------------------------------------------------------------

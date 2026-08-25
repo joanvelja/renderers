@@ -32,7 +32,11 @@ _ROUNDTRIP_MODELS = [
     ("PrimeIntellect/Qwen3-0.6B", "auto"),
     ("Qwen/Qwen3.5-9B", "auto"),
     ("Qwen/Qwen3.6-35B-A3B", "auto"),
+    ("Qwen/Qwen3.8-27B", "auto"),
     ("Qwen/Qwen3-VL-4B-Instruct", "auto"),
+    ("google/gemma-4-31B-it", "auto"),
+    ("thinkingmachines/Inkling", "auto"),
+    ("thinkingmachines/Inkling-Small", "auto"),
     ("zai-org/GLM-5", "auto"),
     ("zai-org/GLM-5.1", "auto"),
     ("zai-org/GLM-4.7-Flash", "auto"),
@@ -46,6 +50,8 @@ _ROUNDTRIP_MODELS = [
     # Ultra: parse must recover content after a </think> glued directly to it
     # (no separating newline) — the Ultra-specific glue stresses the round-trip.
     ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", "auto"),
+    # Nemotron 3.5 (Lightning): same glue as Ultra, distinct renderer class.
+    ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "auto"),
     ("poolside/Laguna-XS.2", "auto"),
     ("poolside/Laguna-M.1", "auto"),
     # Laguna-XS-2.1 is deliberately absent: under the default
@@ -55,7 +61,6 @@ _ROUNDTRIP_MODELS = [
     ("tencent/Hy3", "auto"),
     ("unsloth/Llama-3.2-1B-Instruct", "llama-3"),
     ("openai/gpt-oss-20b", "gpt-oss"),
-    ("google/gemma-4-E2B-it", "auto"),
     ("Qwen/Qwen2.5-0.5B-Instruct", "default"),
 ]
 

@@ -52,6 +52,7 @@ def _config_with_add_vision_id(model_name: str, add_vision_id: bool):
 pytest.importorskip("PIL", reason="Pillow required for multimodal tests")
 pytest.importorskip("torch", reason="torch required for multimodal tests")
 
+import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
 
@@ -120,7 +121,9 @@ def _load_processor_and_renderer(model_name: str):
         revision = _PROCESSOR_TRUSTED_REVISIONS.get(model_name)
         if revision is not None:
             processor = AutoProcessor.from_pretrained(
-                model_name, trust_remote_code=True, revision=revision
+                model_name,
+                trust_remote_code=True,
+                revision=revision,
             )
         else:
             processor = AutoProcessor.from_pretrained(model_name)
@@ -167,11 +170,22 @@ def _detect_family(model_name: str) -> str:
     - ``kimi_k25``: ``processor(messages=..., return_tensors=...)`` (does
       template + image preprocessing in one call), content parts shaped
       ``{"type": "image_url", "image_url": <PIL>}``.
+    - ``gemma4``: canonical Gemma turn grammar plus dynamic
+      ``<|image>`` + N x ``<|image|>`` + ``<image|>`` expansion.
     """
     if model_name.startswith("moonshotai/Kimi-K2.5") or model_name.startswith(
         "moonshotai/Kimi-K2.6"
     ):
         return "kimi_k25"
+    if model_name.startswith("google/gemma-4-"):
+        return "gemma4"
+    if model_name in {
+        "thinkingmachines/Inkling",
+        "thinkingmachines/Inkling-Small",
+    }:
+        # Two-step processor call like Qwen-VL — processor(images=/audio=, text=)
+        # — but different placeholder tokens and a distinct audio modality.
+        return "inkling"
     return "qwen_vl"
 
 
@@ -204,6 +218,45 @@ def _qwen_vl_processor_input_ids(processor, messages, add_gp):
     ].tolist()
 
 
+def _audio_content_part(audio):
+    return {"type": "audio", "audio": audio}
+
+
+def _inkling_audio_processor_input_ids(processor, messages, add_gp):
+    """Run Inkling's processor on audio-bearing ``messages``.
+
+    Two-step like the Qwen-VL image path, but collects audio waveforms and
+    passes them via ``audio=``. The template puts one ``<|unused_200053|>``
+    per audio placeholder; the processor expands it to one per mel frame.
+    """
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=add_gp
+    )
+    audios = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not (
+                isinstance(item, dict)
+                and item.get("type")
+                in (
+                    "audio",
+                    "input_audio",
+                    "audio_url",
+                )
+            ):
+                continue
+            for key in ("audio", "input_audio", "audio_url"):
+                if key in item:
+                    audios.append(item[key])
+                    break
+    return processor(audio=audios, text=text, return_tensors="pt")["input_ids"][
+        0
+    ].tolist()
+
+
 def _kimi_processor_input_ids(processor, messages, add_gp):
     """Run Kimi K2.5's processor on ``messages`` (one-shot template+vision).
 
@@ -218,6 +271,43 @@ def _kimi_processor_input_ids(processor, messages, add_gp):
     return out["input_ids"][0].tolist()
 
 
+def _gemma4_processor_input_ids(processor, messages, add_gp):
+    """Run Gemma 4's template followed by its dynamic image expansion."""
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=add_gp
+    )
+    images = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in ("image", "image_url") or "image" in item:
+                raw = item.get("image")
+                if raw is not None:
+                    images.append(raw)
+    out = processor(images=[images], text=[text], return_tensors="pt")
+    return out["input_ids"][0].tolist()
+
+
+def _audio_sample():
+    """A 1-second 440 Hz mono tone at 16 kHz (Inkling's expected rate)."""
+    sr = 16000
+    t = np.arange(sr, dtype=np.float32) / sr
+    return (0.1 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+
+
+def _sample_for(modality: str, tiny_image):
+    """The per-modality media item cases are built from."""
+    if modality == "image":
+        return tiny_image
+    if modality == "audio":
+        return _audio_sample()
+    raise NotImplementedError(f"No sample for modality {modality!r}.")
+
+
 def _modality_kit(modality: str, model_name: str):
     family = _detect_family(model_name)
     if modality == "image":
@@ -227,12 +317,37 @@ def _modality_kit(modality: str, model_name: str):
                 "placeholder_token": "<|media_pad|>",
                 "processor_input_ids": _kimi_processor_input_ids,
             }
+        if family == "gemma4":
+            return {
+                "make_part": _image_content_part,
+                "placeholder_token": "<|image|>",
+                "processor_input_ids": _gemma4_processor_input_ids,
+            }
+        if family == "inkling":
+            # Inkling expands the single image placeholder to ``num_patches``
+            # ``<|unused_200054|>`` tokens; the processor call matches the
+            # Qwen-VL two-step (images=, text=).
+            return {
+                "make_part": _image_content_part,
+                "placeholder_token": "<|unused_200054|>",
+                "processor_input_ids": _qwen_vl_processor_input_ids,
+            }
         # Default: Qwen-VL family (Qwen3-VL, Qwen3.5, Qwen3.6).
         return {
             "make_part": _image_content_part,
             "placeholder_token": "<|image_pad|>",
             "processor_input_ids": _qwen_vl_processor_input_ids,
         }
+    if modality == "audio":
+        if family == "inkling":
+            return {
+                "make_part": _audio_content_part,
+                "placeholder_token": "<|unused_200053|>",
+                "processor_input_ids": _inkling_audio_processor_input_ids,
+            }
+        raise NotImplementedError(
+            f"Audio test kit not implemented for family {family!r}."
+        )
     raise NotImplementedError(
         f"Test kit for modality {modality!r} not implemented yet."
     )
@@ -438,17 +553,38 @@ def _build_tool_image_cases(make_part, image):
 
 
 def _skip_for_disabled_thinking_deviation(renderer, case_id) -> bool:
-    """With ``enable_thinking=False`` (the resolved default on the small
-    Qwen3.5 sizes) the Qwen family re-emits the empty think wrapper on
-    historical assistant turns without reasoning — a documented deviation
-    from the template for sampled-token stability (see
-    ``test_disabled_thinking_stability.py``). Cases with an assistant turn
-    before the last user query therefore diverge from the processor oracle
-    by exactly those wrapper tokens; skip them for parity purposes."""
-    return getattr(renderer.config, "enable_thinking", True) is False and case_id in (
-        "multi_turn_two_images",
-        "multi_turn_tool_response_images",
+    """Skip processor parity where a disabled-thinking renderer deliberately
+    preserves a generation-prefilled empty thought wrapper on assistant history.
+
+    The Qwen family deviates only once the assistant is before a later user
+    query. Gemma 4's 26B/31B revision never re-emits its generation prefill in
+    the upstream template, so every media case containing an assistant turn is
+    affected. Sampled-token stability is covered separately.
+    """
+    from renderers.gemma4 import Gemma4Renderer
+    from renderers.qwen35 import Qwen35Renderer
+
+    qwen_deviation = (
+        isinstance(renderer, Qwen35Renderer)
+        and getattr(renderer.config, "enable_thinking", True) is False
+        and case_id
+        in (
+            "multi_turn_two_images",
+            "multi_turn_tool_response_images",
+        )
     )
+    gemma4_deviation = (
+        isinstance(renderer, Gemma4Renderer)
+        and getattr(renderer.config, "enable_thinking", True) is False
+        and case_id
+        in (
+            "multi_turn_two_images",
+            "tool_response_with_image",
+            "multi_turn_tool_response_images",
+            "consecutive_tools_mixed_media",
+        )
+    )
+    return qwen_deviation or gemma4_deviation
 
 
 def _supports_tool_message_images(renderer) -> bool:
@@ -456,10 +592,11 @@ def _supports_tool_message_images(renderer) -> bool:
     content. Renderers without the feature silently drop image parts in tool
     content; as they grow the feature they get added here and the test starts
     asserting against them."""
+    from renderers.gemma4 import Gemma4Renderer
     from renderers.kimi_k25 import KimiK25Renderer
     from renderers.qwen35 import Qwen35Renderer
 
-    return isinstance(renderer, (Qwen35Renderer, KimiK25Renderer))
+    return isinstance(renderer, (Qwen35Renderer, KimiK25Renderer, Gemma4Renderer))
 
 
 @pytest.mark.parametrize(
@@ -477,8 +614,9 @@ def test_multimodal_byte_parity_vs_processor(mm_model_name, modality, tiny_image
 
     kit = _modality_kit(modality, mm_model_name)
     tokenizer, processor, renderer = _load_processor_and_renderer(mm_model_name)
+    sample = _sample_for(modality, tiny_image)
 
-    for case in _build_cases(kit["make_part"], tiny_image):
+    for case in _build_cases(kit["make_part"], sample):
         messages, add_gp = case.values
         if _skip_for_disabled_thinking_deviation(renderer, case.id):
             continue
@@ -510,8 +648,9 @@ def test_multimodal_placeholders_match_pad_runs(mm_model_name, modality, tiny_im
     kit = _modality_kit(modality, mm_model_name)
     tokenizer, _, renderer = _load_processor_and_renderer(mm_model_name)
     pad_id = tokenizer.convert_tokens_to_ids(kit["placeholder_token"])
+    sample = _sample_for(modality, tiny_image)
 
-    for case in _build_cases(kit["make_part"], tiny_image):
+    for case in _build_cases(kit["make_part"], sample):
         messages, add_gp = case.values
         rendered = renderer.render(messages, add_generation_prompt=add_gp)
 
@@ -578,12 +717,13 @@ def test_multimodal_bridge_extends_and_carries_mm_data(
     )
     if hasattr(renderer, "_processor") and renderer._processor is None:
         renderer._processor = processor
+    sample = _sample_for(modality, tiny_image)
 
     initial = [
         {
             "role": "user",
             "content": [
-                kit["make_part"](tiny_image),
+                kit["make_part"](sample),
                 {"type": "text", "text": "Turn one."},
             ],
         }
@@ -592,7 +732,7 @@ def test_multimodal_bridge_extends_and_carries_mm_data(
         {
             "role": "user",
             "content": [
-                kit["make_part"](tiny_image),
+                kit["make_part"](sample),
                 {"type": "text", "text": "Turn two."},
             ],
         }
@@ -605,11 +745,11 @@ def test_multimodal_bridge_extends_and_carries_mm_data(
         len(prior_mm.mm_items.get(modality, [])),
         len(prior_mm.mm_hashes.get(modality, [])),
     )
-    # ``previous_completion_ids`` mirrors what a sampler would emit
-    # starting AFTER the prompt's assistant role opener — i.e. the
-    # response text followed by ``<|im_end|>``.
-    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-    completion_ids = tokenizer.encode("Saw it.", add_special_tokens=False) + [im_end_id]
+    # ``previous_completion_ids`` mirrors what a sampler would emit starting
+    # AFTER the prompt's assistant opener — response text then the renderer's
+    # own turn-close token.
+    close_id = renderer.get_stop_token_ids()[0]
+    completion_ids = tokenizer.encode("Saw it.", add_special_tokens=False) + [close_id]
 
     bridged_raw = renderer.bridge_to_next_turn(
         previous_prompt_ids=initial_rendered.token_ids,
@@ -679,6 +819,56 @@ def test_multimodal_bridge_extends_and_carries_mm_data(
         f"{mm_model_name} / {modality}: new placeholder offset {new_placeholder.offset} "
         f"sits inside the carried-forward prefix (len={len(prev)})"
     )
+
+
+def test_inkling_bridge_does_not_mutate_prior_mm_data(tiny_image):
+    """Bridging must not mutate the caller's ``previous_multi_modal_data`` —
+    the merge copies the per-modality lists, not just the outer dict, so a
+    carried-forward image doesn't grow the prior turn's list in place."""
+    model = "thinkingmachines/Inkling"
+    if not _hf_snapshot_cached(model):
+        pytest.skip(f"{model}: HF snapshot not cached locally")
+
+    _, processor, renderer = _load_processor_and_renderer(model)
+    initial = [
+        {
+            "role": "user",
+            "content": [
+                _image_content_part(tiny_image),
+                {"type": "text", "text": "Turn one."},
+            ],
+        }
+    ]
+    rendered = renderer.render(initial, add_generation_prompt=True)
+    prior = rendered.multi_modal_data
+    assert prior is not None and len(prior.mm_placeholders["image"]) == 1
+
+    close_id = renderer.get_stop_token_ids()[0]
+    completion_ids = processor.tokenizer.encode("Saw it.", add_special_tokens=False) + [
+        close_id
+    ]
+    new = [
+        {
+            "role": "user",
+            "content": [
+                _image_content_part(tiny_image),
+                {"type": "text", "text": "Turn two."},
+            ],
+        }
+    ]
+    bridged = renderer.bridge_to_next_turn(
+        rendered.token_ids,
+        completion_ids,
+        new,
+        previous_multi_modal_data=prior,
+    )
+    assert bridged is not None
+
+    # The prior sidecar is unchanged; the bridged one carries both images.
+    assert len(prior.mm_placeholders["image"]) == 1
+    assert len(prior.mm_hashes["image"]) == 1
+    assert len(prior.mm_items["image"]) == 1
+    assert len(bridged.multi_modal_data.mm_placeholders["image"]) == 2
 
 
 def test_modality_registry_models_route_to_renderer():

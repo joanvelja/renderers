@@ -56,6 +56,7 @@ class Renderer(Protocol):
 - `RenderedTokens` carries `token_ids` **and** `message_indices` — one entry per token attributing each to its source message (`-1` for structural scaffolding). Lets `build_training_sample` build a per-token loss mask in one render.
 - `ParsedResponse` is `(content, reasoning_content, tool_calls)`. It scans token ids for special-token boundaries (e.g. id `151657` for `<tool_call>` on Qwen3) — a literal `"<tool_call>"` in user content tokenizes to ordinary text ids and never matches.
 - Round-trip: rendering `[user, assistant(content, reasoning, tool_calls)]`, slicing the assistant completion, and feeding it through `parse_response` returns an equivalent structured message. Tested per-renderer in `tests/test_roundtrip.py`.
+- Gemma 4 renders visible content on a tool-calling assistant message before its calls, where a sampled turn has it (generation halts at `<|tool_response>`), and leaves the turn open after the folded tool responses. Google's template moves the content after the responses and closes the turn with `<turn|>` ([HF discussion #115](https://huggingface.co/google/gemma-4-31B-it/discussions/115)); re-rendering that way would rewrite sampled history and put a turn close where the model is still mid-turn. Legacy `tool_responses` messages keep the template's placement.
 
 ### `bridge_to_next_turn` (the core contract)
 

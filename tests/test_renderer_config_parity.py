@@ -240,6 +240,30 @@ _MESSAGE_SHAPES = [
         ],
         {"tools": TOOLS, "add_generation_prompt": True},
     ),
+    # ``tool_cycle_prose``: the tool-calling assistant also carries visible
+    # content. Templates place it either before the calls (the only order a
+    # sampled turn can have) or after the folded tool response.
+    (
+        "tool_cycle_prose",
+        [
+            {"role": "user", "content": "Weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": "Let me check.",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": {"city": "Paris"},
+                        }
+                    }
+                ],
+            },
+            {"role": "tool", "content": '{"temp": 20}'},
+            {"role": "assistant", "content": "It is 20 degrees."},
+        ],
+        {"tools": TOOLS, "add_generation_prompt": True},
+    ),
     # ``no_system_user_gen``: no system message — exercises the
     # template fallback persona (e.g. MiniMax-M2's ``model_identity``).
     (
@@ -438,11 +462,13 @@ def test_chat_template_kwarg_parity_hf(
     # the same conversation disagree at the token level. ``multi_turn`` is
     # the only shape with such a turn — except on qwen3, whose template
     # window additionally requires ``is_last or reasoning_content``, so its
-    # non-last tool-call turn in ``tool_cycle`` is stripped too. Stability
-    # is pinned in ``test_disabled_thinking_stability.py``.
+    # non-last tool-call turn in the ``tool_cycle`` shapes is stripped too.
+    # Stability is pinned in ``test_disabled_thinking_stability.py``.
     resolved = _resolve_renderer_name(model, renderer_name)
     qwen_deviating_shapes = (
-        ("multi_turn", "tool_cycle") if resolved == "qwen3" else ("multi_turn",)
+        ("multi_turn", "tool_cycle", "tool_cycle_prose")
+        if resolved == "qwen3"
+        else ("multi_turn",)
     )
     qwen_deviation = (
         resolved in ("qwen3", "qwen3.5", "qwen3.6")
@@ -459,6 +485,15 @@ def test_chat_template_kwarg_parity_hf(
         pytest.skip(
             "deliberate template deviation: empty think wrapper kept on "
             "historical turns for sampled-token stability"
+        )
+    # Documented deviation: Gemma 4's template renders a tool-calling
+    # message's content after the folded tool response (HF discussion #115),
+    # where a sampled turn can only have it before the calls. Pinned in
+    # ``test_gemma4.py::test_content_before_tool_call_is_a_documented_template_deviation``.
+    if resolved == "gemma4" and shape_id == "tool_cycle_prose":
+        pytest.skip(
+            "deliberate template deviation: tool-call content rendered before "
+            "the calls, where the sampled stream has it"
         )
 
     try:

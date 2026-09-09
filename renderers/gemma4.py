@@ -1075,7 +1075,30 @@ class Gemma4Renderer:
                 if is_assistant
                 else []
             )
+            # A sampled Gemma 4 turn halts at ``<|tool_response>`` right after
+            # its calls, so visible content on a tool-calling message can only
+            # precede them. Google's template appends it after the folded
+            # response and then closes the turn (HF discussion #115); rendering
+            # it that way would rewrite the sampled stream, so this is a
+            # deliberate deviation in two parts: the content goes before the
+            # calls, and ``has_content`` stays False so the turn is left open
+            # after the responses, awaiting continuation exactly like an
+            # empty-content tool call. Content sampled between the calls and
+            # ``<|tool_response>`` (never observed) cannot round-trip: the
+            # parser folds it into ``content`` and it renders before the calls.
+            # Legacy ``tool_responses`` messages keep the template's placement,
+            # where ``content`` really is the post-response answer.
+            has_content = False
             if tool_calls:
+                em.set_msg_idx(msg_idx)
+                self._emit_content(
+                    em,
+                    msg.get("content"),
+                    role,
+                    mm_hashes,
+                    mm_placeholders,
+                    mm_items,
+                )
                 for tool_call in tool_calls:
                     body = (
                         "call:"
@@ -1179,15 +1202,16 @@ class Gemma4Renderer:
                     previous_message_type = "tool_response"
                     scan += 1
 
-            em.set_msg_idx(msg_idx)
-            has_content = self._emit_content(
-                em,
-                msg.get("content"),
-                role,
-                mm_hashes,
-                mm_placeholders,
-                mm_items,
-            )
+            if not tool_calls:
+                em.set_msg_idx(msg_idx)
+                has_content = self._emit_content(
+                    em,
+                    msg.get("content"),
+                    role,
+                    mm_hashes,
+                    mm_placeholders,
+                    mm_items,
+                )
 
             next_non_tool_role = None
             for next_idx in loop_indices[pos + 1 :]:

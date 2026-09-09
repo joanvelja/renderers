@@ -612,6 +612,204 @@ def test_bridge_across_user_turn_is_exact_with_thinking_off():
     )
 
 
+_WEATHER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "description": "Look up the weather.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+
+def _weather_call(index: int, city: str, content: str, reasoning: str | None):
+    return {
+        "role": "assistant",
+        "reasoning_content": reasoning,
+        "content": content,
+        "tool_calls": [
+            {
+                "id": f"call-{index}",
+                "type": "function",
+                "function": {"name": "weather", "arguments": {"city": city}},
+            }
+        ],
+    }
+
+
+@pytest.mark.parametrize("enable_thinking", [False, True])
+@pytest.mark.parametrize("cycles", [1, 2])
+def test_content_before_tool_call_rerenders_as_sampled(enable_thinking, cycles):
+    """Visible content on a tool-calling turn precedes its calls in the stream.
+
+    Generation halts at ``<|tool_response>`` right after the calls, so a
+    sampled ``[thought] prose <|tool_call>...<tool_call|>`` turn can only carry
+    its prose before the call. A full re-render of the parsed messages must
+    reproduce that stream byte for byte, across one and two tool cycles.
+    """
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(
+        tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking)
+    )
+
+    def encode(text: str) -> list[int]:
+        return tokenizer.encode(text, add_special_tokens=False)
+
+    user = {"role": "user", "content": "Weather in Berlin and Paris?"}
+    stream = renderer.render_ids(
+        [user], tools=_WEATHER_TOOLS, add_generation_prompt=True
+    )
+    messages = [user]
+    for index, city in enumerate(["Berlin", "Paris"][:cycles]):
+        thought = ""
+        if enable_thinking:
+            # The first turn samples its own opener; after a tool response the
+            # bridged prompt already ends with ``<|channel>thought\n``.
+            opener = "<|channel>thought\n" if index == 0 else ""
+            thought = f"{opener}Need {city}.\n<channel|>"
+        completion = encode(
+            f"{thought}Checking {city}."
+            f'<|tool_call>call:weather{{city:<|"|>{city}<|"|>}}<tool_call|>'
+            "<|tool_response>"
+        )
+        parsed = renderer.parse_response(completion, tools=_WEATHER_TOOLS)
+        assert parsed.content == f"Checking {city}."
+        assert [call.name for call in parsed.tool_calls] == ["weather"]
+        assert parsed.reasoning_content == (
+            f"Need {city}." if enable_thinking else None
+        )
+
+        tool_response = {
+            "role": "tool",
+            "tool_call_id": f"call-{index}",
+            "content": f'{{"temperature": {20 + index}}}',
+        }
+        bridged = renderer.bridge_to_next_turn(
+            stream, completion, [tool_response], tools=_WEATHER_TOOLS
+        )
+        assert bridged is not None
+        assert bridged.token_ids[: len(stream) + len(completion)] == stream + completion
+        stream = list(bridged.token_ids)
+        messages += [
+            _weather_call(index, city, parsed.content, parsed.reasoning_content),
+            tool_response,
+        ]
+
+    final_thought = "Done.\n<channel|>" if enable_thinking else ""
+    final = encode(f"{final_thought}Berlin 20 C, Paris 21 C.") + [renderer._turn_end]
+    parsed_final = renderer.parse_response(final, tools=_WEATHER_TOOLS)
+    messages.append(
+        {
+            "role": "assistant",
+            "reasoning_content": parsed_final.reasoning_content,
+            "content": parsed_final.content,
+        }
+    )
+    stream += final
+
+    rerendered = renderer.render_ids(messages, tools=_WEATHER_TOOLS)
+    assert rerendered == stream + encode("\n")
+
+
+@pytest.mark.parametrize("enable_thinking", [False, True])
+def test_bridge_after_tool_response_matches_rerender_with_pre_call_content(
+    enable_thinking,
+):
+    """Mid-episode state: a tool-calling turn with prose, its response landed.
+
+    The bridged prompt and a full re-render with a generation prompt must
+    agree, which requires the turn to stay open after the responses.
+    """
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(
+        tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking)
+    )
+    user = {"role": "user", "content": "Weather in Berlin?"}
+    reasoning = "Need Berlin." if enable_thinking else None
+    call = _weather_call(0, "Berlin", "Checking Berlin.", reasoning)
+    tool_response = {
+        "role": "tool",
+        "tool_call_id": "call-0",
+        "content": '{"temperature": 20}',
+    }
+
+    prompt = renderer.render_ids(
+        [user], tools=_WEATHER_TOOLS, add_generation_prompt=True
+    )
+    full = renderer.render_ids(
+        [user, call], tools=_WEATHER_TOOLS, add_generation_prompt=True
+    )
+    assert full[: len(prompt)] == prompt
+    completion = full[len(prompt) :]
+    assert completion[-1] == renderer._tool_response_start
+
+    bridged = renderer.bridge_to_next_turn(
+        prompt, completion, [tool_response], tools=_WEATHER_TOOLS
+    )
+    assert bridged is not None
+    assert bridged.token_ids == renderer.render_ids(
+        [user, call, tool_response], tools=_WEATHER_TOOLS, add_generation_prompt=True
+    )
+
+
+def test_content_before_tool_call_is_a_documented_template_deviation():
+    """Pins the stock template's behaviour so its eventual fix is noticed.
+
+    Google's template renders a tool-calling message's content after the
+    folded tool response and then closes the turn (HF discussion #115, open
+    since revision 842da37). The renderer deviates on purpose: content goes
+    before the calls, where the sampled stream has it, and the turn stays open
+    after the responses. With a later assistant message the turn close is
+    absent in both, so only the content moves; mid-episode the template also
+    emits a ``<turn|>`` that the renderer omits. When this test fails because
+    the template changed, drop the deviation.
+    """
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(tokenizer, Gemma4RendererConfig(enable_thinking=True))
+    prose = "Checking Berlin."
+    user = {"role": "user", "content": "Weather in Berlin?"}
+    call = _weather_call(0, "Berlin", prose, "Need Berlin.")
+    tool_response = {
+        "role": "tool",
+        "tool_call_id": "call-0",
+        "content": '{"temperature": 20}',
+    }
+    final = {"role": "assistant", "reasoning_content": "Done.", "content": "20 C."}
+
+    def template(messages):
+        return tokenizer.apply_chat_template(
+            messages, tools=_WEATHER_TOOLS, tokenize=False, enable_thinking=True
+        )
+
+    def ours(messages):
+        return tokenizer.decode(renderer.render_ids(messages, tools=_WEATHER_TOOLS))
+
+    completed = [user, call, tool_response, final]
+    assert template(completed).index("<tool_response|>") < template(completed).index(
+        prose
+    )
+    rendered = ours(completed)
+    assert (
+        rendered.index("<channel|>")
+        < rendered.index(prose)
+        < rendered.index("<|tool_call>")
+    )
+    assert rendered.replace(prose, "") == template(completed).replace(prose, "")
+
+    mid_episode = [user, call, tool_response]
+    assert template(mid_episode).endswith(f"<tool_response|>{prose}<turn|>\n")
+    assert ours(mid_episode).endswith("<tool_response|>")
+    assert ours(mid_episode).replace(prose, "") + f"{prose}<turn|>\n" == template(
+        mid_episode
+    )
+
+
 @pytest.mark.parametrize("preserve_thinking", [False, True])
 def test_bridge_drops_thinking_at_new_user_turn(preserve_thinking):
     """With thinking on, the template strips a non-tool-call turn's reasoning once a

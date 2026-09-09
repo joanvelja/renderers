@@ -86,19 +86,29 @@ def test_base_checkpoint_prompt_variant_fallback_is_exact(
     assert text.endswith("<|channel>thought\n<channel|>") is has_empty_thought
 
 
-def test_preserve_thinking_controls_derived_retention_and_rejects_conflicts():
+def test_enable_thinking_controls_derived_retention_and_rejects_conflicts():
     tokenizer, _ = _gemma4()
+    disabled = Gemma4Renderer(tokenizer, Gemma4RendererConfig(enable_thinking=False))
+    assert disabled.effective_thinking_retention == "all"
+
+    enabled = Gemma4Renderer(tokenizer, Gemma4RendererConfig(enable_thinking=True))
+    assert enabled.effective_thinking_retention == "tool_cycle"
+
+    # preserve_thinking widens only the tool-call gate; the bridge policy follows enable_thinking.
     preserved = Gemma4Renderer(
         tokenizer,
         Gemma4RendererConfig(enable_thinking=True, preserve_thinking=True),
     )
-    assert preserved.effective_thinking_retention == "all"
+    assert preserved.effective_thinking_retention == "tool_cycle"
 
-    with pytest.raises(ValueError, match="preserve_thinking=True implies"):
-        Gemma4RendererConfig(
-            preserve_thinking=True,
-            thinking_retention="tool_cycle",
-        )
+    # Narrowing the bridge policy is always safe; widening it with thinking on is not.
+    conservative = Gemma4Renderer(
+        tokenizer,
+        Gemma4RendererConfig(enable_thinking=False, thinking_retention="tool_cycle"),
+    )
+    assert conservative.effective_thinking_retention == "tool_cycle"
+    with pytest.raises(ValueError, match="enable_thinking=True implies"):
+        Gemma4RendererConfig(enable_thinking=True, thinking_retention="all")
 
 
 @pytest.mark.parametrize(
@@ -579,13 +589,9 @@ def test_render_accepts_openai_json_string_arguments():
     assert parsed.tool_calls[0].arguments == {"city": "Tokyo"}
 
 
-@pytest.mark.parametrize("enable_thinking", [True, False])
-def test_bridge_drops_thinking_at_new_user_turn(enable_thinking):
+def test_bridge_across_user_turn_is_exact_with_thinking_off():
     tokenizer, _ = _gemma4()
-    renderer = Gemma4Renderer(
-        tokenizer,
-        Gemma4RendererConfig(enable_thinking=enable_thinking),
-    )
+    renderer = Gemma4Renderer(tokenizer, Gemma4RendererConfig(enable_thinking=False))
     first = [{"role": "user", "content": "A"}]
     assistant = {"role": "assistant", "content": "B"}
     next_turn = [{"role": "user", "content": "C"}]
@@ -594,6 +600,40 @@ def test_bridge_drops_thinking_at_new_user_turn(enable_thinking):
     previous_full_ids = renderer.render_ids(first + [assistant])
     previous_completion_ids = previous_full_ids[len(previous_prompt_ids) :]
 
+    bridged = renderer.bridge_to_next_turn(
+        previous_prompt_ids,
+        previous_completion_ids,
+        next_turn,
+    )
+    assert bridged is not None
+    assert bridged.token_ids == renderer.render_ids(
+        first + [assistant] + next_turn,
+        add_generation_prompt=True,
+    )
+
+
+@pytest.mark.parametrize("preserve_thinking", [False, True])
+def test_bridge_drops_thinking_at_new_user_turn(preserve_thinking):
+    """With thinking on, the template strips a non-tool-call turn's reasoning once a
+    later user query exists, so the sampled stream cannot be extended in place."""
+    tokenizer, _ = _gemma4()
+    renderer = Gemma4Renderer(
+        tokenizer,
+        Gemma4RendererConfig(enable_thinking=True, preserve_thinking=preserve_thinking),
+    )
+    first = [{"role": "user", "content": "A"}]
+    assistant = {"role": "assistant", "content": "B", "reasoning_content": "why B"}
+    next_turn = [{"role": "user", "content": "C"}]
+
+    previous_prompt_ids = renderer.render_ids(first, add_generation_prompt=True)
+    previous_full_ids = renderer.render_ids(first + [assistant])
+    previous_completion_ids = previous_full_ids[len(previous_prompt_ids) :]
+    assert "why B" in tokenizer.decode(previous_completion_ids)
+
+    rerendered = renderer.render_ids(
+        first + [assistant] + next_turn, add_generation_prompt=True
+    )
+    assert "why B" not in tokenizer.decode(rerendered)
     assert (
         renderer.bridge_to_next_turn(
             previous_prompt_ids,
@@ -601,24 +641,6 @@ def test_bridge_drops_thinking_at_new_user_turn(enable_thinking):
             next_turn,
         )
         is None
-    )
-
-    retaining = Gemma4Renderer(
-        tokenizer,
-        Gemma4RendererConfig(
-            enable_thinking=enable_thinking,
-            preserve_thinking=True,
-        ),
-    )
-    retained = retaining.bridge_to_next_turn(
-        previous_prompt_ids,
-        previous_completion_ids,
-        next_turn,
-    )
-    assert retained is not None
-    assert retained.token_ids == retaining.render_ids(
-        first + [assistant] + next_turn,
-        add_generation_prompt=True,
     )
 
 

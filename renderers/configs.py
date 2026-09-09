@@ -339,10 +339,16 @@ class Gemma4RendererConfig(BaseRendererConfig):
     _template_fields = frozenset({"enable_thinking", "preserve_thinking"})
 
     enable_thinking: bool = False
-    """Enable Gemma 4's thinking mode. Mirrors the canonical template kwarg."""
+    """Enable Gemma 4's thinking mode. Mirrors the canonical template kwarg.
+    ``False`` implies bridge policy ``"all"``: no historical turn carries
+    reasoning, so a bridge across a user query is exact. ``True`` implies
+    ``"tool_cycle"``: the template strips reasoning from non-tool-call turns
+    before the last user query."""
 
     preserve_thinking: bool = False
-    """Keep thinking on historical tool-call turns when the template permits it."""
+    """Keep thinking on historical tool-call turns when the template permits it.
+    Does not change the bridge policy: reasoning on non-tool-call turns is still
+    stripped before the last user query."""
 
     image_cache_max: int = 256
     """FIFO bound on processed image entries. Renderer-internal."""
@@ -351,12 +357,16 @@ class Gemma4RendererConfig(BaseRendererConfig):
 
     @model_validator(mode="after")
     def _check_thinking_retention(self):
-        _reject_thinking_retention_conflict(
-            self,
-            "preserve_thinking",
-            true_implies="all",
-            false_implies="tool_cycle",
-        )
+        # One-sided on purpose: narrowing to "tool_cycle" with thinking off is
+        # always safe (a full re-render), so it is accepted like on GLM-4.5,
+        # Kimi and Nemotron. Widening to "all" with thinking on would bridge
+        # across user queries whose reasoning the template strips.
+        if self.enable_thinking and self.thinking_retention == "all":
+            raise ValueError(
+                "enable_thinking=True implies thinking_retention='tool_cycle': the "
+                "template strips reasoning from non-tool-call turns before the last "
+                "user query, so a bridge across user queries cannot be exact."
+            )
         return self
 
 

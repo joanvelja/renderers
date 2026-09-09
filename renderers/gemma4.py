@@ -464,10 +464,13 @@ class Gemma4Renderer:
             model_name in _EMPTY_THOUGHT_PREFILL_MODELS
             or "<|channel>thought\\n<channel|>" in chat_template
         )
-        if self.config.preserve_thinking:
-            default_retention = "all"
-        else:
-            default_retention = "tool_cycle"
+        # With thinking off no historical turn carries reasoning, so a bridge
+        # across a user query reproduces the full render byte for byte. With
+        # thinking on the template strips reasoning from every non-tool-call
+        # turn before the last user query, so bridging must stop at the tool
+        # cycle; `preserve_thinking` widens only the tool-call gate and does
+        # not make a cross-query bridge exact.
+        default_retention = "tool_cycle" if self.config.enable_thinking else "all"
         self.effective_thinking_retention = resolve_thinking_retention(
             self.config, default_retention
         )

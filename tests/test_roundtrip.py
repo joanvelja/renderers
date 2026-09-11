@@ -5,13 +5,13 @@ Core renderer invariant: if you render
 extract the assistant's completion slice, and feed it through
 ``parse_response``, you should get back an equivalent structured message.
 Catches asymmetries between a renderer's emit path and its parse path —
-bugs that slip past render-parity tests (which only check vs
-apply_chat_template) and parse-robustness tests (which feed crafted text,
-not rendered output).
+bugs that slip past render-parity tests (which compare against each model's
+reference encoder) and parse-robustness tests (which feed crafted text, not
+rendered output).
 
 Parametrizes over a wider model list than the shared conftest barrage
-(which is kept conservative because several newer renderers still
-disagree with apply_chat_template in complex tool-cycle edge cases).
+(which is kept conservative because several newer renderers still disagree
+with their upstream references in complex tool-cycle edge cases).
 The roundtrip invariant is renderer-self-consistent so it can tolerate
 those gaps while still giving per-renderer coverage of the emit/parse
 pair.
@@ -24,45 +24,9 @@ from functools import lru_cache
 from typing import Any
 
 import pytest
+from parity import models_for
 
-# (HuggingFace model name, renderer name or "auto"). These are the
-# renderers we actively rely on; expand as new ones get hand-coded.
-_ROUNDTRIP_MODELS = [
-    ("Qwen/Qwen3-8B", "auto"),
-    ("PrimeIntellect/Qwen3-0.6B", "auto"),
-    ("Qwen/Qwen3.5-9B", "auto"),
-    ("Qwen/Qwen3.6-35B-A3B", "auto"),
-    ("Qwen/Qwen3.8-27B", "auto"),
-    ("Qwen/Qwen3-VL-4B-Instruct", "auto"),
-    ("google/gemma-4-31B-it", "auto"),
-    ("thinkingmachines/Inkling", "auto"),
-    ("thinkingmachines/Inkling-Small", "auto"),
-    ("zai-org/GLM-5", "auto"),
-    ("zai-org/GLM-5.1", "auto"),
-    ("zai-org/GLM-4.7-Flash", "auto"),
-    ("THUDM/GLM-4.5-Air", "auto"),
-    ("MiniMaxAI/MiniMax-M2.5", "auto"),
-    ("moonshotai/Kimi-K2-Instruct", "auto"),
-    ("moonshotai/Kimi-K2.5", "auto"),
-    ("moonshotai/Kimi-K2.6", "auto"),
-    ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "auto"),
-    ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16", "auto"),
-    # Ultra: parse must recover content after a </think> glued directly to it
-    # (no separating newline) — the Ultra-specific glue stresses the round-trip.
-    ("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16", "auto"),
-    # Nemotron 3.5 (Lightning): same glue as Ultra, distinct renderer class.
-    ("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", "auto"),
-    ("poolside/Laguna-XS.2", "auto"),
-    ("poolside/Laguna-M.1", "auto"),
-    # Laguna-XS-2.1 is deliberately absent: under the default
-    # ``enable_thinking=False`` its template drops assistant reasoning at
-    # render time, so the reasoning round-trip can't hold by design.
-    # test_laguna_xs21.py covers the round-trip under enable_thinking=True.
-    ("tencent/Hy3", "auto"),
-    ("unsloth/Llama-3.2-1B-Instruct", "llama-3"),
-    ("openai/gpt-oss-20b", "gpt-oss"),
-    ("Qwen/Qwen2.5-0.5B-Instruct", "default"),
-]
+_ROUNDTRIP_MODELS = [(case.model, case.renderer) for case in models_for("roundtrip")]
 
 
 @lru_cache(maxsize=None)
@@ -138,7 +102,7 @@ def test_roundtrip_content_only(rt_model, rt_tokenizer, rt_renderer):
     """Plain response, no thinking, no tool calls."""
     msg = {"role": "assistant", "content": "Four."}
     completion_ids = _extract_assistant_tokens(rt_renderer, PROMPT, msg)
-    parsed = rt_renderer.parse_response(completion_ids)
+    parsed = rt_renderer.parse_response(completion_ids, prompt_ids=[])
 
     assert "Four" in parsed.content, f"{rt_model}: lost content, got {parsed.content!r}"
     assert not parsed.tool_calls, (
@@ -158,7 +122,7 @@ def test_roundtrip_reasoning_and_content(rt_model, rt_tokenizer, rt_renderer):
         "reasoning_content": "Two plus two equals four.",
     }
     completion_ids = _extract_assistant_tokens(rt_renderer, PROMPT, msg)
-    parsed = rt_renderer.parse_response(completion_ids)
+    parsed = rt_renderer.parse_response(completion_ids, prompt_ids=[])
 
     assert "four" in parsed.content.lower(), (
         f"{rt_model}: lost content, got {parsed.content!r}"
@@ -174,10 +138,10 @@ def test_roundtrip_reasoning_and_content(rt_model, rt_tokenizer, rt_renderer):
 # ── tool calls ────────────────────────────────────────────────────────
 
 
-def _maybe_skip_tool_calls(renderer_name: str) -> None:
+def _maybe_skip_tool_calls(renderer) -> None:
     """DefaultRenderer without a tool_parser configured always returns an
     empty tool_calls list. That's a documented limitation, not a bug — skip."""
-    if renderer_name == "default":
+    if renderer.config.name == "default":
         pytest.skip(
             "DefaultRenderer requires an explicit tool_parser to parse tool "
             "calls; not exercised in the round-trip matrix."
@@ -187,7 +151,7 @@ def _maybe_skip_tool_calls(renderer_name: str) -> None:
 def test_roundtrip_single_tool_call(
     rt_model, rt_renderer_name, rt_tokenizer, rt_renderer
 ):
-    _maybe_skip_tool_calls(rt_renderer_name)
+    _maybe_skip_tool_calls(rt_renderer)
 
     msg = {
         "role": "assistant",
@@ -206,7 +170,7 @@ def test_roundtrip_single_tool_call(
         ],
     }
     completion_ids = _extract_assistant_tokens(rt_renderer, PROMPT, msg)
-    parsed = rt_renderer.parse_response(completion_ids)
+    parsed = rt_renderer.parse_response(completion_ids, prompt_ids=[])
 
     assert parsed.tool_calls, f"{rt_model}: tool_calls lost, got {parsed.tool_calls!r}"
     assert len(parsed.tool_calls) == 1
@@ -222,8 +186,8 @@ def test_roundtrip_multiple_tool_calls(
 ):
     """Parsers that loop over ``<tool_call>…</tool_call>`` blocks can
     silently drop the second one; this test catches that."""
-    _maybe_skip_tool_calls(rt_renderer_name)
-    if rt_renderer_name == "llama-3":
+    _maybe_skip_tool_calls(rt_renderer)
+    if rt_renderer.config.name == "llama-3":
         pytest.skip(
             "Llama-3's chat template forbids >1 tool call per assistant "
             "message (the renderer raises, mirroring the template); the "
@@ -254,7 +218,7 @@ def test_roundtrip_multiple_tool_calls(
         ],
     }
     completion_ids = _extract_assistant_tokens(rt_renderer, PROMPT, msg)
-    parsed = rt_renderer.parse_response(completion_ids)
+    parsed = rt_renderer.parse_response(completion_ids, prompt_ids=[])
 
     assert len(parsed.tool_calls) == 2, (
         f"{rt_model}: expected 2 tool_calls, got {parsed.tool_calls!r}"
@@ -295,10 +259,10 @@ def test_think_reasoning_parser_preserves_boundary_whitespace():
 
     parser = ThinkTextReasoningParser(tokenizer=None)
 
-    # Model naturally emits `\n<think>...</think>\nCONTENT` — the \n on
-    # each side of `</think>` is load-bearing.
+    # An initial reasoning block followed by a content newline. The newline
+    # after `</think>` belongs to the final content and must survive parsing.
     reasoning, content = parser.extract(
-        "\n<think>Reason text</think>\nThe answer is four."
+        "<think>Reason text</think>\nThe answer is four."
     )
 
     assert reasoning == "Reason text", f"reasoning boundary stripped: {reasoning!r}"

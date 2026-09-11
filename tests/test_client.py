@@ -12,7 +12,7 @@ from renderers.base import (
     RenderedTokens,
     ToolCallParseStatus,
 )
-from renderers.client import generate, parse_generate_response
+from renderers.client import generate
 
 
 class _FakeRenderer:
@@ -41,7 +41,7 @@ class _FakeRenderer:
         return [99]
 
     def parse_response(
-        self, completion_ids: list[int], *, tools=None
+        self, completion_ids: list[int], *, tools=None, prompt_ids=None
     ) -> ParsedResponse:
         assert completion_ids == [7, 8]
         # Stores tools so tests can assert the client plumbed them through.
@@ -68,6 +68,7 @@ class _FakeClient:
     def __init__(self):
         self.calls = []
         self.base_url = "http://fake-host:8000/v1"
+        self.usage = None
         routed_experts = np.array([[[1]], [[2]]], dtype=np.uint8)
         self.choice = {
             "index": 0,
@@ -93,6 +94,11 @@ class _FakeClient:
             "request_id": "gen-test",
             "choices": [self.choice],
         }
+        if self.usage is not None:
+            payload["usage"] = self.usage
+        if body and body.get("content_parts"):
+            payload["prompt_token_ids"] = [1, 2, 2, 3]
+            payload["mm_placeholders"] = {"image": [{"offset": 1, "length": 2}]}
         return httpx.Response(
             200,
             content=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
@@ -111,8 +117,22 @@ def _run_generate(client, renderer=None):
     )
 
 
-def test_generate_builds_request_body_and_parses_response():
+@pytest.mark.parametrize(
+    "usage",
+    [
+        None,
+        {
+            "prompt_tokens": 3,
+            "completion_tokens": 2,
+            "total_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 2},
+            "completion_tokens_details": {"reasoning_tokens": 1},
+        },
+    ],
+)
+def test_generate_builds_request_body_and_parses_response(usage):
     client = _FakeClient()
+    client.usage = usage
     renderer = _FakeRenderer()
 
     result = asyncio.run(
@@ -124,8 +144,6 @@ def test_generate_builds_request_body_and_parses_response():
             tools=[{"type": "function", "function": {"name": "echo"}}],
             sampling_params={"temperature": 0.3, "max_tokens": 7, "min_tokens": 2},
             cache_salt="ckpt-42",
-            kv_session_key="episode-1:alice",
-            kv_continuation_expected=True,
         )
     )
 
@@ -144,14 +162,12 @@ def test_generate_builds_request_body_and_parses_response():
         "model": "test-model",
         "token_ids": [1, 2, 3],
         "cache_salt": "ckpt-42",
-        "kv_session_key": "episode-1:alice",
-        "kv_continuation_expected": True,
         "sampling_params": {
             "temperature": 0.3,
             "max_tokens": 7,
             "min_tokens": 2,
             "stop_token_ids": [99],
-            "logprobs": 0,
+            "logprobs": 1,
             "skip_special_tokens": False,
         },
     }
@@ -164,10 +180,11 @@ def test_generate_builds_request_body_and_parses_response():
     assert result["completion_ids"] == [7, 8]
     assert result["completion_logprobs"] == [-0.1, -0.2]
     assert result["routed_experts"]["shape"] == [2, 1, 1]
-    assert isinstance(result["routed_experts"]["data"], bytes)
-    assert result["routed_experts"]["data"] == base64.b64encode(b"\x01\x02")
+    assert isinstance(result["routed_experts"]["data"], memoryview)
+    assert result["routed_experts"]["data"].tobytes() == base64.b64encode(b"\x01\x02")
     assert result["multi_modal_data"] is None
     assert result["request_id"] == "gen-test"
+    assert result["usage"] == usage
     # Per-token attribution from the renderer surfaces on the result so
     # downstream consumers (verifiers RendererClient → prime-rl) can
     # build selective loss masks without a second render pass.
@@ -186,35 +203,47 @@ def test_generate_builds_request_body_and_parses_response():
     assert tc.status == ToolCallParseStatus.OK
 
 
-def test_parse_generate_response_copies_all_large_base64_fields():
-    routed_data = base64.b64encode(b"routing")
-    kept_ids = base64.b64encode(b"kept")
-    raw = (
-        b'{"choices":[{"routed_experts":{"data":"'
-        + routed_data
-        + b'","shape":[1]},"kept_tokens":{"ids":"'
-        + kept_ids
-        + b'","counts":"AAAAAA=="}}]}'
+def test_generate_process_multimodal_false_sends_content_parts():
+    class DeferredMultimodalRenderer(_FakeRenderer):
+        supports_process_multimodal = True
+
+        def render(
+            self,
+            messages,
+            *,
+            tools=None,
+            add_generation_prompt=False,
+            process_multimodal=True,
+        ):
+            assert process_multimodal is False
+            return RenderedTokens(token_ids=[1, 2, 3])
+
+    client = _FakeClient()
+    image_url = "data:image/png;base64,aW1hZ2U="
+    result = asyncio.run(
+        generate(
+            client=client,
+            renderer=DeferredMultimodalRenderer(),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }
+            ],
+            model="test-model",
+            process_multimodal=False,
+        )
     )
 
-    payload = parse_generate_response(raw)
-
-    assert payload["choices"][0]["routed_experts"]["data"] == routed_data
-    assert payload["choices"][0]["kept_tokens"]["ids"] == kept_ids
-    assert type(payload["choices"][0]["routed_experts"]["data"]) is bytes
-    assert type(payload["choices"][0]["kept_tokens"]["ids"]) is bytes
-
-
-@pytest.mark.parametrize("token_ids", [None, "7", [7, True], [7, "8"], [7, -1]])
-def test_generate_rejects_invalid_completion_token_ids(token_ids):
-    client = _FakeClient()
-    client.choice["token_ids"] = token_ids
-
-    with pytest.raises(
-        MalformedGenerateResponseError,
-        match=r"choice\.token_ids must",
-    ):
-        _run_generate(client)
+    body = client.calls[0]["body"]
+    assert body["content_parts"] == [{"type": "image_url", "url": image_url}]
+    assert "features" not in body
+    assert result["renderer_prompt_ids"] == [1, 2, 3]
+    assert result["prompt_ids"] == [1, 2, 2, 3]
+    assert result["mm_placeholders"] == {"image": [{"offset": 1, "length": 2}]}
 
 
 def test_generate_rejects_missing_completion_logprobs_before_parsing():
@@ -310,7 +339,7 @@ class _MalformedToolRenderer(_FakeRenderer):
     """Returns only a malformed tool-call attempt — finish_reason must stay "stop"."""
 
     def parse_response(
-        self, completion_ids: list[int], *, tools=None
+        self, completion_ids: list[int], *, tools=None, prompt_ids=None
     ) -> ParsedResponse:
         return ParsedResponse(
             content="",
@@ -420,8 +449,9 @@ def test_generate_threads_prompt_attribution_through_prebuilt_prompt_path():
         ("Qwen/Qwen3-VL-4B-Instruct", "renderers.qwen3_vl:Qwen3VLRenderer"),
         ("Qwen/Qwen3.5-2B", "renderers.qwen35:Qwen35Renderer"),
         ("Qwen/Qwen3.8-27B", "renderers.qwen38:Qwen38Renderer"),
+        ("Qwen/Qwen3.8-Flash-Next", "renderers.qwen38:Qwen38Renderer"),
     ],
-    ids=["qwen3_vl", "qwen35", "qwen38"],
+    ids=["qwen3_vl", "qwen35", "qwen38", "qwen38_flash_next"],
 )
 def test_generate_serializes_multimodal_features_for_qwen_vl_family(
     model_id, renderer_class_path
@@ -696,3 +726,30 @@ def test_generate_caches_max_prompt_len_lookup_failure():
     assert len(client.calls) == 1
     assert result["prompt_ids"] == list(range(10))
     assert _max_prompt_len_cache[("http://no-models:8000/v1", "test-model")] is None
+
+
+@pytest.mark.parametrize(
+    "finish,reasoning_complete", [("stop", False), ("length", True), ("stop", None)]
+)
+def test_generate_forwards_reasoning_state_without_classifying_acceptance(
+    finish,
+    reasoning_complete,
+):
+    class ContextRenderer(_FakeRenderer):
+        def parse_response(self, completion_ids, *, tools=None, prompt_ids=None):
+            assert prompt_ids == [1, 2, 3]
+            assert completion_ids == [7, 8]
+            return ParsedResponse(
+                content="",
+                reasoning_content="reasoning",
+                reasoning_complete=reasoning_complete,
+            )
+
+    client = _FakeClient()
+    client.choice["finish_reason"] = finish
+    result = _run_generate(client, ContextRenderer())
+    assert result["reasoning_complete"] is reasoning_complete
+    assert result["finish_reason"] == finish
+    assert result["completion_ids"] == [7, 8]
+    assert result["completion_logprobs"] == [-0.1, -0.2]
+    assert result["content"] == ""

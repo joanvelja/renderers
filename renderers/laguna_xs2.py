@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import json
 
-from transformers.tokenization_utils import PreTrainedTokenizer
+from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
     Content,
@@ -58,6 +58,9 @@ from renderers.base import (
     ParsedResponse,
     RenderedTokens,
     ToolSpec,
+    Tokenizer,
+    _content_mask_or_empty,
+    _infer_offsets_from_decode,
     attribute_text_segments,
     extract_message_tool_names,
     reject_assistant_in_extension,
@@ -119,7 +122,7 @@ _TOOLS_HEADER_XS21 = (
 class LagunaXS2Renderer:
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Tokenizer,
         config: (
             LagunaXS2RendererConfig
             | LagunaM1RendererConfig
@@ -328,7 +331,7 @@ class LagunaXS2Renderer:
             token_ids=tokens,
             message_indices=indices,
             sampled_mask=sampled,
-            is_content=content_mask,
+            is_content=_content_mask_or_empty(self._tokenizer, content_mask),
             message_roles=[m.get("role") or "" for m in messages],
             message_tool_names=extract_message_tool_names(messages),
         )
@@ -351,6 +354,7 @@ class LagunaXS2Renderer:
         token_ids: list[int],
         *,
         tools: list[ToolSpec] | None = None,
+        prompt_ids: list[int] | None = None,
     ) -> ParsedResponse:
         return parse_laguna_xs2(
             self._tokenizer,
@@ -361,6 +365,12 @@ class LagunaXS2Renderer:
             tool_call_id=self._tool_call,
             tool_call_end_id=self._tool_call_end,
             tools=tools,
+            prefilled_thinking=prompt_ends_in_reasoning(
+                self._tokenizer,
+                prompt_ids,
+                stop_ids=set(self.get_stop_token_ids()),
+                assistant_prefix="<assistant>",
+            ),
         )
 
     def get_stop_token_ids(self) -> list[int]:
@@ -380,6 +390,20 @@ class LagunaXS2Renderer:
             or reject_assistant_in_extension(new_messages)
         ):
             return None
+
+        boundary = scan_reasoning(
+            self._tokenizer,
+            previous_completion_ids,
+            prompt_ids=previous_prompt_ids,
+            stop_ids=set(self.get_stop_token_ids()),
+            tool_start_id=self._tool_call,
+            assistant_prefix="<assistant>",
+        )
+        if boundary.is_open:
+            if any(t in self.get_stop_token_ids() for t in previous_completion_ids):
+                return None
+            previous_completion_ids = [*previous_completion_ids, self._think_end]
+
         if should_rerender_for_thinking_retention(
             self.effective_thinking_retention,
             new_messages,
@@ -485,7 +509,9 @@ class LagunaXS2Renderer:
             token_ids=previous_ids + ext,
             message_indices=[-1] * len(previous_ids) + ext_indices,
             sampled_mask=[False] * total_len,
-            is_content=[False] * len(previous_ids) + ext_content,
+            is_content=_content_mask_or_empty(
+                self._tokenizer, [False] * len(previous_ids) + ext_content
+            ),
             message_roles=[m.get("role") or "" for m in new_messages],
             message_tool_names=extract_message_tool_names(new_messages),
         )
@@ -652,7 +678,7 @@ class LagunaM1Renderer(LagunaXS2Renderer):
 
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Tokenizer,
         config: LagunaM1RendererConfig | None = None,
     ):
         super().__init__(tokenizer, config or LagunaM1RendererConfig())
@@ -692,7 +718,7 @@ class LagunaXS21Renderer(LagunaXS2Renderer):
 
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Tokenizer,
         config: LagunaXS21RendererConfig | LagunaS21RendererConfig | None = None,
     ):
         super().__init__(tokenizer, config or LagunaXS21RendererConfig())
@@ -782,12 +808,52 @@ class LagunaXS21Renderer(LagunaXS2Renderer):
                 tool_text += "</available_tools>"
                 header_segs.append((tool_text, False))
             header_segs.append(("</system>\n", False))
-            for tok_id, is_content in attribute_text_segments(
+            attributed = attribute_text_segments(
                 self._tokenizer, header_segs, overlap_is_content=True
-            ):
+            )
+            fallback_indices: list[int] | None = None
+            if not attributed.has_content_attribution:
+                full_header = "".join(text for text, _ in header_segs)
+                offsets = _infer_offsets_from_decode(
+                    self._tokenizer,
+                    [token_id for token_id, _ in attributed],
+                    full_header,
+                )
+                if offsets is None:
+                    fallback_index = 0 if caller_has_system and has_sys_content else -1
+                    fallback_indices = [fallback_index] * len(attributed)
+                else:
+                    content_spans: list[tuple[int, int]] = []
+                    position = 0
+                    for text, is_content in header_segs:
+                        end = position + len(text)
+                        if is_content:
+                            content_spans.append((position, end))
+                        position = end
+                    fallback_indices = [
+                        0
+                        if (
+                            any(
+                                span_start < end and start < span_end
+                                for span_start, span_end in content_spans
+                            )
+                            if end > start
+                            else any(
+                                span_start <= start < span_end
+                                for span_start, span_end in content_spans
+                            )
+                        )
+                        else -1
+                        for start, end in offsets
+                    ]
+            for position, (tok_id, is_content) in enumerate(attributed):
+                if fallback_indices is not None:
+                    message_index = fallback_indices[position]
+                else:
+                    message_index = 0 if is_content else -1
                 emit_special(
                     tok_id,
-                    0 if is_content else -1,
+                    message_index,
                     is_sampled=False,
                     is_content=is_content,
                 )
@@ -841,7 +907,7 @@ class LagunaXS21Renderer(LagunaXS2Renderer):
             token_ids=tokens,
             message_indices=indices,
             sampled_mask=sampled,
-            is_content=content_mask,
+            is_content=_content_mask_or_empty(self._tokenizer, content_mask),
             message_roles=[m.get("role") or "" for m in messages],
             message_tool_names=extract_message_tool_names(messages),
         )
@@ -851,6 +917,7 @@ class LagunaXS21Renderer(LagunaXS2Renderer):
         token_ids: list[int],
         *,
         tools: list[ToolSpec] | None = None,
+        prompt_ids: list[int] | None = None,
     ) -> ParsedResponse:
         # The XS-2.1 template renders reasoning and content verbatim (no
         # newline wrapping), so the parse is verbatim too.
@@ -864,6 +931,12 @@ class LagunaXS21Renderer(LagunaXS2Renderer):
             tool_call_end_id=self._tool_call_end,
             tools=tools,
             strip_newlines=False,
+            prefilled_thinking=prompt_ends_in_reasoning(
+                self._tokenizer,
+                prompt_ids,
+                stop_ids=set(self.get_stop_token_ids()),
+                assistant_prefix="<assistant>",
+            ),
         )
 
     def bridge_to_next_turn(
@@ -880,6 +953,20 @@ class LagunaXS21Renderer(LagunaXS2Renderer):
             or reject_assistant_in_extension(new_messages)
         ):
             return None
+
+        boundary = scan_reasoning(
+            self._tokenizer,
+            previous_completion_ids,
+            prompt_ids=previous_prompt_ids,
+            stop_ids=set(self.get_stop_token_ids()),
+            tool_start_id=self._tool_call,
+            assistant_prefix="<assistant>",
+        )
+        if boundary.is_open:
+            if any(t in self.get_stop_token_ids() for t in previous_completion_ids):
+                return None
+            previous_completion_ids = [*previous_completion_ids, self._think_end]
+
         if should_rerender_for_thinking_retention(
             self.effective_thinking_retention,
             new_messages,
@@ -959,7 +1046,9 @@ class LagunaXS21Renderer(LagunaXS2Renderer):
             token_ids=previous_ids + ext,
             message_indices=[-1] * len(previous_ids) + ext_indices,
             sampled_mask=[False] * total_len,
-            is_content=[False] * len(previous_ids) + ext_content,
+            is_content=_content_mask_or_empty(
+                self._tokenizer, [False] * len(previous_ids) + ext_content
+            ),
             message_roles=[m.get("role") or "" for m in new_messages],
             message_tool_names=extract_message_tool_names(new_messages),
         )

@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from transformers.tokenization_utils import PreTrainedTokenizer
+from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
     Message,
@@ -34,6 +34,9 @@ from renderers.base import (
     PlaceholderRange,
     RenderedTokens,
     ToolSpec,
+    Tokenizer,
+    _content_mask_or_empty,
+    _require_transformers,
     attribute_text_segments,
     extract_message_tool_names,
     reject_assistant_in_extension,
@@ -104,6 +107,7 @@ _ENABLE_THINKING_DEFAULTS: dict[str, bool] = {
     "Qwen/Qwen3.6-35B-A3B": True,
     # Qwen3.8 keeps thinking enabled by default.
     "Qwen/Qwen3.8-27B": True,
+    "Qwen/Qwen3.8-Flash-Next": True,
 }
 
 
@@ -121,11 +125,12 @@ def _default_enable_thinking(tokenizer) -> bool:
 class Qwen35Renderer:
     """Deterministic message → token renderer for Qwen3.5 models."""
 
+    supports_process_multimodal = True
     _config_cls: type = Qwen35RendererConfig
 
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Tokenizer,
         config: Qwen35RendererConfig | None = None,
         *,
         processor: Any = None,
@@ -184,8 +189,6 @@ class Qwen35Renderer:
     def _get_processor(self):
         if self._processor is not None:
             return self._processor
-        from transformers import AutoProcessor
-
         name = getattr(self._tokenizer, "name_or_path", None)
         if not name:
             raise RuntimeError(
@@ -194,7 +197,8 @@ class Qwen35Renderer:
                 "constructor, or load the tokenizer with a known name_or_path "
                 "so the processor can be auto-loaded."
             )
-        self._processor = AutoProcessor.from_pretrained(name)
+        transformers = _require_transformers("Auto-loading a Qwen3.5-family processor")
+        self._processor = transformers.AutoProcessor.from_pretrained(name)
         return self._processor
 
     def _process_image(self, part: dict[str, Any]):
@@ -352,6 +356,7 @@ class Qwen35Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        process_multimodal: bool = True,
     ) -> RenderedTokens:
         if not messages:
             raise ValueError("No messages provided.")
@@ -423,7 +428,11 @@ class Qwen35Renderer:
             # image data, so they ARE body content (is_content=True);
             # the surrounding ``<|vision_start|>`` / ``<|vision_end|>``
             # specials are template scaffold.
-            _, out, n, h = self._process_image(part)
+            if process_multimodal:
+                _, out, n, h = self._process_image(part)
+            else:
+                out = h = None
+                n = 1
             vision_counts["image"] += 1
             if self.config.add_vision_id:
                 emit_text(
@@ -441,16 +450,18 @@ class Qwen35Renderer:
                     self._image_pad, msg_idx, is_sampled=False, is_content=True
                 )
             emit_special(self._vision_end, msg_idx, is_sampled=False, is_content=False)
-            mm_hashes.setdefault("image", []).append(h)
-            mm_placeholders.setdefault("image", []).append(
-                PlaceholderRange(offset=offset, length=n)
-            )
-            mm_items.setdefault("image", []).append(
-                {
-                    "pixel_values": out["pixel_values"],
-                    "image_grid_thw": out["image_grid_thw"],
-                }
-            )
+            if process_multimodal:
+                assert out is not None and h is not None
+                mm_hashes.setdefault("image", []).append(h)
+                mm_placeholders.setdefault("image", []).append(
+                    PlaceholderRange(offset=offset, length=n)
+                )
+                mm_items.setdefault("image", []).append(
+                    {
+                        "pixel_values": out["pixel_values"],
+                        "image_grid_thw": out["image_grid_thw"],
+                    }
+                )
 
         def emit_user_with_media(content_list: list[Any], msg_idx: int) -> None:
             """Emit a user message whose content list contains image parts.
@@ -637,7 +648,7 @@ class Qwen35Renderer:
             token_ids=tokens,
             message_indices=indices,
             sampled_mask=sampled,
-            is_content=content_mask,
+            is_content=_content_mask_or_empty(self._tokenizer, content_mask),
             message_roles=[m.get("role") or "" for m in messages],
             message_tool_names=extract_message_tool_names(messages),
             multi_modal_data=mm_data,
@@ -661,6 +672,7 @@ class Qwen35Renderer:
         token_ids: list[int],
         *,
         tools: list[ToolSpec] | None = None,
+        prompt_ids: list[int] | None = None,
     ) -> ParsedResponse:
         return parse_qwen35(
             self._tokenizer,
@@ -671,6 +683,11 @@ class Qwen35Renderer:
             tool_call_id=self._tool_call,
             tool_call_end_id=self._tool_call_end,
             tools=tools,
+            prefilled_thinking=prompt_ends_in_reasoning(
+                self._tokenizer,
+                prompt_ids,
+                stop_ids=set(self.get_stop_token_ids()),
+            ),
         )
 
     def get_stop_token_ids(self) -> list[int]:
@@ -684,6 +701,7 @@ class Qwen35Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         previous_multi_modal_data: MultiModalData | None = None,
+        process_multimodal: bool = True,
     ) -> "RenderedTokens | None":
         if (
             not previous_prompt_ids
@@ -691,6 +709,18 @@ class Qwen35Renderer:
             or reject_assistant_in_extension(new_messages)
         ):
             return None
+
+        boundary = scan_reasoning(
+            self._tokenizer,
+            previous_completion_ids,
+            prompt_ids=previous_prompt_ids,
+            stop_ids=set(self.get_stop_token_ids()),
+            tool_start_id=self._tool_call,
+        )
+        if boundary.is_open:
+            if any(t in self.get_stop_token_ids() for t in previous_completion_ids):
+                return None
+            previous_completion_ids = [*previous_completion_ids, self._think_end]
 
         if should_rerender_for_thinking_retention(
             self.effective_thinking_retention,
@@ -720,6 +750,7 @@ class Qwen35Renderer:
         # scratch correctly.
         if (
             self.config.add_vision_id
+            and process_multimodal
             and previous_multi_modal_data is None
             and self._vision_start in previous_ids
         ):
@@ -750,9 +781,11 @@ class Qwen35Renderer:
         # ``add_vision_id`` parity across turns.
         prev_image_count = 0
         prev_video_count = 0
-        if previous_multi_modal_data is not None:
+        if process_multimodal and previous_multi_modal_data is not None:
             prev_image_count = len(previous_multi_modal_data.mm_items.get("image", []))
             prev_video_count = len(previous_multi_modal_data.mm_items.get("video", []))
+        elif not process_multimodal:
+            prev_image_count = previous_ids.count(self._image_pad)
         vision_counts = {"image": prev_image_count, "video": prev_video_count}
 
         def emit_special(
@@ -795,7 +828,11 @@ class Qwen35Renderer:
                 content_mask.append(is_content)
 
         def emit_image(part: dict[str, Any], msg_idx: int = -1) -> None:
-            _, out, n, h = self._process_image(part)
+            if process_multimodal:
+                _, out, n, h = self._process_image(part)
+            else:
+                out = h = None
+                n = 1
             vision_counts["image"] += 1
             if self.config.add_vision_id:
                 emit_text(f"Picture {vision_counts['image']}: ", msg_idx)
@@ -804,16 +841,18 @@ class Qwen35Renderer:
             for _ in range(n):
                 emit_special(self._image_pad, msg_idx, is_content=True)
             emit_special(self._vision_end, msg_idx)
-            new_hashes.setdefault("image", []).append(h)
-            new_placeholders.setdefault("image", []).append(
-                PlaceholderRange(offset=offset, length=n)
-            )
-            new_items.setdefault("image", []).append(
-                {
-                    "pixel_values": out["pixel_values"],
-                    "image_grid_thw": out["image_grid_thw"],
-                }
-            )
+            if process_multimodal:
+                assert out is not None and h is not None
+                new_hashes.setdefault("image", []).append(h)
+                new_placeholders.setdefault("image", []).append(
+                    PlaceholderRange(offset=offset, length=n)
+                )
+                new_items.setdefault("image", []).append(
+                    {
+                        "pixel_values": out["pixel_values"],
+                        "image_grid_thw": out["image_grid_thw"],
+                    }
+                )
 
         def emit_user_with_media(content_list: list[Any], msg_idx: int) -> None:
             emit_special(self._im_start, msg_idx)
@@ -904,17 +943,17 @@ class Qwen35Renderer:
         # below never mutates the caller's previous_multi_modal_data.
         merged_hashes: dict[str, list[str]] = (
             {k: list(v) for k, v in previous_multi_modal_data.mm_hashes.items()}
-            if previous_multi_modal_data
+            if process_multimodal and previous_multi_modal_data
             else {}
         )
         merged_placeholders: dict[str, list[PlaceholderRange]] = (
             {k: list(v) for k, v in previous_multi_modal_data.mm_placeholders.items()}
-            if previous_multi_modal_data
+            if process_multimodal and previous_multi_modal_data
             else {}
         )
         merged_items: dict[str, list[dict[str, Any]]] = (
             {k: list(v) for k, v in previous_multi_modal_data.mm_items.items()}
-            if previous_multi_modal_data
+            if process_multimodal and previous_multi_modal_data
             else {}
         )
         for modality, vals in new_hashes.items():
@@ -931,7 +970,7 @@ class Qwen35Renderer:
                 token_ids=tokens,
                 message_indices=indices,
                 sampled_mask=sampled,
-                is_content=content_mask,
+                is_content=_content_mask_or_empty(self._tokenizer, content_mask),
                 message_roles=bridge_roles,
                 message_tool_names=bridge_tool_names,
             )
@@ -945,7 +984,7 @@ class Qwen35Renderer:
             token_ids=tokens,
             message_indices=indices,
             sampled_mask=sampled,
-            is_content=content_mask,
+            is_content=_content_mask_or_empty(self._tokenizer, content_mask),
             message_roles=bridge_roles,
             message_tool_names=bridge_tool_names,
             multi_modal_data=mm_data,

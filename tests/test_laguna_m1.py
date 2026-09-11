@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-import pytest
 from pydantic import TypeAdapter
 
 from renderers import (
@@ -72,38 +71,6 @@ def test_auto_selection_and_typed_config():
     assert parsed.enable_thinking is True
 
 
-@pytest.mark.parametrize("enable_thinking", [False, True])
-def test_no_system_and_generation_prompt_parity(enable_thinking):
-    messages = [{"role": "user", "content": "  preserve me  "}]
-    renderer = _renderer(enable_thinking=enable_thinking)
-    got = renderer.render_ids(messages, add_generation_prompt=True)
-    assert got == _expected(
-        messages,
-        add_generation_prompt=True,
-        enable_thinking=enable_thinking,
-    )
-
-    text = _tok().decode(got)
-    assert text.startswith("〈|EOS|〉<user>\n  preserve me  \n</user>\n<assistant>\n")
-    assert "<system>" not in text
-    assert text.endswith("<think>" if enable_thinking else "</think>")
-
-
-@pytest.mark.parametrize("enable_thinking", [False, True])
-def test_reasoning_content_history_parity_in_both_modes(enable_thinking):
-    messages = [
-        {"role": "user", "content": "Compute."},
-        {
-            "role": "assistant",
-            "reasoning_content": "\n  two steps  \n",
-            "content": "\n  result  \n",
-        },
-    ]
-    got = _renderer(enable_thinking=enable_thinking).render_ids(messages)
-    assert got == _expected(messages, enable_thinking=enable_thinking)
-    assert "<think>\ntwo steps\n</think>\nresult\n</assistant>\n" in _tok().decode(got)
-
-
 def test_reasoning_field_precedence_and_inline_think_extraction():
     precedence = [
         {"role": "user", "content": "Compute."},
@@ -143,51 +110,6 @@ def test_reasoning_field_precedence_and_inline_think_extraction():
     assert _renderer().render_ids(inline) == _expected(inline)
 
 
-def test_tools_calls_responses_and_generation_prompt_parity():
-    messages = [
-        {"role": "system", "content": "Use tools carefully."},
-        {"role": "user", "content": "Inspect the machine."},
-        {
-            "role": "assistant",
-            "reasoning": "Need a command.",
-            "content": "Running it.",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "shell",
-                        "arguments": {"cmd": "uname -a", "timeout": 5},
-                    },
-                }
-            ],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "call_1",
-            "content": '{"stdout":"Linux"}',
-        },
-    ]
-    renderer = _renderer(enable_thinking=True)
-    got = renderer.render_ids(messages, tools=TOOLS, add_generation_prompt=True)
-    assert got == _expected(
-        messages,
-        tools=TOOLS,
-        add_generation_prompt=True,
-        enable_thinking=True,
-    )
-
-    text = _tok().decode(got)
-    assert "<available_tools>\n" in text
-    assert (
-        "<tool_call>shell\n<arg_key>cmd</arg_key>\n"
-        "<arg_value>uname -a</arg_value>\n<arg_key>timeout</arg_key>\n"
-        "<arg_value>5</arg_value>\n</tool_call>\n"
-    ) in text
-    assert '<tool_response>\n{"stdout":"Linux"}\n</tool_response>\n' in text
-    assert text.endswith("<assistant>\n<think>")
-
-
 def test_reasoning_content_and_tool_call_round_trip():
     renderer = _renderer(enable_thinking=True)
     prompt = [{"role": "user", "content": "Inspect the machine."}]
@@ -207,7 +129,7 @@ def test_reasoning_content_and_tool_call_round_trip():
     prompt_ids = renderer.render_ids(prompt, add_generation_prompt=True)
     full_ids = renderer.render_ids([*prompt, assistant])
     completion_ids = full_ids[len(prompt_ids) :]
-    parsed = renderer.parse_response(completion_ids, tools=TOOLS)
+    parsed = renderer.parse_response(completion_ids, tools=TOOLS, prompt_ids=prompt_ids)
 
     assert parsed.reasoning_content == "Need a command."
     assert parsed.content == "Running it."

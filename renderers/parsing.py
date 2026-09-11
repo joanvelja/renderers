@@ -1,8 +1,8 @@
 """Token-level parsing — operates on token IDs directly.
 
-Finds special token boundaries by scanning token IDs, then decodes only
-the text segments between them. No regex on decoded text, no false positives
-from content that happens to look like special tokens.
+Finds structural boundaries by token ID where the tokenizer has atomic
+markers. Text-delimited grammars fall back to decoded markers so BPE merges
+at the boundary do not hide them.
 
 Every parser emits ``list[ParsedToolCall]`` covering every attempt —
 successful and malformed alike — with a ``status`` enum classifying the
@@ -17,9 +17,16 @@ failure) — see ``ToolCallParseStatus`` docstring for the rationale.
 from __future__ import annotations
 
 import json
+
+from renderers.reasoning import scan_reasoning
 from typing import Any
 
-from renderers.base import ParsedResponse, ParsedToolCall, ToolCallParseStatus, ToolSpec
+from renderers.base import (
+    ParsedResponse,
+    ParsedToolCall,
+    ToolCallParseStatus,
+    ToolSpec,
+)
 
 
 # ── Schema-aware argument coercion ──────────────────────────────────
@@ -197,22 +204,29 @@ def parse_qwen3(
     tool_call_id: int,
     tool_call_end_id: int,
     reasoning_end_id: int | None = None,
+    prefilled_thinking: bool = False,
 ) -> ParsedResponse:
     """Parse Qwen3 completion tokens. Hermes-style JSON tool calls."""
     ids = _strip_stop_tokens(token_ids, stop_ids)
+    boundary = scan_reasoning(
+        tokenizer,
+        ids,
+        prefilled=prefilled_thinking,
+        close_id=reasoning_end_id,
+        tool_start_id=tool_call_id,
+    )
+    if boundary.is_open:
+        return ParsedResponse(
+            content="", reasoning_content=boundary.text, reasoning_complete=False
+        )
 
-    # Reasoning is resolved before tool calls. Thinking models (e.g.
-    # Qwen3-*-Thinking) routinely draft ``<tool_call>`` blocks *inside* their
-    # ``<think>...</think>`` trace while planning; those are reasoning, not
-    # real invocations. Anchoring the tool-call scan after the ``</think>``
-    # boundary keeps in-think drafts out of ``tool_calls`` (otherwise they
-    # surface as phantom/duplicate calls) and out of the reasoning/content
-    # split. Mirrors vLLM's DelegatingParser, which runs the reasoning parser
-    # first and tool-parses only the post-``</think>`` content.
-    # ``reasoning_end_id`` is the ``</think>`` token id; when it's absent
-    # (``None``) or the model never closed its reasoning, the scan falls back
-    # to the whole stream (prior behavior).
-    reasoning_end = _find(ids, reasoning_end_id) if reasoning_end_id is not None else -1
+    # Tool calls are parsed only after the initial reasoning region. An open
+    # region returned above; a closed region can contain non-executable drafts.
+    reasoning_end = (
+        _find(ids, reasoning_end_id)
+        if reasoning_end_id is not None and boundary.text is not None
+        else -1
+    )
     scan_start = reasoning_end + 1 if reasoning_end != -1 else 0
 
     tc_start = _find(ids, tool_call_id, scan_start)
@@ -280,9 +294,9 @@ def parse_qwen3(
     text = _decode(tokenizer, content_ids)
     # Extract reasoning from text (Qwen3 doesn't have <think> as special token)
     reasoning = None
-    if "</think>" in text:
+    if boundary.text is not None and "</think>" in text:
         before, _, after = text.partition("</think>")
-        reasoning = before.replace("<think>", "").strip("\n").strip()
+        reasoning = boundary.text.strip("\n").strip()
         text = after.strip("\n")
 
     return ParsedResponse(
@@ -305,6 +319,7 @@ def parse_qwen35(
     tool_call_id: int,
     tool_call_end_id: int,
     tools: list[ToolSpec] | None = None,
+    prefilled_thinking: bool = False,
 ) -> ParsedResponse:
     """Parse Qwen3.5 completion tokens. XML-style tool calls, token-level thinking.
 
@@ -314,26 +329,32 @@ def parse_qwen35(
     semantics (PrimeQwen3Renderer): a sampled ``<think></think>`` must
     round-trip parse → message → render back to the same tokens, so an
     empty-but-present block is ``""``, never ``None``.
+
+    ``prefilled_thinking`` declares whether the generation prompt opened reasoning.
+    Direct helper calls default to an unprefilled completion.
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
+    boundary = scan_reasoning(
+        tokenizer,
+        ids,
+        prefilled=bool(prefilled_thinking),
+        open_id=think_id,
+        close_id=think_end_id,
+        tool_start_id=tool_call_id,
+    )
+    if boundary.is_open:
+        return ParsedResponse(
+            content="", reasoning_content=boundary.text, reasoning_complete=False
+        )
 
     # Thinking: find </think> by token ID
     reasoning = None
     parse_offset = 0  # shift to map local indices back to stop-stripped ids
     think_end = _find(ids, think_end_id)
-    if think_end != -1:
-        reasoning_ids = ids[:think_end]
-        reasoning_ids = [t for t in reasoning_ids if t != think_id]
-        reasoning = _decode(tokenizer, reasoning_ids).strip()
+    if boundary.text is not None and think_end != -1:
+        reasoning = boundary.text.strip()
         ids = ids[think_end + 1 :]
         parse_offset = think_end + 1
-    elif think_id in set(ids):
-        # <think> present but no </think> — truncated reasoning. Block
-        # present ⇒ string (see docstring), even when nothing follows the
-        # opening tag.
-        think_start = _find(ids, think_id)
-        reasoning = _decode(tokenizer, ids[think_start + 1 :]).strip()
-        return ParsedResponse(content="", reasoning_content=reasoning, tool_calls=[])
 
     tc_start = _find(ids, tool_call_id)
     tool_calls: list[ParsedToolCall] = []
@@ -453,6 +474,7 @@ def parse_glm(
     arg_value_id: int,
     arg_value_end_id: int,
     tools: list[ToolSpec] | None = None,
+    prefilled_thinking: bool = False,
 ) -> ParsedResponse:
     """Parse GLM completion tokens. Token-level thinking + arg_key/arg_value tool calls.
 
@@ -472,22 +494,27 @@ def parse_glm(
     behaves the same when the request carries no tools).
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
+    boundary = scan_reasoning(
+        tokenizer,
+        ids,
+        prefilled=prefilled_thinking,
+        open_id=think_id,
+        close_id=think_end_id,
+        tool_start_id=tool_call_id,
+        assistant_prefix="<|assistant|>",
+    )
+    if boundary.is_open:
+        return ParsedResponse(
+            content="", reasoning_content=boundary.text, reasoning_complete=False
+        )
 
     reasoning = None
     parse_offset = 0
     think_end = _find(ids, think_end_id)
-    if think_end != -1:
-        reasoning_ids = ids[:think_end]
-        reasoning_ids = [t for t in reasoning_ids if t != think_id]
-        reasoning = _decode(tokenizer, reasoning_ids).strip()
+    if boundary.text is not None and think_end != -1:
+        reasoning = boundary.text.strip()
         ids = ids[think_end + 1 :]
         parse_offset = think_end + 1
-    elif think_id in set(ids):
-        think_start = _find(ids, think_id)
-        reasoning = _decode(tokenizer, ids[think_start + 1 :]).strip()
-        return ParsedResponse(
-            content="", reasoning_content=reasoning or None, tool_calls=[]
-        )
 
     tc_start = _find(ids, tool_call_id)
     tool_calls: list[ParsedToolCall] = []
@@ -636,6 +663,7 @@ def parse_hy3(
     arg_value_id: int,
     arg_value_end_id: int,
     tools: list[ToolSpec] | None = None,
+    prefilled_thinking: bool = False,
 ) -> ParsedResponse:
     """Parse Hy3 completion tokens.
 
@@ -646,6 +674,19 @@ def parse_hy3(
     full ``<think>…</think>`` block.
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
+    boundary = scan_reasoning(
+        tokenizer,
+        ids,
+        prefilled=prefilled_thinking,
+        open_id=think_id,
+        close_id=think_end_id,
+        tool_start_id=tool_calls_id,
+        assistant_prefix="<｜hy_Assistant:opensource｜>",
+    )
+    if boundary.is_open:
+        return ParsedResponse(
+            content="", reasoning_content=boundary.text, reasoning_complete=False
+        )
 
     # ``token_span`` values are reported relative to this stop-stripped stream
     # (the documented contract), so track every prefix we slice off below.
@@ -660,19 +701,10 @@ def parse_hy3(
 
     reasoning = None
     think_end = _find(ids, think_end_id)
-    if think_end != -1:
-        reasoning_ids = [t for t in ids[:think_end] if t != think_id]
-        reasoning = _decode(tokenizer, reasoning_ids).strip()
+    if boundary.text is not None and think_end != -1:
+        reasoning = boundary.text.strip()
         ids = ids[think_end + 1 :]
         offset += think_end + 1
-    elif think_id in set(ids):
-        # Reasoning opened but never closed (truncation): everything after
-        # the opener is reasoning; there is no committed content yet.
-        think_start = _find(ids, think_id)
-        reasoning = _decode(tokenizer, ids[think_start + 1 :]).strip()
-        return ParsedResponse(
-            content="", reasoning_content=reasoning or None, tool_calls=[]
-        )
 
     # Content ends at the first tool marker — the outer <tool_calls> wrapper
     # or, defensively, a bare <tool_call> the model emitted without it.
@@ -828,6 +860,7 @@ def parse_laguna_xs2(
     tool_call_end_id: int,
     tools: list[ToolSpec] | None = None,
     strip_newlines: bool = True,
+    prefilled_thinking: bool = False,
 ) -> ParsedResponse:
     """Parse Laguna-XS.2 / XS-2.1 completion tokens.
 
@@ -843,8 +876,25 @@ def parse_laguna_xs2(
     never a bare ``.strip()``, which would also eat whitespace the model
     emitted intentionally. XS-2.1 renders both segments verbatim, so it
     parses with ``strip_newlines=False``.
+
+    ``prefilled_thinking`` means the generation prompt already opened
+    ``<think>``. Without a sampled ``</think>``, all output is still
+    reasoning, including any tool-call-looking text drafted inside it.
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
+    boundary = scan_reasoning(
+        tokenizer,
+        ids,
+        prefilled=prefilled_thinking,
+        open_id=think_id,
+        close_id=think_end_id,
+        tool_start_id=tool_call_id,
+        assistant_prefix="<assistant>",
+    )
+    if boundary.is_open:
+        return ParsedResponse(
+            content="", reasoning_content=boundary.text, reasoning_complete=False
+        )
 
     def _segment(segment_ids: list[int]) -> str:
         text = _decode(tokenizer, segment_ids)
@@ -853,17 +903,10 @@ def parse_laguna_xs2(
     reasoning = None
     parse_offset = 0
     think_end = _find(ids, think_end_id)
-    if think_end != -1:
-        reasoning_ids = ids[:think_end]
-        reasoning_ids = [t for t in reasoning_ids if t != think_id]
-        reasoning = _segment(reasoning_ids)
+    if boundary.text is not None and think_end != -1:
+        reasoning = boundary.text.strip("\n") if strip_newlines else boundary.text
         ids = ids[think_end + 1 :]
         parse_offset = think_end + 1
-    elif (think_start := _find(ids, think_id)) != -1:
-        reasoning = _segment(ids[think_start + 1 :])
-        return ParsedResponse(
-            content="", reasoning_content=reasoning or None, tool_calls=[]
-        )
 
     tc_start = _find(ids, tool_call_id)
     tool_calls: list[ParsedToolCall] = []
@@ -988,6 +1031,7 @@ def parse_deepseek_v3(
     tool_call_begin_id: int,
     tool_call_end_id: int,
     tool_sep_id: int,
+    prefilled_thinking: bool = False,
 ) -> ParsedResponse:
     """Parse DeepSeek V3 completion tokens.
 
@@ -998,6 +1042,17 @@ def parse_deepseek_v3(
         <｜tool▁calls▁end｜>
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
+    boundary = scan_reasoning(
+        tokenizer,
+        ids,
+        prefilled=prefilled_thinking,
+        tool_start_id=tool_calls_begin_id,
+        assistant_prefix="<｜Assistant｜>",
+    )
+    if boundary.is_open:
+        return ParsedResponse(
+            content="", reasoning_content=boundary.text, reasoning_complete=False
+        )
 
     # Reasoning first: skip past </think> before looking for the tool-call
     # section, so a section the model drafts *inside* its <think> trace isn't
@@ -1005,7 +1060,9 @@ def parse_deepseek_v3(
     # still starts at 0, so the </think> text-split below recovers reasoning.
     # DeepSeek-V3 renders </think> as multi-token text, hence the decode-based
     # boundary finder rather than a token-id anchor.
-    reasoning_end = _reasoning_end_token_index(tokenizer, ids)
+    reasoning_end = (
+        _reasoning_end_token_index(tokenizer, ids) if boundary.text is not None else 0
+    )
 
     tc_section_start = _find(ids, tool_calls_begin_id, reasoning_end)
     tool_calls: list[ParsedToolCall] = []
@@ -1027,9 +1084,9 @@ def parse_deepseek_v3(
     text = _decode(tokenizer, content_ids)
 
     reasoning = None
-    if "</think>" in text:
+    if boundary.text is not None and "</think>" in text:
         before, _, after = text.partition("</think>")
-        reasoning = before.replace("<think>", "").lstrip("\n").rstrip("\n").strip()
+        reasoning = boundary.text.strip()
         text = after.lstrip("\n")
 
     return ParsedResponse(
@@ -1149,6 +1206,205 @@ def _parse_deepseek_tool_calls(
     return tool_calls
 
 
+# ── DeepSeek V4: DSML tool calls + single-token </think> ────────────
+
+
+def parse_deepseek_v4(
+    tokenizer,
+    token_ids: list[int],
+    *,
+    stop_ids: set[int],
+    thinking_enabled: bool,
+    think_end_id: int,
+    dsml_id: int,
+    think_start_id: int | None = None,
+) -> ParsedResponse:
+    """Parse a DeepSeek V4 completion.
+
+    Thinking mode prefills ``<think>`` in the prompt, so the completion starts
+    with reasoning and closes it with the single-token ``</think>``.  Tool
+    calls use DSML markup; the ``｜DSML｜`` marker is a special token, and the
+    decoded grammar carries an explicit ``string=`` flag for lossless argument
+    type recovery. ``thinking_enabled`` describes the prompt's initial channel;
+    reasoning opened in the completion is recognized independently.
+    """
+    ids = _strip_stop_tokens(token_ids, stop_ids)
+    boundary = scan_reasoning(
+        tokenizer,
+        ids,
+        prefilled=thinking_enabled,
+        open_id=think_start_id,
+        close_id=think_end_id,
+        tool_start_id=dsml_id,
+        assistant_prefix="<｜Assistant｜>",
+    )
+    if boundary.is_open:
+        return ParsedResponse(
+            content="", reasoning_content=boundary.text, reasoning_complete=False
+        )
+
+    reasoning: str | None = None
+    content_offset = 0
+    think_end = _find(ids, think_end_id)
+    if boundary.text is not None and think_end != -1:
+        reasoning = boundary.text
+        content_offset = think_end + 1
+
+    content_ids = ids[content_offset:]
+    decoded = _decode(tokenizer, content_ids)
+    section_marker = "\n\n<｜DSML｜tool_calls>"
+    section_pos = decoded.find(section_marker)
+    if section_pos == -1 or dsml_id not in content_ids:
+        return ParsedResponse(
+            content=decoded,
+            reasoning_content=reasoning or None,
+            tool_calls=[],
+        )
+
+    content = decoded[:section_pos]
+    section_text = decoded[section_pos:]
+    section_token_offset = content_offset + _decoded_char_to_token_index(
+        tokenizer,
+        content_ids,
+        section_pos,
+    )
+    tool_calls = _parse_deepseek_v4_tool_calls(
+        tokenizer,
+        section_text,
+        ids[section_token_offset:],
+        section_offset=section_token_offset,
+    )
+    return ParsedResponse(
+        content=content,
+        reasoning_content=reasoning or None,
+        tool_calls=tool_calls,
+    )
+
+
+def _decoded_char_to_token_index(tokenizer, ids: list[int], char_index: int) -> int:
+    """Return the first token boundary at or beyond a decoded char offset."""
+    if char_index <= 0:
+        return 0
+    for boundary in range(1, len(ids) + 1):
+        if len(_decode(tokenizer, ids[:boundary])) >= char_index:
+            return boundary
+    return len(ids)
+
+
+def _parse_deepseek_v4_tool_calls(
+    tokenizer,
+    section_text: str,
+    section_ids: list[int],
+    *,
+    section_offset: int,
+) -> list[ParsedToolCall]:
+    """Parse every DSML ``invoke`` attempt from one tool-calls section."""
+    import re
+
+    invoke_start = '<｜DSML｜invoke name="'
+    invoke_end = "</｜DSML｜invoke>"
+    section_end = "</｜DSML｜tool_calls>"
+    parameter_pattern = re.compile(
+        r'<｜DSML｜parameter name="(.*?)" string="(true|false)">'
+        r"(.*?)</｜DSML｜parameter>",
+        re.DOTALL,
+    )
+
+    tool_calls: list[ParsedToolCall] = []
+    outer_end = section_text.find(section_end)
+    for invoke_match in re.finditer(r"<｜DSML｜invoke", section_text):
+        start = invoke_match.start()
+        if outer_end != -1 and outer_end < start:
+            break
+
+        close = section_text.find(invoke_end, start + len(invoke_start))
+        unclosed = close == -1 or (outer_end != -1 and outer_end < close)
+        block_end = outer_end if unclosed and outer_end != -1 else len(section_text)
+        if not unclosed:
+            block_end = close + len(invoke_end)
+        raw = section_text[start:block_end]
+
+        token_start = _decoded_char_to_token_index(tokenizer, section_ids, start)
+        token_end = _decoded_char_to_token_index(tokenizer, section_ids, block_end)
+        span = (section_offset + token_start, section_offset + token_end)
+
+        header_end = section_text.find(">\n", start, block_end)
+        name: str | None = None
+        malformed = False
+        if header_end == -1:
+            malformed = True
+            body = ""
+        else:
+            header = section_text[start : header_end + 2]
+            name_match = re.fullmatch(
+                r'<｜DSML｜invoke name="(.*?)">\n',
+                header,
+                flags=re.DOTALL,
+            )
+            if name_match:
+                name = name_match.group(1)
+            else:
+                malformed = True
+            body_end = close if not unclosed else block_end
+            body = section_text[header_end + 2 : body_end]
+
+        arguments: dict[str, Any] = {}
+        invalid_json = False
+        matched_ranges: list[tuple[int, int]] = []
+        for match in parameter_pattern.finditer(body):
+            key, is_string, raw_value = match.groups()
+            matched_ranges.append(match.span())
+            if key in arguments:
+                malformed = True
+                continue
+            if is_string == "true":
+                arguments[key] = raw_value
+            else:
+                try:
+                    arguments[key] = json.loads(raw_value)
+                except (json.JSONDecodeError, ValueError):
+                    arguments[key] = raw_value
+                    invalid_json = True
+
+        remainder_parts: list[str] = []
+        previous_end = 0
+        for match_start, match_end in matched_ranges:
+            remainder_parts.append(body[previous_end:match_start])
+            previous_end = match_end
+        remainder_parts.append(body[previous_end:])
+        remainder = "".join(remainder_parts)
+        # The canonical form has one newline before ``</invoke>`` and newlines
+        # between parameters.  Anything else left after removing parameter
+        # blocks is structural debris.
+        if remainder.strip("\n"):
+            malformed = True
+
+        if unclosed:
+            status = ToolCallParseStatus.UNCLOSED_BLOCK
+        elif not name:
+            status = ToolCallParseStatus.MISSING_NAME
+        elif malformed:
+            status = ToolCallParseStatus.MALFORMED_STRUCTURE
+        elif invalid_json:
+            status = ToolCallParseStatus.INVALID_JSON
+        else:
+            status = ToolCallParseStatus.OK
+
+        tool_calls.append(
+            ParsedToolCall(
+                raw=raw,
+                name=name,
+                arguments=arguments,
+                token_span=span,
+                status=status,
+            )
+        )
+        if unclosed:
+            break
+
+    return tool_calls
+
+
 # ── MiniMax: <minimax:tool_call> ... </minimax:tool_call> ────────────
 
 
@@ -1162,28 +1418,34 @@ def parse_minimax(
     tool_call_id: int,
     tool_call_end_id: int,
     tools: list[ToolSpec] | None = None,
+    prefilled_thinking: bool = False,
 ) -> ParsedResponse:
     """Parse MiniMax M2 completion tokens."""
     import re
 
     ids = _strip_stop_tokens(token_ids, stop_ids)
+    boundary = scan_reasoning(
+        tokenizer,
+        ids,
+        prefilled=prefilled_thinking,
+        open_id=think_id,
+        close_id=think_end_id,
+        tool_start_id=tool_call_id,
+        assistant_prefix="]~b]ai\n",
+    )
+    if boundary.is_open:
+        return ParsedResponse(
+            content="", reasoning_content=boundary.text, reasoning_complete=False
+        )
     param_index = _build_param_type_index(tools)
 
     reasoning = None
     parse_offset = 0
     think_end = _find(ids, think_end_id)
-    if think_end != -1:
-        reasoning_ids = ids[:think_end]
-        reasoning_ids = [t for t in reasoning_ids if t != think_id]
-        reasoning = _decode(tokenizer, reasoning_ids).strip()
+    if boundary.text is not None and think_end != -1:
+        reasoning = boundary.text.strip()
         ids = ids[think_end + 1 :]
         parse_offset = think_end + 1
-    elif think_id in set(ids):
-        think_start = _find(ids, think_id)
-        reasoning = _decode(tokenizer, ids[think_start + 1 :]).strip()
-        return ParsedResponse(
-            content="", reasoning_content=reasoning or None, tool_calls=[]
-        )
 
     tc_start = _find(ids, tool_call_id)
     tool_calls: list[ParsedToolCall] = []
@@ -1333,6 +1595,7 @@ def parse_kimi_k2(
     tool_call_begin_id: int,
     tool_call_argument_begin_id: int,
     tool_call_end_id: int,
+    prefilled_thinking: bool = False,
 ) -> ParsedResponse:
     """Parse Kimi K2 completion tokens.
 
@@ -1341,6 +1604,17 @@ def parse_kimi_k2(
     Tool call IDs are in format ``functions.name:index``.
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
+    boundary = scan_reasoning(
+        tokenizer,
+        ids,
+        prefilled=prefilled_thinking,
+        tool_start_id=tool_calls_section_begin_id,
+        assistant_prefix="<|im_assistant|>assistant<|im_middle|>",
+    )
+    if boundary.is_open:
+        return ParsedResponse(
+            content="", reasoning_content=boundary.text, reasoning_complete=False
+        )
 
     content_ids, tool_calls = parse_kimi_k2_section(
         tokenizer,
@@ -1350,24 +1624,18 @@ def parse_kimi_k2(
         tool_call_begin_id=tool_call_begin_id,
         tool_call_argument_begin_id=tool_call_argument_begin_id,
         tool_call_end_id=tool_call_end_id,
+        scan_start=_reasoning_end_token_index(tokenizer, ids)
+        if boundary.text is not None
+        else 0,
     )
 
     text = _decode(tokenizer, content_ids)
     reasoning: str | None = None
-    if "</think>" in text:
+    if boundary.text is not None and "</think>" in text:
         before, _, after = text.partition("</think>")
-        raw_think = before.replace("<think>", "", 1)
+        raw_think = boundary.text
         reasoning = raw_think.strip("\n").strip() or None
         text = after.strip("\n")
-    elif "<think>" in text:
-        # Truncated thinking (no closing tag)
-        raw_think = text.split("<think>", 1)[1]
-        reasoning = raw_think.strip("\n").strip() or None
-        return ParsedResponse(
-            content="",
-            reasoning_content=reasoning,
-            tool_calls=[],
-        )
 
     return ParsedResponse(
         content=text.strip(),
@@ -1465,6 +1733,40 @@ def _parse_kimi_k2_tool_calls(
 # ── GptOss (Harmony): <|start|>role<|channel|>ch<|message|>content<|end|/return|/call|>
 
 
+def harmony_blocks(
+    ids: list[int], *, start_id: int, message_id: int, end_id: int, call_id: int
+):
+    """Yield (block start, header end, body end, closed) without parsing payloads."""
+    i = 0
+    while i < len(ids):
+        if ids[i] != start_id:
+            i += 1
+            continue
+
+        block_start = i
+        msg_pos = _find(ids, message_id, i + 1)
+        if msg_pos == -1:
+            break
+
+        body_start = msg_pos + 1
+        candidates = [
+            pos
+            for pos in (
+                _find(ids, start_id, body_start),
+                _find(ids, end_id, body_start),
+                _find(ids, call_id, body_start),
+            )
+            if pos != -1
+        ]
+        body_end = min(candidates) if candidates else len(ids)
+        body_closed = bool(candidates) and ids[body_end] in (end_id, call_id)
+
+        yield block_start, msg_pos, body_end, body_closed
+        i = body_end
+        if i < len(ids) and ids[i] in (end_id, call_id):
+            i += 1
+
+
 def parse_gpt_oss(
     tokenizer,
     token_ids: list[int],
@@ -1479,8 +1781,7 @@ def parse_gpt_oss(
 ) -> ParsedResponse:
     """Parse GptOss (Harmony) completion tokens.
 
-    Finds the earliest terminal token (<|return|> or <|call|>), then walks the
-    token stream block-by-block to extract:
+    Stops at the first <|return|>, then walks message blocks to extract:
 
     - analysis channel              → reasoning_content
     - final channel                 → content
@@ -1501,34 +1802,18 @@ def parse_gpt_oss(
     reasoning_parts: list[str] = []
     content_parts: list[str] = []
     tool_calls: list[ParsedToolCall] = []
+    reasoning_complete = True
 
-    i = 0
-    while i < len(ids):
-        if ids[i] != start_id:
-            i += 1
-            continue
-
-        block_start = i
-        msg_pos = _find(ids, message_id, i + 1)
-        if msg_pos == -1:
-            break
-
-        header_ids = ids[i + 1 : msg_pos]
+    for block_start, msg_pos, body_end, body_closed in harmony_blocks(
+        ids,
+        start_id=start_id,
+        message_id=message_id,
+        end_id=end_id,
+        call_id=call_id,
+    ):
+        header_ids = ids[block_start + 1 : msg_pos]
         header_text = _decode(tokenizer, header_ids)
-
         body_start = msg_pos + 1
-        candidates = [
-            pos
-            for pos in (
-                _find(ids, start_id, body_start),
-                _find(ids, end_id, body_start),
-                _find(ids, call_id, body_start),
-            )
-            if pos != -1
-        ]
-        body_end = min(candidates) if candidates else len(ids)
-        body_closed = bool(candidates) and ids[body_end] in (end_id, call_id)
-
         body_text = _decode(tokenizer, ids[body_start:body_end])
 
         channel = _gptoss_extract_after_token(tokenizer, header_ids, channel_id)
@@ -1570,22 +1855,22 @@ def parse_gpt_oss(
                 )
         elif channel == "analysis":
             reasoning_parts.append(body_text)
+            # A new message ends this channel even without a message closer.
+            # Only analysis that reaches the end of the stream remains open.
+            reasoning_complete = body_closed or body_end < len(ids)
         elif channel == "final":
             content_parts.append(body_text)
         elif channel == "commentary":
             content_parts.append(body_text)
 
-        i = body_end
-        if i < len(ids) and ids[i] in (end_id, call_id):
-            i += 1
-
-    reasoning = "".join(reasoning_parts).strip() or None
+    reasoning = "".join(reasoning_parts).strip() or (None if reasoning_complete else "")
     content = "".join(content_parts).strip()
 
     return ParsedResponse(
         content=content,
         reasoning_content=reasoning,
         tool_calls=tool_calls,
+        reasoning_complete=reasoning_complete,
     )
 
 
@@ -1680,6 +1965,7 @@ def parse_inkling(
     invoke_json_id: int,
     invoke_text_id: int,
     end_message_id: int,
+    prefilled_thinking: bool = False,
 ) -> ParsedResponse:
     """Parse Inkling completion tokens.
 
@@ -1708,6 +1994,10 @@ def parse_inkling(
     content_parts: list[str] = []
     tool_calls: list[ParsedToolCall] = []
 
+    if prefilled_thinking and not ids:
+        return ParsedResponse(
+            content="", reasoning_content="", reasoning_complete=False
+        )
     pos = 0
     n = len(ids)
     while pos < n:
@@ -1723,8 +2013,15 @@ def parse_inkling(
 
         if not body:
             pass
-        elif body[0] == content_thinking_id:
-            reasoning_parts.append(_decode(tokenizer, body[1:]))
+        elif body[0] == content_thinking_id or (pos == 0 and prefilled_thinking):
+            reasoning_ids = body[1:] if body[0] == content_thinking_id else body
+            reasoning_parts.append(_decode(tokenizer, reasoning_ids))
+            if not terminated:
+                return ParsedResponse(
+                    content="",
+                    reasoning_content="".join(reasoning_parts),
+                    reasoning_complete=False,
+                )
         elif body[0] == content_text_id:
             content_parts.append(_decode(tokenizer, body[1:]))
         else:

@@ -25,15 +25,13 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from parity import models_for
 from renderers.base import ToolCallParseStatus
 
 # Both GLM renderers share ``parse_glm`` and are served by the same
 # strict vLLM parser (the ``glm45`` and ``glm47`` aliases both resolve
 # to ``Glm47MoeModelToolParser`` in vLLM ≥ 0.24).
-_MODELS = [
-    ("THUDM/GLM-4.5-Air", "auto"),
-    ("zai-org/GLM-5", "auto"),
-]
+_MODELS = [(case.model, case.renderer) for case in models_for("glm-tool-names")]
 
 _TOOLS = [
     {
@@ -75,7 +73,7 @@ def pytest_generate_tests(metafunc):
 def _parse(model: str, renderer_name: str, text: str, tools):
     tok, renderer = _load(model, renderer_name)
     ids = tok.encode(text, add_special_tokens=False)
-    return renderer.parse_response(ids, tools=tools)
+    return renderer.parse_response(ids, tools=tools, prompt_ids=[])
 
 
 def _statuses(parsed):

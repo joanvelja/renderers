@@ -1,55 +1,42 @@
-"""Sampled-token stability for renderers with disabled-thinking prefills.
+"""Sampled-token stability with thinking disabled.
 
-With ``enable_thinking=False`` the generation prompt prefills the empty
-``<think>\\n\\n</think>\\n\\n`` wrapper, so the wrapper is part of every
-sampled turn's token stream. In an agentic rollout the conversation keeps
-growing (tool responses, budget / prune-reminder user messages, ...) and may
-be re-rendered from messages. The upstream Jinja template strips the wrapper
-from assistant turns at or before the last user query, so a re-render would
-diverge token-for-token from the stream the model actually sampled — forking
-any token-identity comparison on byte-identical messages.
+For the affected Qwen and Gemma 4 variants, the generation prompt prefills an
+empty thinking wrapper, so that wrapper is part of every sampled turn's token
+stream. In an agentic rollout the conversation keeps growing (tool responses,
+budget / prune-reminder user messages, ...) and may be re-rendered from
+messages. The upstream Jinja templates strip the wrapper from assistant
+history, so a re-render would diverge token-for-token from the stream the model
+actually sampled — forking any token-identity comparison on byte-identical
+messages.
 
 These tests pin the renderer-side guarantee that fixes this: with thinking
 disabled, historical assistant turns without ``reasoning_content`` re-emit
 the exact gen-prompt wrapper, so the tokens a turn was sampled with are a
-prefix of every later re-render of the grown conversation. When a renderer's
-retention policy permits bridging across a user query, the bridge and full
-re-render also agree.
+prefix of every later re-render of the grown conversation, and the bridge
+and a full re-render agree.
 
 This is a deliberate, documented deviation from ``apply_chat_template`` —
-see the carve-out in ``test_renderer_config_parity.py`` and the module
-docstrings of ``renderers/qwen3.py`` / ``renderers/qwen35.py``.
+see the carve-out in ``test_parity.py`` and the module
+docstrings of the affected renderers.
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
 
-
+from parity import models_for
 from renderers import create_renderer
 from renderers.base import load_tokenizer
-from renderers.configs import (
-    Gemma4RendererConfig,
-    Qwen3RendererConfig,
-    Qwen35RendererConfig,
-    Qwen36RendererConfig,
-    Qwen38RendererConfig,
-)
+from renderers.configs import _config_class_for
 
 # One representative model per affected renderer family, each with
 # thinking explicitly disabled.
 _MODELS = [
-    ("Qwen/Qwen3-8B", Qwen3RendererConfig(enable_thinking=False)),
-    ("Qwen/Qwen3.5-9B", Qwen35RendererConfig(enable_thinking=False)),
-    ("Qwen/Qwen3.6-35B-A3B", Qwen36RendererConfig(enable_thinking=False)),
     (
-        "Qwen/Qwen3.8-27B",
-        Qwen38RendererConfig(enable_thinking=False),
-    ),
-    (
-        "google/gemma-4-26B-A4B-it",
-        Gemma4RendererConfig(enable_thinking=False),
-    ),
+        case.model,
+        _config_class_for(case.resolved_renderer)(enable_thinking=False),
+    )
+    for case in models_for("disabled-thinking")
 ]
 
 _EMPTY_WRAPPERS = {
@@ -123,12 +110,11 @@ def test_wrapper_reemitted_on_historical_turn(dt_model, dt_config):
     )
 
 
-def test_bridge_matches_derived_retention_policy(dt_model, dt_config):
-    """Cross-user bridging follows the renderer's derived retention policy.
-
-    When permitted, extending a sampled turn via the bridge and re-rendering
-    the same conversation from messages must produce identical tokens.
-    """
+def test_bridge_and_rerender_agree(dt_model, dt_config):
+    """Extending a sampled turn via the bridge and re-rendering the same
+    conversation from messages must produce identical tokens — the property
+    whose violation shows up as token-level forks on byte-identical
+    trajectories."""
     tok = _load(dt_model)
     renderer = create_renderer(tok, dt_config)
 
@@ -141,12 +127,9 @@ def test_bridge_matches_derived_retention_policy(dt_model, dt_config):
     reminder = {"role": "user", "content": "You are running low on budget."}
 
     bridged = renderer.bridge_to_next_turn(prompt_ids, completion_ids, [reminder])
-    if renderer.effective_thinking_retention != "all":
-        assert bridged is None
-        return
-
     assert bridged is not None, (
-        f"{dt_model}: bridge refused despite derived thinking_retention='all'"
+        f"{dt_model}: bridge refused with thinking disabled (implied "
+        "thinking_retention='all' should allow it)"
     )
 
     rerender = renderer.render_ids(

@@ -39,7 +39,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
-from transformers.tokenization_utils import PreTrainedTokenizer
+from renderers.reasoning import prompt_ends_in_reasoning
 
 from renderers.base import (
     Content,
@@ -49,6 +49,9 @@ from renderers.base import (
     PlaceholderRange,
     RenderedTokens,
     ToolSpec,
+    Tokenizer,
+    _content_mask_or_empty,
+    _require_transformers,
     extract_message_tool_names,
     reject_assistant_in_extension,
     resolve_thinking_retention,
@@ -172,7 +175,7 @@ class InklingRenderer:
 
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Tokenizer,
         config: InklingRendererConfig | None = None,
         *,
         processor: Any = None,
@@ -251,8 +254,6 @@ class InklingRenderer:
     def _get_processor(self):
         if self._processor is not None:
             return self._processor
-        from transformers import AutoProcessor
-
         name = getattr(self._tokenizer, "name_or_path", None)
         if not name:
             raise RuntimeError(
@@ -265,8 +266,9 @@ class InklingRenderer:
         # trust_remote_code is required. Keep text-only rendering installable
         # with older downstream pins and fail only when multimodal processing
         # is actually requested.
+        transformers = _require_transformers("Auto-loading an Inkling processor")
         try:
-            self._processor = AutoProcessor.from_pretrained(name)
+            self._processor = transformers.AutoProcessor.from_pretrained(name)
         except (ImportError, KeyError, ValueError) as exc:
             raise RuntimeError(
                 "Inkling image/audio rendering requires Transformers >=5.14 "
@@ -493,7 +495,7 @@ class InklingRenderer:
             token_ids=tokens,
             message_indices=indices,
             sampled_mask=sampled,
-            is_content=content_mask,
+            is_content=_content_mask_or_empty(self._tokenizer, content_mask),
             message_roles=[m.get("role") or "" for m in messages],
             message_tool_names=tool_names,
             multi_modal_data=mm_data,
@@ -515,6 +517,7 @@ class InklingRenderer:
         token_ids: list[int],
         *,
         tools: list[ToolSpec] | None = None,  # noqa: ARG002 — args are native JSON, no schema coercion
+        prompt_ids: list[int] | None = None,
     ) -> ParsedResponse:
         return parse_inkling(
             self._tokenizer,
@@ -526,6 +529,18 @@ class InklingRenderer:
             invoke_json_id=self._content_invoke_tool_json,
             invoke_text_id=self._content_invoke_tool_text,
             end_message_id=self._end_message,
+            prefilled_thinking=prompt_ends_in_reasoning(
+                self._tokenizer,
+                prompt_ids,
+                open_marker="<|content_thinking|>",
+                close_marker="<|end_message|>",
+                stop_ids={
+                    *self.get_stop_token_ids(),
+                    self._end_message,
+                    self._content_text,
+                },
+                initial_only=False,
+            ),
         )
 
     def get_stop_token_ids(self) -> list[int]:
@@ -795,6 +810,32 @@ class InklingRenderer:
             or reject_assistant_in_extension(new_messages)
         ):
             return None
+
+        completion_end = next(
+            (
+                i
+                for i, t in enumerate(previous_completion_ids)
+                if t in self.get_stop_token_ids()
+            ),
+            len(previous_completion_ids),
+        )
+        tail = [*previous_prompt_ids, *previous_completion_ids[:completion_end]]
+        segment_start = next(
+            (
+                i + 1
+                for i in range(len(tail) - 1, -1, -1)
+                if tail[i] == self._end_message
+            ),
+            0,
+        )
+        segment = tail[segment_start:]
+        if segment and segment[0] == self._message_model:
+            segment = segment[1:]
+        if segment and segment[0] == self._content_thinking:
+            if completion_end != len(previous_completion_ids):
+                return None
+            previous_completion_ids = [*previous_completion_ids, self._end_message]
+
         if should_rerender_for_thinking_retention(
             self.effective_thinking_retention, new_messages
         ):
@@ -990,7 +1031,7 @@ class InklingRenderer:
             token_ids=tokens,
             message_indices=indices,
             sampled_mask=sampled,
-            is_content=content_mask,
+            is_content=_content_mask_or_empty(self._tokenizer, content_mask),
             message_roles=[m.get("role") or "" for m in new_messages],
             message_tool_names=tool_names,
             multi_modal_data=mm_data,

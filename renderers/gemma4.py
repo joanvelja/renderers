@@ -464,10 +464,13 @@ class Gemma4Renderer:
             model_name in _EMPTY_THOUGHT_PREFILL_MODELS
             or "<|channel>thought\\n<channel|>" in chat_template
         )
-        if self.config.preserve_thinking:
-            default_retention = "all"
-        else:
-            default_retention = "tool_cycle"
+        # With thinking off no historical turn carries reasoning, so a bridge
+        # across a user query reproduces the full render byte for byte. With
+        # thinking on the template strips reasoning from every non-tool-call
+        # turn before the last user query, so bridging must stop at the tool
+        # cycle; `preserve_thinking` widens only the tool-call gate and does
+        # not make a cross-query bridge exact.
+        default_retention = "tool_cycle" if self.config.enable_thinking else "all"
         self.effective_thinking_retention = resolve_thinking_retention(
             self.config, default_retention
         )
@@ -1072,7 +1075,30 @@ class Gemma4Renderer:
                 if is_assistant
                 else []
             )
+            # A sampled Gemma 4 turn halts at ``<|tool_response>`` right after
+            # its calls, so visible content on a tool-calling message can only
+            # precede them. Google's template appends it after the folded
+            # response and then closes the turn (HF discussion #115); rendering
+            # it that way would rewrite the sampled stream, so this is a
+            # deliberate deviation in two parts: the content goes before the
+            # calls, and ``has_content`` stays False so the turn is left open
+            # after the responses, awaiting continuation exactly like an
+            # empty-content tool call. Content sampled between the calls and
+            # ``<|tool_response>`` (never observed) cannot round-trip: the
+            # parser folds it into ``content`` and it renders before the calls.
+            # Legacy ``tool_responses`` messages keep the template's placement,
+            # where ``content`` really is the post-response answer.
+            has_content = False
             if tool_calls:
+                em.set_msg_idx(msg_idx)
+                self._emit_content(
+                    em,
+                    msg.get("content"),
+                    role,
+                    mm_hashes,
+                    mm_placeholders,
+                    mm_items,
+                )
                 for tool_call in tool_calls:
                     body = (
                         "call:"
@@ -1176,15 +1202,16 @@ class Gemma4Renderer:
                     previous_message_type = "tool_response"
                     scan += 1
 
-            em.set_msg_idx(msg_idx)
-            has_content = self._emit_content(
-                em,
-                msg.get("content"),
-                role,
-                mm_hashes,
-                mm_placeholders,
-                mm_items,
-            )
+            if not tool_calls:
+                em.set_msg_idx(msg_idx)
+                has_content = self._emit_content(
+                    em,
+                    msg.get("content"),
+                    role,
+                    mm_hashes,
+                    mm_placeholders,
+                    mm_items,
+                )
 
             next_non_tool_role = None
             for next_idx in loop_indices[pos + 1 :]:

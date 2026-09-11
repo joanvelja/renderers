@@ -76,6 +76,10 @@ def test_no_thinking_knob_implies_all_bridge_policy(
     if isinstance(bare, DefaultRenderer):
         pytest.skip("DefaultRenderer has no typed no-thinking bridge policy")
 
+    if renderer_name == "auto":
+        renderer_name = MODEL_RENDERER_MAP.get(
+            getattr(tokenizer, "name_or_path", ""), "default"
+        )
     cfg_cls = _config_class_for(renderer_name)
     template_fields = cfg_cls.template_field_names()
     if "enable_thinking" in template_fields:

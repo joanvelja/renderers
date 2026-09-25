@@ -170,6 +170,7 @@ def test_generate_builds_request_body_and_parses_response(usage):
             "stop_token_ids": [99],
             "logprobs": 1,
             "skip_special_tokens": False,
+            "detokenize": False,
         },
     }
     # finish_reason promoted from "stop" → "tool_calls" because the renderer
@@ -204,6 +205,32 @@ def test_generate_builds_request_body_and_parses_response(usage):
     assert tc.name == "echo"
     assert tc.arguments == {"text": "hello"}
     assert tc.status == ToolCallParseStatus.OK
+
+
+@pytest.mark.parametrize(
+    ("sampling_params", "detokenize"),
+    [({}, False), ({"stop": ["</cell>"]}, True), ({"detokenize": True}, True)],
+    ids=["no-stop", "stop-strings", "caller-set"],
+)
+def test_generate_detokenizes_only_when_stop_strings_need_it(
+    sampling_params, detokenize
+):
+    client = _FakeClient()
+
+    asyncio.run(
+        generate(
+            client=client,
+            renderer=_FakeRenderer(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+            sampling_params=sampling_params,
+        )
+    )
+
+    # vLLM's SamplingParams default is detokenize=True, so an absent key detokenizes.
+    sent = client.calls[0]["body"]["sampling_params"]
+    assert sent.get("detokenize", True) is detokenize
 
 
 def test_generate_process_multimodal_false_sends_content_parts():

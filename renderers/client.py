@@ -357,7 +357,9 @@ async def generate(
 
     ``sampling_params`` is forwarded to vLLM verbatim. Two fields are always
     set by us and override caller values: ``stop_token_ids`` (from the
-    renderer) and ``logprobs`` (we always emit completion_logprobs). The
+    renderer) and ``logprobs`` (we always emit completion_logprobs).
+    ``detokenize`` defaults to ``False`` unless the request has ``stop``
+    strings: the endpoint returns token ids, so decoding is wasted work. The
     caller's ``top_logprobs=k`` is popped: ``k > 0`` requests ``logprobs=k+1``
     (the engine's ``max_logprobs`` must allow it) plus
     ``extra_args.top_logprobs=k`` (a prime-rl server answers with the packed
@@ -484,6 +486,9 @@ async def generate(
             "top_logprobs": top_k_logprobs,
         }
     sp.setdefault("skip_special_tokens", False)
+    # The endpoint returns token ids, never text: detokenizing only feeds stop strings.
+    if not sp.get("stop"):
+        sp.setdefault("detokenize", False)
 
     body: dict[str, Any] = {
         "model": model,

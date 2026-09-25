@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+from pathlib import Path
 
 import httpx
 import numpy as np
@@ -328,44 +329,41 @@ def test_generate_rejects_logprob_token_id_mismatch():
         _run_generate(client)
 
 
-def _vllm_top_logprobs(sampled, distribution, n):
-    """vLLM 0.28 generate serving: the position's dict is ``{sampled}`` then
-    top-1..top-n (insertion order, deduplicated), and the first ``n`` items
-    ship. A sampled token outside the top n evicts rank n."""
-    logprobs = dict(distribution)
-    row = {sampled: logprobs[sampled]}
-    for token_id, logprob in distribution[:n]:
-        row.setdefault(token_id, logprob)
-    return [
-        {"token": f"token_id:{t}", "logprob": lp} for t, lp in list(row.items())[:n]
-    ]
+# A live vLLM 0.28 /inference/v1/generate response for top_logprobs=3 (logprobs=4), recorded on the
+# TTT adapter and served byte for byte. vLLM ships {sampled} ∪ top-4 cut to 4 entries: seven
+# positions sample from outside the top 3 (row = [y, top-1, top-2, top-3], rank 4 evicted);
+# position 3 samples its rank-3 token; positions 3 and 4 hold exact logprob ties inside the head.
+_RECORDED_K3 = (Path(__file__).parent / "data" / "vllm_generate_k3.json").read_bytes()
 
 
-# Position 0 samples 7 from outside the top 4; position 1 samples 8 at rank 2.
-_DISTRIBUTIONS = (
-    [(50, -0.3), (51, -1.2), (52, -2.0), (53, -3.0), (7, -4.0)],
-    [(60, -0.2), (8, -0.9), (61, -1.5), (62, -2.5), (63, -3.5)],
-)
+class _RecordedClient(_FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.raw = _RECORDED_K3
+        self.payload = json.loads(_RECORDED_K3)
+        self.choice = self.payload["choices"][0]
+
+    def mutate_row(self, index, mutate):
+        mutate(self.choice["logprobs"]["content"][index]["top_logprobs"])
+        self.raw = json.dumps(self.payload).encode()
+
+    async def post(self, path, *, cast_to=dict, body=None, options=None):
+        self.calls.append(
+            {"path": path, "cast_to": cast_to, "body": body, "options": options}
+        )
+        return httpx.Response(200, content=self.raw)
 
 
-def _top_logprobs_client(k):
-    client = _FakeClient()
-    client.choice["logprobs"]["content"] = [
-        {
-            "token": f"token_id:{sampled}",
-            "logprob": dict(distribution)[sampled],
-            "top_logprobs": _vllm_top_logprobs(sampled, distribution, k + 1),
-        }
-        for sampled, distribution in zip((7, 8), _DISTRIBUTIONS)
-    ]
-    return client
+class _AnyCompletionRenderer(_FakeRenderer):
+    def parse_response(self, completion_ids, *, tools=None, prompt_ids=None):
+        return ParsedResponse(content="")
 
 
 def _run_top_logprobs(client, k):
     return asyncio.run(
         generate(
             client=client,
-            renderer=_FakeRenderer(),
+            renderer=_AnyCompletionRenderer(),
             messages=[{"role": "user", "content": "hi"}],
             model="test-model",
             tools=[{"type": "function", "function": {"name": "echo"}}],
@@ -375,7 +373,7 @@ def _run_top_logprobs(client, k):
 
 
 def test_generate_returns_exact_sampler_top_k_for_any_sampled_token():
-    client = _top_logprobs_client(3)
+    client = _RecordedClient()
 
     result = _run_top_logprobs(client, 3)
 
@@ -384,11 +382,29 @@ def test_generate_returns_exact_sampler_top_k_for_any_sampled_token():
     assert "top_logprobs" not in sp
     ids, logprobs = result["completion_top_ids"], result["completion_top_logprobs"]
     assert ids.dtype == np.int32 and logprobs.dtype == np.float32
-    np.testing.assert_array_equal(ids, [[50, 51, 52], [60, 8, 61]])
+    expected = [
+        [198, 220, 279],
+        [198, 220, 195],
+        [198, 136238, 279],
+        [9062, 1456, 17316],
+        [2247, 7972, 198],
+        [9062, 2184, 7599],
+        [198, 2247, 11],
+        [198, 271, 220],
+    ]
+    np.testing.assert_array_equal(ids, expected)
+    content = client.choice["logprobs"]["content"]
+    recorded = [
+        {int(e["token"][len("token_id:") :]): e["logprob"] for e in row["top_logprobs"]}
+        for row in content
+    ]
     np.testing.assert_array_equal(
-        logprobs, np.array([[-0.3, -1.2, -2.0], [-0.2, -0.9, -1.5]], np.float32)
+        logprobs,
+        np.array(
+            [[r[t] for t in row] for r, row in zip(recorded, expected)], np.float32
+        ),
     )
-    assert result["completion_logprobs"] == [-4.0, -0.9]
+    assert result["completion_logprobs"] == [row["logprob"] for row in content]
 
 
 @pytest.mark.parametrize(
@@ -405,15 +421,15 @@ def test_generate_returns_exact_sampler_top_k_for_any_sampled_token():
         ),
         (lambda row: row[2].update(logprob=None), r"logprob must be a number"),
         (lambda row: row[3].update(token="token_id:x"), r"must be 'token_id:<int32>'"),
-        (lambda row: row[3].update(token="61"), r"must be 'token_id:<int32>'"),
+        (lambda row: row[3].update(token="195"), r"must be 'token_id:<int32>'"),
         (lambda row: row[3].update(token="token_id:-61"), r"'token_id:<int32>'"),
         (lambda row: row[3].update(token="token_id:4294967296"), r"<int32>"),
     ],
     ids=["short", "duplicate", "nan", "null", "text", "bare", "negative", "wide"],
 )
 def test_generate_rejects_malformed_top_logprobs_row(mutate, match):
-    client = _top_logprobs_client(3)
-    mutate(client.choice["logprobs"]["content"][1]["top_logprobs"])
+    client = _RecordedClient()
+    client.mutate_row(1, mutate)
 
     with pytest.raises(MalformedGenerateResponseError, match=match):
         _run_top_logprobs(client, 3)
@@ -421,7 +437,7 @@ def test_generate_rejects_malformed_top_logprobs_row(mutate, match):
 
 @pytest.mark.parametrize("k", [-1, True, 2.0, "3"])
 def test_generate_rejects_invalid_top_logprobs_request(k):
-    client = _top_logprobs_client(3)
+    client = _RecordedClient()
 
     with pytest.raises(ValueError, match="top_logprobs must be a non-negative int"):
         _run_top_logprobs(client, k)

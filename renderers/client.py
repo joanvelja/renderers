@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 import httpx
+import numpy as np
 from openai import AsyncOpenAI
 
 from renderers.base import (
@@ -31,6 +32,8 @@ ROUTED_EXPERTS_DATA_PREFIX = b'"routed_experts":{"data":"'
 # vLLM uses this value both when sampled-token evidence is missing and as a
 # lower-bound clamp, so receiving it cannot prove the real logprob was returned.
 VLLM_LOGPROB_SENTINEL = -9999.0
+_TOKEN_ID_PREFIX = "token_id:"
+_INT32_MAX = 2**31 - 1
 
 
 class OverlongPromptError(Exception):
@@ -188,6 +191,80 @@ def _parse_completion_logprobs(
     return completion_logprobs
 
 
+def _parse_completion_top_logprobs(
+    content: list[Mapping[str, Any]], k: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """The sampler's exact top-``k`` per completion token: int32 ids and float32
+    logprobs, each ``[T, k]``, sorted by logprob descending.
+
+    vLLM builds each position's dict as ``{sampled} ∪ {top-1..top-N}`` and
+    returns its first ``N`` items, so a sampled token outside the top ``N``
+    evicts rank ``N``. The request asks for ``N = k + 1``; the ``k`` largest
+    of those ``k + 1`` entries are the exact top-``k`` for any sampled token.
+    ``-9999.0`` (vLLM's clamp of ``-inf``) is kept: it is a zero-probability
+    head entry, not missing evidence.
+    """
+    width = k + 1
+    ids: list[int] = []
+    logprobs: list[float] = []
+    for index, entry in enumerate(content):
+        top = entry.get("top_logprobs")
+        if not isinstance(top, list) or len(top) != width:
+            got = len(top) if isinstance(top, list) else type(top).__name__
+            raise MalformedGenerateResponseError(
+                f"Engine response choice.logprobs.content[{index}].top_logprobs must "
+                f"hold {width} entries for top_logprobs={k}, got {got}."
+            )
+        for rank, item in enumerate(top):
+            token = item.get("token") if isinstance(item, Mapping) else None
+            digits = (
+                token[len(_TOKEN_ID_PREFIX) :]
+                if isinstance(token, str) and token.startswith(_TOKEN_ID_PREFIX)
+                else ""
+            )
+            token_id = int(digits) if digits.isascii() and digits.isdigit() else -1
+            if not 0 <= token_id <= _INT32_MAX:
+                raise MalformedGenerateResponseError(
+                    f"Engine response choice.logprobs.content[{index}].top_logprobs[{rank}]"
+                    f".token must be 'token_id:<int32>', got {token!r}."
+                )
+            value = item.get("logprob")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise MalformedGenerateResponseError(
+                    f"Engine response choice.logprobs.content[{index}].top_logprobs[{rank}]"
+                    ".logprob must be a number."
+                )
+            ids.append(token_id)
+            logprobs.append(value)
+
+    rows = len(content)
+    id_rows = np.asarray(ids, dtype=np.int32).reshape(rows, width)
+    try:
+        lp_rows = np.asarray(logprobs, dtype=np.float64).reshape(rows, width)
+    except OverflowError as exc:  # an integer literal beyond float64
+        raise MalformedGenerateResponseError(
+            "Engine response top_logprobs logprobs must be finite."
+        ) from exc
+    bad = np.nonzero(~np.isfinite(lp_rows).all(axis=1))[0]
+    if len(bad):
+        raise MalformedGenerateResponseError(
+            f"Engine response choice.logprobs.content[{bad[0]}].top_logprobs "
+            "logprobs must be finite."
+        )
+    sorted_ids = np.sort(id_rows, axis=1)
+    dup = np.nonzero((sorted_ids[:, 1:] == sorted_ids[:, :-1]).any(axis=1))[0]
+    if len(dup):
+        raise MalformedGenerateResponseError(
+            f"Engine response choice.logprobs.content[{dup[0]}].top_logprobs "
+            "has duplicate token ids."
+        )
+    order = np.argsort(-lp_rows, axis=1, kind="stable")[:, :k]
+    return (
+        np.take_along_axis(id_rows, order, axis=1),
+        np.take_along_axis(lp_rows, order, axis=1).astype(np.float32),
+    )
+
+
 async def generate(
     *,
     client: AsyncOpenAI,
@@ -209,7 +286,12 @@ async def generate(
 
     ``sampling_params`` is forwarded to vLLM verbatim. Two fields are always
     set by us and override caller values: ``stop_token_ids`` (from the
-    renderer) and ``logprobs=1`` (we always emit completion_logprobs). Pass
+    renderer) and ``logprobs`` (we always emit completion_logprobs). The
+    caller's ``top_logprobs=k`` is popped: ``k > 0`` requests ``logprobs=k+1``
+    (the engine's ``max_logprobs`` must allow it) and returns the sampler's
+    exact top-``k`` per completion token as ``completion_top_ids`` (int32
+    ``[T, k]``) and ``completion_top_logprobs`` (float32 ``[T, k]``), each row
+    sorted by logprob descending; both are ``None`` when ``k == 0``. Pass
     ``prompt_ids`` to skip rendering and use a prebuilt token sequence —
     pair it with ``multi_modal_data`` when the prebuilt prompt has image /
     video placeholders that need engine-side mm payload, and with
@@ -240,7 +322,8 @@ async def generate(
     vLLM knows the expanded prompt length.
 
     Returns a dict with: request_id, prompt_ids, renderer_prompt_ids,
-    mm_placeholders, completion_ids, completion_logprobs, content,
+    mm_placeholders, completion_ids, completion_logprobs, completion_top_ids,
+    completion_top_logprobs, content,
     reasoning_content, tool_calls, finish_reason, routed_experts,
     multi_modal_data, prompt_attribution. ``renderer_prompt_ids`` is the
     unexpanded logical prompt when ``process_multimodal=False`` and ``None``
@@ -308,8 +391,19 @@ async def generate(
             )
 
     sp: dict[str, Any] = dict(sampling_params or {})
+    top_k_logprobs = sp.pop("top_logprobs", 0)
+    if (
+        isinstance(top_k_logprobs, bool)
+        or not isinstance(top_k_logprobs, int)
+        or top_k_logprobs < 0
+    ):
+        raise ValueError(
+            f"top_logprobs must be a non-negative int, got {top_k_logprobs!r}"
+        )
     sp["stop_token_ids"] = stop_token_ids
-    sp["logprobs"] = 1
+    # One extra entry makes the head independent of the sampled token (see
+    # _parse_completion_top_logprobs).
+    sp["logprobs"] = top_k_logprobs + 1 if top_k_logprobs else 1
     sp.setdefault("skip_special_tokens", False)
 
     body: dict[str, Any] = {
@@ -366,6 +460,11 @@ async def generate(
         )
 
     completion_logprobs = _parse_completion_logprobs(choice, completion_ids)
+    completion_top_ids, completion_top_logprobs = (
+        _parse_completion_top_logprobs(choice["logprobs"]["content"], top_k_logprobs)
+        if top_k_logprobs
+        else (None, None)
+    )
 
     parsed = renderer.parse_response(
         completion_ids,
@@ -401,6 +500,8 @@ async def generate(
         "mm_placeholders": mm_placeholders,
         "completion_ids": list(completion_ids),
         "completion_logprobs": completion_logprobs,
+        "completion_top_ids": completion_top_ids,
+        "completion_top_logprobs": completion_top_logprobs,
         "content": parsed.content,
         "reasoning_content": parsed.reasoning_content,
         "tool_calls": parsed.tool_calls,

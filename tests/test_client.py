@@ -179,6 +179,8 @@ def test_generate_builds_request_body_and_parses_response(usage):
     assert result["prompt_ids"] == [1, 2, 3]
     assert result["completion_ids"] == [7, 8]
     assert result["completion_logprobs"] == [-0.1, -0.2]
+    assert result["completion_top_ids"] is None
+    assert result["completion_top_logprobs"] is None
     assert result["routed_experts"]["shape"] == [2, 1, 1]
     assert isinstance(result["routed_experts"]["data"], memoryview)
     assert result["routed_experts"]["data"].tobytes() == base64.b64encode(b"\x01\x02")
@@ -324,6 +326,106 @@ def test_generate_rejects_logprob_token_id_mismatch():
         match=r"content\[0\]\.token must be 'token_id:7'",
     ):
         _run_generate(client)
+
+
+def _vllm_top_logprobs(sampled, distribution, n):
+    """vLLM 0.28 generate serving: the position's dict is ``{sampled}`` then
+    top-1..top-n (insertion order, deduplicated), and the first ``n`` items
+    ship. A sampled token outside the top n evicts rank n."""
+    logprobs = dict(distribution)
+    row = {sampled: logprobs[sampled]}
+    for token_id, logprob in distribution[:n]:
+        row.setdefault(token_id, logprob)
+    return [
+        {"token": f"token_id:{t}", "logprob": lp} for t, lp in list(row.items())[:n]
+    ]
+
+
+# Position 0 samples 7 from outside the top 4; position 1 samples 8 at rank 2.
+_DISTRIBUTIONS = (
+    [(50, -0.3), (51, -1.2), (52, -2.0), (53, -3.0), (7, -4.0)],
+    [(60, -0.2), (8, -0.9), (61, -1.5), (62, -2.5), (63, -3.5)],
+)
+
+
+def _top_logprobs_client(k):
+    client = _FakeClient()
+    client.choice["logprobs"]["content"] = [
+        {
+            "token": f"token_id:{sampled}",
+            "logprob": dict(distribution)[sampled],
+            "top_logprobs": _vllm_top_logprobs(sampled, distribution, k + 1),
+        }
+        for sampled, distribution in zip((7, 8), _DISTRIBUTIONS)
+    ]
+    return client
+
+
+def _run_top_logprobs(client, k):
+    return asyncio.run(
+        generate(
+            client=client,
+            renderer=_FakeRenderer(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+            sampling_params={"top_logprobs": k},
+        )
+    )
+
+
+def test_generate_returns_exact_sampler_top_k_for_any_sampled_token():
+    client = _top_logprobs_client(3)
+
+    result = _run_top_logprobs(client, 3)
+
+    sp = client.calls[0]["body"]["sampling_params"]
+    assert sp["logprobs"] == 4
+    assert "top_logprobs" not in sp
+    ids, logprobs = result["completion_top_ids"], result["completion_top_logprobs"]
+    assert ids.dtype == np.int32 and logprobs.dtype == np.float32
+    np.testing.assert_array_equal(ids, [[50, 51, 52], [60, 8, 61]])
+    np.testing.assert_array_equal(
+        logprobs, np.array([[-0.3, -1.2, -2.0], [-0.2, -0.9, -1.5]], np.float32)
+    )
+    assert result["completion_logprobs"] == [-4.0, -0.9]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (lambda row: row.pop(), r"content\[1\]\.top_logprobs must hold 4 entries"),
+        (
+            lambda row: row[1].update(token=row[0]["token"]),
+            r"content\[1\]\.top_logprobs has duplicate token ids",
+        ),
+        (
+            lambda row: row[2].update(logprob=float("nan")),
+            r"content\[1\]\.top_logprobs logprobs must be finite",
+        ),
+        (lambda row: row[2].update(logprob=None), r"logprob must be a number"),
+        (lambda row: row[3].update(token="token_id:x"), r"must be 'token_id:<int32>'"),
+        (lambda row: row[3].update(token="61"), r"must be 'token_id:<int32>'"),
+        (lambda row: row[3].update(token="token_id:-61"), r"'token_id:<int32>'"),
+        (lambda row: row[3].update(token="token_id:4294967296"), r"<int32>"),
+    ],
+    ids=["short", "duplicate", "nan", "null", "text", "bare", "negative", "wide"],
+)
+def test_generate_rejects_malformed_top_logprobs_row(mutate, match):
+    client = _top_logprobs_client(3)
+    mutate(client.choice["logprobs"]["content"][1]["top_logprobs"])
+
+    with pytest.raises(MalformedGenerateResponseError, match=match):
+        _run_top_logprobs(client, 3)
+
+
+@pytest.mark.parametrize("k", [-1, True, 2.0, "3"])
+def test_generate_rejects_invalid_top_logprobs_request(k):
+    client = _top_logprobs_client(3)
+
+    with pytest.raises(ValueError, match="top_logprobs must be a non-negative int"):
+        _run_top_logprobs(client, k)
+    assert client.calls == []
 
 
 def test_generate_preserves_zero_completion_logprob():

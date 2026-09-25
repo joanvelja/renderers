@@ -379,6 +379,7 @@ def test_generate_returns_exact_sampler_top_k_for_any_sampled_token():
 
     sp = client.calls[0]["body"]["sampling_params"]
     assert sp["logprobs"] == 4
+    assert sp["extra_args"] == {"top_logprobs": 3}
     assert "top_logprobs" not in sp
     ids, logprobs = result["completion_top_ids"], result["completion_top_logprobs"]
     assert ids.dtype == np.int32 and logprobs.dtype == np.float32
@@ -432,6 +433,15 @@ def test_generate_rejects_malformed_top_logprobs_row(mutate, match):
     client.mutate_row(1, mutate)
 
     with pytest.raises(MalformedGenerateResponseError, match=match):
+        _run_top_logprobs(client, 3)
+
+
+def test_generate_rejects_a_response_without_any_requested_top_k():
+    client = _RecordedClient()
+    for index in range(len(client.choice["logprobs"]["content"])):
+        client.mutate_row(index, list.clear)
+
+    with pytest.raises(MalformedGenerateResponseError, match=r"carries neither packed"):
         _run_top_logprobs(client, 3)
 
 

@@ -7,6 +7,8 @@ messages → Renderer.render_ids() → token IDs → POST /inference/v1/generate
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import math
@@ -265,6 +267,75 @@ def _parse_completion_top_logprobs(
     )
 
 
+def _decode_packed_top(
+    choice: Mapping[str, Any], key: str, dtype: str, rows: int, k: int
+) -> np.ndarray:
+    """One packed ``{data, shape, dtype}`` raw-byte base64 array from the choice."""
+    packed = choice.get(key)
+    if not isinstance(packed, Mapping):
+        raise MalformedGenerateResponseError(
+            f"Engine response choice.{key} must be a packed array object."
+        )
+    if packed.get("dtype") != dtype or packed.get("shape") != [rows, k]:
+        raise MalformedGenerateResponseError(
+            f"Engine response choice.{key} must be {dtype} [{rows}, {k}], got "
+            f"{packed.get('dtype')!r} {packed.get('shape')!r}."
+        )
+    data = packed.get("data")
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (TypeError, ValueError, binascii.Error) as exc:
+        raise MalformedGenerateResponseError(
+            f"Engine response choice.{key}.data must be base64."
+        ) from exc
+    wire = np.dtype(dtype).newbyteorder("<")
+    if len(raw) != rows * k * wire.itemsize:
+        raise MalformedGenerateResponseError(
+            f"Engine response choice.{key} holds {len(raw)} bytes, not {rows} x {k} {dtype}."
+        )
+    return np.frombuffer(raw, dtype=wire).reshape(rows, k).astype(dtype, copy=False)
+
+
+def _parse_completion_top_k(
+    choice: Mapping[str, Any], completion_ids: list[int], k: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """The sampler's top-``k`` per completion token, from whichever format the engine
+    sent: prime-rl's packed ``completion_top_ids`` / ``completion_top_logprobs``
+    (int32 / float32 ``[T, k]`` raw-byte base64), or stock vLLM's JSON
+    ``top_logprobs`` rows. Neither present raises."""
+    rows = len(completion_ids)
+    if "completion_top_ids" in choice or "completion_top_logprobs" in choice:
+        ids = _decode_packed_top(choice, "completion_top_ids", "int32", rows, k)
+        logprobs = _decode_packed_top(
+            choice, "completion_top_logprobs", "float32", rows, k
+        )
+        if rows and int(ids.min()) < 0:
+            raise MalformedGenerateResponseError(
+                "Engine response choice.completion_top_ids has negative token ids."
+            )
+        if not np.isfinite(logprobs).all():
+            raise MalformedGenerateResponseError(
+                "Engine response choice.completion_top_logprobs must be finite."
+            )
+        if (logprobs[:, 1:] > logprobs[:, :-1]).any():
+            raise MalformedGenerateResponseError(
+                "Engine response choice.completion_top_logprobs rows must be sorted descending."
+            )
+        sorted_ids = np.sort(ids, axis=1)
+        if (sorted_ids[:, 1:] == sorted_ids[:, :-1]).any():
+            raise MalformedGenerateResponseError(
+                "Engine response choice.completion_top_ids has duplicate token ids."
+            )
+        return ids, logprobs
+    content = choice["logprobs"]["content"]
+    if content and not any(entry.get("top_logprobs") for entry in content):
+        raise MalformedGenerateResponseError(
+            f"top_logprobs={k} was requested but the engine response carries neither "
+            "packed completion_top_ids / completion_top_logprobs nor JSON top_logprobs."
+        )
+    return _parse_completion_top_logprobs(content, k)
+
+
 async def generate(
     *,
     client: AsyncOpenAI,
@@ -288,10 +359,12 @@ async def generate(
     set by us and override caller values: ``stop_token_ids`` (from the
     renderer) and ``logprobs`` (we always emit completion_logprobs). The
     caller's ``top_logprobs=k`` is popped: ``k > 0`` requests ``logprobs=k+1``
-    (the engine's ``max_logprobs`` must allow it) and returns the sampler's
-    exact top-``k`` per completion token as ``completion_top_ids`` (int32
-    ``[T, k]``) and ``completion_top_logprobs`` (float32 ``[T, k]``), each row
-    sorted by logprob descending; both are ``None`` when ``k == 0``. Pass
+    (the engine's ``max_logprobs`` must allow it) plus
+    ``extra_args.top_logprobs=k`` (a prime-rl server answers with the packed
+    head) and returns the sampler's exact top-``k`` per completion token as
+    ``completion_top_ids`` (int32 ``[T, k]``) and ``completion_top_logprobs``
+    (float32 ``[T, k]``), each row sorted by logprob descending; both are
+    ``None`` when ``k == 0``. Pass
     ``prompt_ids`` to skip rendering and use a prebuilt token sequence —
     pair it with ``multi_modal_data`` when the prebuilt prompt has image /
     video placeholders that need engine-side mm payload, and with
@@ -401,9 +474,15 @@ async def generate(
             f"top_logprobs must be a non-negative int, got {top_k_logprobs!r}"
         )
     sp["stop_token_ids"] = stop_token_ids
-    # One extra entry makes the head independent of the sampled token (see
-    # _parse_completion_top_logprobs).
+    # One extra entry makes stock vLLM's JSON head independent of the sampled token
+    # (see _parse_completion_top_logprobs); extra_args asks a prime-rl server for the
+    # packed top-k instead (see _parse_completion_top_k).
     sp["logprobs"] = top_k_logprobs + 1 if top_k_logprobs else 1
+    if top_k_logprobs:
+        sp["extra_args"] = {
+            **(sp.get("extra_args") or {}),
+            "top_logprobs": top_k_logprobs,
+        }
     sp.setdefault("skip_special_tokens", False)
 
     body: dict[str, Any] = {
@@ -461,7 +540,7 @@ async def generate(
 
     completion_logprobs = _parse_completion_logprobs(choice, completion_ids)
     completion_top_ids, completion_top_logprobs = (
-        _parse_completion_top_logprobs(choice["logprobs"]["content"], top_k_logprobs)
+        _parse_completion_top_k(choice, completion_ids, top_k_logprobs)
         if top_k_logprobs
         else (None, None)
     )

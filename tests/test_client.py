@@ -334,14 +334,23 @@ def test_generate_rejects_logprob_token_id_mismatch():
 # positions sample from outside the top 3 (row = [y, top-1, top-2, top-3], rank 4 evicted);
 # position 3 samples its rank-3 token; positions 3 and 4 hold exact logprob ties inside the head.
 _RECORDED_K3 = (Path(__file__).parent / "data" / "vllm_generate_k3.json").read_bytes()
+# The same request to a prime-rl server (feat/score-centering-serving): extra_args.top_logprobs=3
+# returns the head as packed int32 / float32 [8, 3] arrays and empty JSON top_logprobs rows.
+_RECORDED_K3_PACKED = (
+    Path(__file__).parent / "data" / "prime_rl_generate_k3_packed.json"
+).read_bytes()
 
 
 class _RecordedClient(_FakeClient):
-    def __init__(self):
+    def __init__(self, raw=_RECORDED_K3):
         super().__init__()
-        self.raw = _RECORDED_K3
-        self.payload = json.loads(_RECORDED_K3)
+        self.raw = raw
+        self.payload = json.loads(raw)
         self.choice = self.payload["choices"][0]
+
+    def mutate_choice(self, mutate):
+        mutate(self.choice)
+        self.raw = json.dumps(self.payload).encode()
 
     def mutate_row(self, index, mutate):
         mutate(self.choice["logprobs"]["content"][index]["top_logprobs"])
@@ -431,6 +440,65 @@ def test_generate_returns_exact_sampler_top_k_for_any_sampled_token():
 def test_generate_rejects_malformed_top_logprobs_row(mutate, match):
     client = _RecordedClient()
     client.mutate_row(1, mutate)
+
+    with pytest.raises(MalformedGenerateResponseError, match=match):
+        _run_top_logprobs(client, 3)
+
+
+def test_generate_decodes_a_live_packed_top_k():
+    client = _RecordedClient(_RECORDED_K3_PACKED)
+
+    result = _run_top_logprobs(client, 3)
+
+    assert client.calls[0]["body"]["sampling_params"]["extra_args"] == {
+        "top_logprobs": 3
+    }
+    ids, logprobs = result["completion_top_ids"], result["completion_top_logprobs"]
+    assert ids.dtype == np.int32 and logprobs.dtype == np.float32
+    np.testing.assert_array_equal(
+        ids,
+        [
+            [198, 220, 279],
+            [198, 220, 304],
+            [198, 136238, 279],
+            [9062, 1456, 17316],
+            [2247, 7972, 198],
+            [9062, 2184, 7599],
+            [198, 2247, 11],
+            [198, 271, 220],
+        ],
+    )
+    content = client.choice["logprobs"]["content"]
+    sampled = [row["logprob"] for row in content]
+    assert result["completion_logprobs"] == sampled
+    # Position 3 samples its rank-3 token: the packed head and the sampled entry agree.
+    assert logprobs[3, 2] == np.float32(sampled[3])
+    assert (np.diff(logprobs, axis=1) <= 0).all()
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        (
+            lambda choice: choice.pop("completion_top_logprobs"),
+            r"completion_top_logprobs must be a packed array object",
+        ),
+        (
+            lambda choice: choice["completion_top_ids"].update(shape=[8, 4]),
+            r"completion_top_ids must be int32 \[8, 3\]",
+        ),
+        (
+            lambda choice: choice["completion_top_ids"].update(
+                data=choice["completion_top_ids"]["data"][:-8]
+            ),
+            r"completion_top_ids holds 90 bytes",
+        ),
+    ],
+    ids=["one-key", "shape", "truncated"],
+)
+def test_generate_rejects_a_malformed_packed_top_k(mutate, match):
+    client = _RecordedClient(_RECORDED_K3_PACKED)
+    client.mutate_choice(mutate)
 
     with pytest.raises(MalformedGenerateResponseError, match=match):
         _run_top_logprobs(client, 3)

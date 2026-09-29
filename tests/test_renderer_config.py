@@ -7,12 +7,12 @@ from typing import Literal
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
-
 from renderers import (
     AutoRendererConfig,
     BaseRendererConfig,
     DefaultRendererConfig,
     GLM5RendererConfig,
+    GLM53RendererConfig,
     GptOssRendererConfig,
     Nemotron3RendererConfig,
     Qwen3RendererConfig,
@@ -51,6 +51,12 @@ def test_discriminated_union_dispatches_on_name():
     assert isinstance(parsed, GLM5RendererConfig)
     assert parsed.enable_thinking is False
     assert parsed.clear_thinking is False
+
+
+def test_glm53_defaults_match_its_template():
+    cfg = GLM53RendererConfig()
+    assert cfg.clear_thinking is False
+    assert cfg.reasoning_effort == "max"
 
 
 def test_discriminated_union_rejects_wrong_renderer_kwargs():

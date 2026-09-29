@@ -984,6 +984,8 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     "zai-org/GLM-5-FP8": "glm-5",
     "zai-org/GLM-4.7-Flash": "glm-5",
     "zai-org/GLM-5.1": "glm-5.1",
+    "zai-org/GLM-5.3": "glm-5.3",
+    "zai-org/GLM-5.3-BF16": "glm-5.3",
     # GLM-4.5.
     "THUDM/GLM-4.5-Air": "glm-4.5",
     "zai-org/GLM-4.5-Air": "glm-4.5",
@@ -1015,6 +1017,7 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     # Nemotron 3.5 (Lightning). Its template is the Ultra variant's minus the
     # effort kwarg (``nemotron-3.5``).
     "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": "nemotron-3.5",
+    "nvidia/NVIDIA-Nemotron-3.5-Super-EA-09112026": "nemotron-3.5",
     # Llama 3.2 (Instruct). Tested against the gated meta-llama repos and
     # the unrestricted unsloth/... mirror, which ships a byte-identical
     # chat template. ``Llama3Renderer`` defaults ``date_string`` to
@@ -1055,6 +1058,7 @@ MODEL_RENDERER_MAP: dict[str, str] = {
 # Modality values: ``"image"``, ``"video"``, ``"audio"``. Text is implicit
 # (every model supports it), so it doesn't appear in the set.
 MULTIMODAL_MODELS: dict[str, set[str]] = {
+    "nvidia/NVIDIA-Nemotron-3.5-Super-EA-09112026": {"image"},
     "Qwen/Qwen3-VL-4B-Instruct": {"image"},
     "Qwen/Qwen3-VL-8B-Instruct": {"image"},
     "Qwen/Qwen3-VL-30B-A3B-Instruct": {"image"},
@@ -1318,10 +1322,10 @@ def _populate_registry():
     from renderers.deepseek_v3 import DeepSeekV3Renderer
     from renderers.deepseek_v4 import DeepSeekV4Renderer
     from renderers.default import DefaultRenderer
-    from renderers.glm5 import GLM5Renderer, GLM51Renderer
+    from renderers.gemma4 import Gemma4Renderer
+    from renderers.glm5 import GLM5Renderer, GLM51Renderer, GLM53Renderer
     from renderers.glm45 import GLM45Renderer
     from renderers.gpt_oss import GptOssRenderer
-    from renderers.gemma4 import Gemma4Renderer
     from renderers.hy3 import Hy3Renderer
     from renderers.inkling import InklingRenderer
     from renderers.kimi_k2 import KimiK2Renderer
@@ -1358,6 +1362,7 @@ def _populate_registry():
             "qwen3.8": Qwen38Renderer,
             "glm-5": GLM5Renderer,
             "glm-5.1": GLM51Renderer,
+            "glm-5.3": GLM53Renderer,
             "glm-4.5": GLM45Renderer,
             "minimax-m2": MiniMaxM2Renderer,
             "deepseek-v3": DeepSeekV3Renderer,

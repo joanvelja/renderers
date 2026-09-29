@@ -57,6 +57,14 @@ as self-contained: reasoning needs its own initial opener or channel header.
 Generation settings never supply missing parsing context. If the prompt supplied
 the opener, pass that prompt; `generate` does this automatically.
 
+Where vLLM 0.26's parser does the same, the format's atomic tool-call opener
+also ends reasoning that has no closing marker: Qwen3 / Qwen3-VL / Qwen3.5+,
+Prime-Qwen3, Nemotron-3, GLM, MiniMax-M2, DeepSeek-V4, Kimi-K2 / K2.5, Gemma 4,
+and Inkling. The call parses normally, and `bridge_to_next_turn` extends it
+without inserting a close. A closing marker later in the completion still wins:
+tool markup before it stays reasoning. Inkling ends thinking and tool segments
+with the same `<|end_message|>`, so there the first opener decides.
+
 For reasoning-first formats, only an initial `<think>` (after any assistant
 header) or reasoning already opened in the prompt starts reasoning. After its
 first closing marker, the rest is content. Later think markers remain literal
@@ -86,7 +94,7 @@ next_prompt_ids = r.bridge_to_next_turn(
 )
 ```
 
-Hand-coded renderers ship for `qwen3`, `qwen3-vl`, `qwen3.5`, `qwen3.6`, `qwen3.8`, `gemma4`, `glm-5`, `glm-5.1`, `glm-4.5`, `minimax-m2`, `deepseek-v3`, `deepseek-r1`, `deepseek-v4` (V4 Flash 0731), `kimi-k2`, `kimi-k2.5` / `kimi-k2.6`, `laguna-xs.2`, `laguna-xs-2.1`, `laguna-s-2.1`, `laguna-m.1`, `nemotron-3`, `nemotron-3-ultra`, `nemotron-3.5`, `llama-3`, `gpt-oss`, `hy3`, `inkling` / `inkling-small`, and `prime-qwen3`. Anything else falls back to `DefaultRenderer`, a generic `apply_chat_template` wrapper. `qwen3-vl`, `qwen3.5`, `qwen3.6`, `qwen3.8`, `gemma4`, `kimi-k2.5` / `kimi-k2.6`, and the Inkling checkpoints are multimodal (Inkling handles both image **and** audio).
+Hand-coded renderers ship for `qwen3`, `qwen3-vl`, `qwen3.5`, `qwen3.6`, `qwen3.8`, `gemma4`, `glm-5`, `glm-5.1`, `glm-5.3`, `glm-4.5`, `minimax-m2`, `deepseek-v3`, `deepseek-r1`, `deepseek-v4` (V4 Flash 0731), `kimi-k2`, `kimi-k2.5` / `kimi-k2.6`, `laguna-xs.2`, `laguna-xs-2.1`, `laguna-s-2.1`, `laguna-m.1`, `nemotron-3`, `nemotron-3-ultra`, `nemotron-3.5`, `llama-3`, `gpt-oss`, `hy3`, `inkling` / `inkling-small`, and `prime-qwen3`. Anything else falls back to `DefaultRenderer`, a generic `apply_chat_template` wrapper. `qwen3-vl`, `qwen3.5`, `qwen3.6`, `qwen3.8`, `gemma4`, `kimi-k2.5` / `kimi-k2.6`, and the Inkling checkpoints are multimodal (Inkling handles both image **and** audio).
 
 ## API
 

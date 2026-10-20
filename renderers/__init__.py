@@ -37,13 +37,16 @@ from renderers.base import (
     create_renderer,
     extract_message_tool_names,
     is_multimodal,
+    merge_chat_template_kwargs,
     reject_assistant_in_extension,
+    template_field_names,
     trim_to_turn_close,
 )
 from renderers.client import MalformedGenerateResponseError, OverlongPromptError
 from renderers.configs import (
     AutoRendererConfig,
     BaseRendererConfig,
+    CustomRendererConfig,
     DeepSeekR1RendererConfig,
     DeepSeekV3RendererConfig,
     DeepSeekV4RendererConfig,
@@ -52,6 +55,7 @@ from renderers.configs import (
     GLM5RendererConfig,
     GLM45RendererConfig,
     GLM51RendererConfig,
+    GLM53FlashRendererConfig,
     GLM53RendererConfig,
     GptOssRendererConfig,
     Hy3RendererConfig,
@@ -64,6 +68,7 @@ from renderers.configs import (
     LagunaXS21RendererConfig,
     Llama3RendererConfig,
     MiniMaxM2RendererConfig,
+    MuseGlimmerRendererConfig,
     Nemotron3RendererConfig,
     Nemotron3UltraRendererConfig,
     Nemotron35RendererConfig,
@@ -76,6 +81,7 @@ from renderers.configs import (
     RendererConfig,
     config_from_name,
 )
+from renderers.custom import custom_renderer_config, load_custom_renderer, load_target
 
 # Concrete renderer classes are lazy-loaded so that consumers needing only the
 # config layer (``RendererConfig`` discriminated union) don't import every
@@ -91,6 +97,7 @@ _LAZY_RENDERERS: dict[str, str] = {
     "DefaultRenderer": "renderers.default",
     "GLM45Renderer": "renderers.glm45",
     "GLM51Renderer": "renderers.glm5",
+    "GLM53FlashRenderer": "renderers.glm5",
     "GLM53Renderer": "renderers.glm5",
     "GLM5Renderer": "renderers.glm5",
     "GptOssRenderer": "renderers.gpt_oss",
@@ -105,6 +112,7 @@ _LAZY_RENDERERS: dict[str, str] = {
     "LagunaXS2Renderer": "renderers.laguna_xs2",
     "Llama3Renderer": "renderers.llama_3",
     "MiniMaxM2Renderer": "renderers.minimax_m2",
+    "MuseGlimmerRenderer": "renderers.muse_glimmer",
     "Nemotron35Renderer": "renderers.nemotron3",
     "Nemotron3Renderer": "renderers.nemotron3",
     "Nemotron3UltraRenderer": "renderers.nemotron3",
@@ -138,6 +146,7 @@ __all__ = [
     "ChatTemplateTokenizer",
     "Content",
     "ContentPart",
+    "CustomRendererConfig",
     "DeepSeekR1Renderer",
     "DeepSeekR1RendererConfig",
     "DeepSeekV3Renderer",
@@ -150,6 +159,8 @@ __all__ = [
     "GLM45RendererConfig",
     "GLM51Renderer",
     "GLM51RendererConfig",
+    "GLM53FlashRenderer",
+    "GLM53FlashRendererConfig",
     "GLM53Renderer",
     "GLM53RendererConfig",
     "GLM5Renderer",
@@ -184,6 +195,8 @@ __all__ = [
     "MiniMaxM2RendererConfig",
     "MultiModalData",
     "MultimodalRenderer",
+    "MuseGlimmerRenderer",
+    "MuseGlimmerRendererConfig",
     "Nemotron35Renderer",
     "Nemotron35RendererConfig",
     "Nemotron3Renderer",
@@ -226,8 +239,13 @@ __all__ = [
     "build_trajectory_step",
     "config_from_name",
     "create_renderer",
+    "custom_renderer_config",
     "extract_message_tool_names",
     "is_multimodal",
+    "load_custom_renderer",
+    "load_target",
+    "merge_chat_template_kwargs",
     "reject_assistant_in_extension",
+    "template_field_names",
     "trim_to_turn_close",
 ]

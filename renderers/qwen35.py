@@ -23,6 +23,7 @@ path and remain byte-identical to ``apply_chat_template``.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from typing import Any
 
 from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
@@ -124,6 +125,12 @@ def _default_enable_thinking(tokenizer) -> bool:
 
 class Qwen35Renderer:
     """Deterministic message → token renderer for Qwen3.5 models."""
+
+    @property
+    def is_prefix_stable(self) -> bool:
+        """Whether full renders preserve completed conversation prefixes."""
+        # Qwen3.6/3.8 can retain every thinking block through their template knob.
+        return bool(getattr(self.config, "preserve_thinking", False))
 
     supports_process_multimodal = True
     _config_cls: type = Qwen35RendererConfig
@@ -252,7 +259,11 @@ class Qwen35Renderer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _render_content(content: Any) -> str:
+    def _iter_content_parts(content: list[Any]) -> Iterable[Any]:
+        return content
+
+    @classmethod
+    def _render_content(cls, content: Any) -> str:
         """Render message content to a text string (before tokenization).
 
         Handles string, list of text parts, and None. Image / video parts
@@ -268,7 +279,7 @@ class Qwen35Renderer:
             return content
         if isinstance(content, list):
             parts: list[str] = []
-            for item in content:
+            for item in cls._iter_content_parts(content):
                 if isinstance(item, str):
                     parts.append(item)
                 elif isinstance(item, dict):
@@ -489,7 +500,7 @@ class Qwen35Renderer:
                     emit_text_segments(buf_segments, msg_idx, is_sampled=False)
                     buf_segments.clear()
 
-            for item in content_list:
+            for item in self._iter_content_parts(content_list):
                 if isinstance(item, str):
                     if item:
                         buf_segments.append((item, True))
@@ -864,7 +875,7 @@ class Qwen35Renderer:
                     emit_text_segments(buf_segments, msg_idx)
                     buf_segments.clear()
 
-            for item in content_list:
+            for item in self._iter_content_parts(content_list):
                 if isinstance(item, str):
                     if item:
                         buf_segments.append((item, True))
@@ -1192,7 +1203,7 @@ class Qwen35Renderer:
                     emit_text_segments(buf_segments, msg_idx, is_sampled=False)
                     buf_segments.clear()
 
-            for item in raw_content:
+            for item in self._iter_content_parts(raw_content):
                 if isinstance(item, str):
                     if item:
                         buf_segments.append((item, True))

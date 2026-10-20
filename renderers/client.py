@@ -13,6 +13,7 @@ import json
 import logging
 import math
 from collections.abc import Mapping
+from itertools import islice, pairwise
 from typing import Any, cast
 
 import httpx
@@ -34,8 +35,6 @@ ROUTED_EXPERTS_DATA_PREFIX = b'"routed_experts":{"data":"'
 # vLLM uses this value both when sampled-token evidence is missing and as a
 # lower-bound clamp, so receiving it cannot prove the real logprob was returned.
 VLLM_LOGPROB_SENTINEL = -9999.0
-_TOKEN_ID_PREFIX = "token_id:"
-_INT32_MAX = 2**31 - 1
 
 
 class OverlongPromptError(Exception):
@@ -96,7 +95,7 @@ async def _resolve_max_prompt_len(client: AsyncOpenAI, model: str) -> int | None
             return _max_prompt_len_cache[key]
         try:
             payload = await client.get("/models", cast_to=cast(Any, dict[str, Any]))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             _request_logger.debug("max_prompt_len lookup failed: %s", exc)
             _max_prompt_len_cache[key] = None
             return None
@@ -114,34 +113,142 @@ async def _resolve_max_prompt_len(client: AsyncOpenAI, model: str) -> int | None
         return value
 
 
-def _strip_base64_field(raw: bytes, prefix: bytes) -> tuple[bytes, memoryview | None]:
+def _strip_base64_fields(raw: bytes, prefix: bytes) -> tuple[bytes, list[memoryview]]:
     """Splice a large base64 string field out of raw JSON bytes.
 
     Avoids json-decoding megabytes of base64; the returned memoryview
     references ``raw`` and is re-inserted into the parsed payload.
     """
-    data_start = raw.find(prefix)
-    if data_start < 0:
-        return raw, None
-
-    data_start += len(prefix)
-    data_end = raw.index(b'"', data_start)
-    data = memoryview(raw)[data_start:data_end]
-    stripped = raw[:data_start] + raw[data_end:]
-    return stripped, data
+    chunks = []
+    fields = []
+    cursor = 0
+    while (start := raw.find(prefix, cursor)) >= 0:
+        start += len(prefix)
+        end = raw.index(b'"', start)
+        chunks.append(raw[cursor:start])
+        fields.append(memoryview(raw)[start:end])
+        cursor = end
+    if not fields:
+        return raw, fields
+    chunks.append(raw[cursor:])
+    return b"".join(chunks), fields
 
 
 def parse_generate_response(raw: bytes) -> dict[str, Any]:
-    stripped, routed_data = _strip_base64_field(raw, ROUTED_EXPERTS_DATA_PREFIX)
+    stripped, routed_data = _strip_base64_fields(raw, ROUTED_EXPERTS_DATA_PREFIX)
+    stripped, compact_data = _strip_base64_fields(
+        stripped, b'"compact_logprobs":{"data":"'
+    )
     payload: dict[str, Any] = json.loads(stripped)
-    if routed_data is not None:
-        payload["choices"][0]["routed_experts"]["data"] = routed_data
+    for field, buffers in (
+        ("routed_experts", routed_data),
+        ("compact_logprobs", compact_data),
+    ):
+        if buffers:
+            pending = iter(buffers)
+            for choice in payload["choices"]:
+                if (
+                    isinstance(choice.get(field), dict)
+                    and choice[field].get("data") == ""
+                ):
+                    choice[field]["data"] = next(pending)
     return payload
+
+
+def _parse_packed_completion_logprobs(
+    packed: Mapping[str, Any], completion_ids: list[int]
+) -> list[float]:
+    """prime-rl's packed form: base64 float32 ``{data, shape, dtype}``, one per token."""
+    values = np.frombuffer(base64.b64decode(packed["data"]), dtype=packed["dtype"])
+    valid = np.isfinite(values) & (values > VLLM_LOGPROB_SENTINEL)
+    if len(values) != len(completion_ids) or not valid.all():
+        raise MalformedGenerateResponseError(
+            f"Engine response choice.completion_logprobs: {len(values)} values for "
+            f"{len(completion_ids)} completion tokens, or a non-finite or missing (-9999) logprob."
+        )
+    return values.astype(np.float64).tolist()
+
+
+def _parse_compact_logprobs(
+    choice: Mapping[str, Any], completion_ids: list[int], k: int | None
+) -> tuple[list[float], list[list[int]] | None, list[list[float]] | None]:
+    packed = choice.get("compact_logprobs")
+    if not isinstance(packed, Mapping) or packed.get("format") != "u32-f32-le-v1":
+        raise MalformedGenerateResponseError("Unsupported compact logprob format")
+    offsets = packed.get("offsets")
+    if (
+        not isinstance(offsets, list)
+        or len(offsets) != len(completion_ids) + 1
+        or any(type(x) is not int or x < 0 for x in offsets)
+        or offsets[0] != 0
+        or any(end <= start for start, end in pairwise(offsets))
+    ):
+        raise MalformedGenerateResponseError("Invalid compact logprob offsets")
+    num_top = packed.get("num_top_logprobs")
+    if type(num_top) is not int or num_top < -1:
+        raise MalformedGenerateResponseError("Invalid compact logprob candidate count")
+    try:
+        raw = base64.b64decode(packed["data"], validate=True)
+    except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+        raise MalformedGenerateResponseError("Invalid compact logprob base64") from exc
+    count = offsets[-1]
+    if len(raw) != count * 8:
+        raise MalformedGenerateResponseError("Invalid compact logprob buffer length")
+    ids = np.frombuffer(raw, dtype="<u4", count=count)
+    values = np.frombuffer(raw, dtype="<f4", count=count, offset=count * 4)
+    if not np.isfinite(values).all() or (values > 1e-6).any():
+        raise MalformedGenerateResponseError("Invalid compact logprob values")
+    sampled = []
+    top_ids: list[list[int]] = []
+    top_logprobs: list[list[float]] = []
+    supports = _parse_sampling_mask(choice, completion_ids) if k is not None else None
+    for index, (token_id, start, end) in enumerate(
+        zip(completion_ids, offsets, offsets[1:])
+    ):
+        # FlatLogprobs can repeat the sampled ID. Match vLLM's dict order/value semantics.
+        items = list(zip(ids[start:end].tolist(), values[start:end].tolist()))
+        row = dict(items)
+        if any(row[i] != p for i, p in items):
+            raise MalformedGenerateResponseError("Repeated compact logprobs disagree")
+        if token_id not in row or row[token_id] == VLLM_LOGPROB_SENTINEL:
+            raise MalformedGenerateResponseError(
+                "Missing compact sampled-token evidence"
+            )
+        sampled.append(row[token_id])
+        if k is not None:
+            head = dict(islice(row.items(), max(num_top, 1)))
+            selected_ids, selected_logprobs = _select_sampler_head(
+                head,
+                token_id,
+                row[token_id],
+                k,
+                supports[index] if supports is not None else None,
+            )
+            top_ids.append(selected_ids)
+            top_logprobs.append(selected_logprobs)
+    return (
+        sampled,
+        top_ids if k is not None else None,
+        top_logprobs if k is not None else None,
+    )
+
+
+def _logprob_token_id(entry: Mapping[str, Any]) -> int | None:
+    if "token_id" in entry:
+        token_id = entry["token_id"]
+        return token_id if type(token_id) is int and token_id >= 0 else None
+    token = entry.get("token")
+    if isinstance(token, str) and token.startswith("token_id:") and token[9:].isdigit():
+        return int(token[9:])
+    return None
 
 
 def _parse_completion_logprobs(
     choice: Mapping[str, Any], completion_ids: list[int]
 ) -> list[float]:
+    packed = choice.get("completion_logprobs")
+    if packed is not None:
+        return _parse_packed_completion_logprobs(packed, completion_ids)
     raw_logprobs = choice.get("logprobs")
     if not isinstance(raw_logprobs, Mapping):
         raise MalformedGenerateResponseError(
@@ -166,7 +273,7 @@ def _parse_completion_logprobs(
                 f"Engine response choice.logprobs.content[{index}] must be an object."
             )
         expected_token = f"token_id:{completion_ids[index]}"
-        if entry.get("token") != expected_token:
+        if _logprob_token_id(entry) != completion_ids[index]:
             raise MalformedGenerateResponseError(
                 f"Engine response choice.logprobs.content[{index}].token must be {expected_token!r}."
             )
@@ -193,147 +300,143 @@ def _parse_completion_logprobs(
     return completion_logprobs
 
 
-def _parse_completion_top_logprobs(
-    content: list[Mapping[str, Any]], k: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """The sampler's exact top-``k`` per completion token: int32 ids and float32
-    logprobs, each ``[T, k]``, sorted by logprob descending.
-
-    vLLM builds each position's dict as ``{sampled} ∪ {top-1..top-N}`` and
-    returns its first ``N`` items, so a sampled token outside the top ``N``
-    evicts rank ``N``. The request asks for ``N = k + 1``; the ``k`` largest
-    of those ``k + 1`` entries are the exact top-``k`` for any sampled token.
-    ``-9999.0`` (vLLM's clamp of ``-inf``) is kept: it is a zero-probability
-    head entry, not missing evidence.
-    """
-    width = k + 1
-    ids: list[int] = []
-    logprobs: list[float] = []
-    for index, entry in enumerate(content):
-        top = entry.get("top_logprobs")
-        if not isinstance(top, list) or len(top) != width:
-            got = len(top) if isinstance(top, list) else type(top).__name__
-            raise MalformedGenerateResponseError(
-                f"Engine response choice.logprobs.content[{index}].top_logprobs must "
-                f"hold {width} entries for top_logprobs={k}, got {got}."
-            )
-        for rank, item in enumerate(top):
-            token = item.get("token") if isinstance(item, Mapping) else None
-            digits = (
-                token[len(_TOKEN_ID_PREFIX) :]
-                if isinstance(token, str) and token.startswith(_TOKEN_ID_PREFIX)
-                else ""
-            )
-            token_id = int(digits) if digits.isascii() and digits.isdigit() else -1
-            if not 0 <= token_id <= _INT32_MAX:
-                raise MalformedGenerateResponseError(
-                    f"Engine response choice.logprobs.content[{index}].top_logprobs[{rank}]"
-                    f".token must be 'token_id:<int32>', got {token!r}."
+def _parse_sampling_mask(
+    choice: Mapping[str, Any], completion_ids: list[int]
+) -> list[list[int]] | None:
+    mask = choice.get("sampling_mask")
+    if mask is None:
+        return None
+    if isinstance(mask, Mapping):
+        arrays = {}
+        for name in ("ids", "counts"):
+            packed = mask.get(name)
+            if not isinstance(packed, Mapping) or packed.get("dtype") != "int32":
+                raise MalformedGenerateResponseError("Invalid packed sampling mask")
+            try:
+                values = np.frombuffer(
+                    base64.b64decode(packed["data"], validate=True), dtype=np.int32
                 )
-            value = item.get("logprob")
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+            except (KeyError, TypeError, ValueError, binascii.Error) as exc:
                 raise MalformedGenerateResponseError(
-                    f"Engine response choice.logprobs.content[{index}].top_logprobs[{rank}]"
-                    ".logprob must be a number."
-                )
-            ids.append(token_id)
-            logprobs.append(value)
+                    "Invalid packed sampling mask"
+                ) from exc
+            if packed.get("shape") != [len(values)] or (values < 0).any():
+                raise MalformedGenerateResponseError("Invalid packed sampling mask")
+            arrays[name] = values
+        counts, ids = arrays["counts"], arrays["ids"]
+        if len(counts) != len(completion_ids) or int(counts.sum()) != len(ids):
+            raise MalformedGenerateResponseError("Sampling mask token count mismatch")
+        mask = [row.tolist() for row in np.split(ids, np.cumsum(counts)[:-1])]
+        if not len(counts):
+            mask = []
+    if not isinstance(mask, list) or len(mask) != len(completion_ids):
+        raise MalformedGenerateResponseError("Sampling mask token count mismatch")
+    for sampled, support in zip(completion_ids, mask, strict=True):
+        if (
+            not isinstance(support, list)
+            or not support
+            or any(type(i) is not int or i < 0 for i in support)
+            or len(set(support)) != len(support)
+            or sampled not in support
+        ):
+            raise MalformedGenerateResponseError("Invalid recorded sampling support")
+    return mask
 
-    rows = len(content)
-    id_rows = np.asarray(ids, dtype=np.int32).reshape(rows, width)
-    try:
-        lp_rows = np.asarray(logprobs, dtype=np.float64).reshape(rows, width)
-    except OverflowError as exc:  # an integer literal beyond float64
+
+def _select_sampler_head(
+    head: dict[int, float],
+    sampled_id: int,
+    sampled_logprob: float,
+    k: int,
+    support: list[int] | None = None,
+) -> tuple[list[int], list[float]]:
+    """Keep an action-independent head, or the complete recorded replay support."""
+    if sampled_id in head and not math.isclose(
+        head[sampled_id], sampled_logprob, rel_tol=1e-6, abs_tol=1e-5
+    ):
         raise MalformedGenerateResponseError(
-            "Engine response top_logprobs logprobs must be finite."
-        ) from exc
-    bad = np.nonzero(~np.isfinite(lp_rows).all(axis=1))[0]
-    if len(bad):
-        raise MalformedGenerateResponseError(
-            f"Engine response choice.logprobs.content[{bad[0]}].top_logprobs "
-            "logprobs must be finite."
+            "Sampler head and sampled-token logprob disagree"
         )
-    sorted_ids = np.sort(id_rows, axis=1)
-    dup = np.nonzero((sorted_ids[:, 1:] == sorted_ids[:, :-1]).any(axis=1))[0]
-    if len(dup):
-        raise MalformedGenerateResponseError(
-            f"Engine response choice.logprobs.content[{dup[0]}].top_logprobs "
-            "has duplicate token ids."
-        )
-    order = np.argsort(-lp_rows, axis=1, kind="stable")[:, :k]
-    return (
-        np.take_along_axis(id_rows, order, axis=1),
-        np.take_along_axis(lp_rows, order, axis=1).astype(np.float32),
+    # vLLM serializes filtered-out (-inf) candidates as -9999.
+    ranked = sorted(
+        ((i, p) for i, p in head.items() if p != VLLM_LOGPROB_SENTINEL),
+        key=lambda x: (-x[1], x[0]),
     )
-
-
-def _decode_packed_top(
-    choice: Mapping[str, Any], key: str, dtype: str, rows: int, k: int
-) -> np.ndarray:
-    """One packed ``{data, shape, dtype}`` raw-byte base64 array from the choice."""
-    packed = choice.get(key)
-    if not isinstance(packed, Mapping):
+    if support is not None:
+        support_set = set(support)
+        if not support_set.issubset(i for i, _ in ranked):
+            raise MalformedGenerateResponseError(
+                "Missing sampling-support probabilities"
+            )
+        ranked = [(i, p) for i, p in ranked if i in support_set]
+        if not math.isclose(
+            math.fsum(math.exp(p) for _, p in ranked), 1.0, rel_tol=0, abs_tol=1e-4
+        ):
+            raise MalformedGenerateResponseError(
+                "Sampler probabilities must normalize over the recorded support"
+            )
+    elif len(ranked) > k and ranked[k - 1][1] == ranked[k][1]:
+        boundary = ranked[k][1]
+        ranked = [(i, p) for i, p in ranked if p > boundary]
+    else:
+        ranked = ranked[:k]
+    if not ranked or math.fsum(math.exp(p) for _, p in ranked) > 1.0001:
+        raise MalformedGenerateResponseError("Invalid sampler head probability mass")
+    if support is None and len(head) < k + 2:
         raise MalformedGenerateResponseError(
-            f"Engine response choice.{key} must be a packed array object."
+            "Engine returned fewer top logprobs than requested"
         )
-    if packed.get("dtype") != dtype or packed.get("shape") != [rows, k]:
-        raise MalformedGenerateResponseError(
-            f"Engine response choice.{key} must be {dtype} [{rows}, {k}], got "
-            f"{packed.get('dtype')!r} {packed.get('shape')!r}."
-        )
-    data = packed.get("data")
-    try:
-        raw = base64.b64decode(data, validate=True)
-    except (TypeError, ValueError, binascii.Error) as exc:
-        raise MalformedGenerateResponseError(
-            f"Engine response choice.{key}.data must be base64."
-        ) from exc
-    wire = np.dtype(dtype).newbyteorder("<")
-    if len(raw) != rows * k * wire.itemsize:
-        raise MalformedGenerateResponseError(
-            f"Engine response choice.{key} holds {len(raw)} bytes, not {rows} x {k} {dtype}."
-        )
-    return np.frombuffer(raw, dtype=wire).reshape(rows, k).astype(dtype, copy=False)
+    return [i for i, _ in ranked], [p for _, p in ranked]
 
 
-def _parse_completion_top_k(
+def _parse_completion_top_logprobs(
     choice: Mapping[str, Any], completion_ids: list[int], k: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """The sampler's top-``k`` per completion token, from whichever format the engine
-    sent: prime-rl's packed ``completion_top_ids`` / ``completion_top_logprobs``
-    (int32 / float32 ``[T, k]`` raw-byte base64), or stock vLLM's JSON
-    ``top_logprobs`` rows. Neither present raises."""
-    rows = len(completion_ids)
-    if "completion_top_ids" in choice or "completion_top_logprobs" in choice:
-        ids = _decode_packed_top(choice, "completion_top_ids", "int32", rows, k)
-        logprobs = _decode_packed_top(
-            choice, "completion_top_logprobs", "float32", rows, k
+) -> tuple[list[list[int]], list[list[float]]]:
+    """Select an action-independent head from k+2 candidates."""
+    logprobs = choice.get("logprobs")
+    content = logprobs.get("content") if isinstance(logprobs, Mapping) else None
+    if not isinstance(content, list) or len(content) != len(completion_ids):
+        raise MalformedGenerateResponseError("Missing requested top logprobs")
+    top_ids: list[list[int]] = []
+    top_logprobs: list[list[float]] = []
+    supports = _parse_sampling_mask(choice, completion_ids)
+    for index, (sampled_id, entry) in enumerate(
+        zip(completion_ids, content, strict=True)
+    ):
+        candidates = entry.get("top_logprobs")
+        if not isinstance(candidates, list) or not candidates:
+            raise MalformedGenerateResponseError("Missing requested top logprobs")
+        head: dict[int, float] = {}
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                raise MalformedGenerateResponseError("Top logprob must be an object")
+            token_id = _logprob_token_id(candidate)
+            if token_id is None:
+                raise MalformedGenerateResponseError(
+                    "Top logprob must identify a nonnegative token id"
+                )
+            logprob = candidate.get("logprob")
+            if (
+                isinstance(logprob, bool)
+                or not isinstance(logprob, (int, float))
+                or not math.isfinite(logprob)
+            ):
+                raise MalformedGenerateResponseError("Top logprob must be finite")
+            if logprob > 1e-6:
+                raise MalformedGenerateResponseError("Top logprob cannot be positive")
+            if token_id in head:
+                raise MalformedGenerateResponseError("Duplicate top logprob token id")
+            head[token_id] = float(logprob)
+        selected_ids, selected_logprobs = _select_sampler_head(
+            head,
+            sampled_id,
+            entry["logprob"],
+            k,
+            supports[index] if supports is not None else None,
         )
-        if rows and int(ids.min()) < 0:
-            raise MalformedGenerateResponseError(
-                "Engine response choice.completion_top_ids has negative token ids."
-            )
-        if not np.isfinite(logprobs).all():
-            raise MalformedGenerateResponseError(
-                "Engine response choice.completion_top_logprobs must be finite."
-            )
-        if (logprobs[:, 1:] > logprobs[:, :-1]).any():
-            raise MalformedGenerateResponseError(
-                "Engine response choice.completion_top_logprobs rows must be sorted descending."
-            )
-        sorted_ids = np.sort(ids, axis=1)
-        if (sorted_ids[:, 1:] == sorted_ids[:, :-1]).any():
-            raise MalformedGenerateResponseError(
-                "Engine response choice.completion_top_ids has duplicate token ids."
-            )
-        return ids, logprobs
-    content = choice["logprobs"]["content"]
-    if content and not any(entry.get("top_logprobs") for entry in content):
-        raise MalformedGenerateResponseError(
-            f"top_logprobs={k} was requested but the engine response carries neither "
-            "packed completion_top_ids / completion_top_logprobs nor JSON top_logprobs."
-        )
-    return _parse_completion_top_logprobs(content, k)
+        top_ids.append(selected_ids)
+        top_logprobs.append(selected_logprobs)
+    return top_ids, top_logprobs
 
 
 async def generate(
@@ -355,18 +458,18 @@ async def generate(
 ) -> dict[str, Any]:
     """Tokenize messages, call vLLM /inference/v1/generate, parse the response.
 
-    ``sampling_params`` is forwarded to vLLM verbatim. Two fields are always
-    set by us and override caller values: ``stop_token_ids`` (from the
-    renderer) and ``logprobs`` (we always emit completion_logprobs).
+    ``sampling_params`` is forwarded to vLLM, with ``stop_token_ids`` taken
+    from the renderer and ``logprobs`` set to at least one for sampled-token
+    evidence. A positive integer requests a top-k head; we ask the engine
+    for two extra candidates to select that head independently of the sampled
+    action, excluding ties at its boundary.
+    Head requests opt into compact numeric HTTP logprobs; set
+    ``extra_args.prl_compact_logprobs=False`` to use native JSON. Servers without
+    the extension can still return native JSON. Sampled-only requests keep the
+    native path by default.
     ``detokenize`` defaults to ``False`` unless the request has ``stop``
-    strings: the endpoint returns token ids, so decoding is wasted work. The
-    caller's ``top_logprobs=k`` is popped: ``k > 0`` requests ``logprobs=k+1``
-    (the engine's ``max_logprobs`` must allow it) plus
-    ``extra_args.top_logprobs=k`` (a prime-rl server answers with the packed
-    head) and returns the sampler's exact top-``k`` per completion token as
-    ``completion_top_ids`` (int32 ``[T, k]``) and ``completion_top_logprobs``
-    (float32 ``[T, k]``), each row sorted by logprob descending; both are
-    ``None`` when ``k == 0``. Pass
+    strings: the endpoint returns token ids, so decoding is wasted work.
+    Pass
     ``prompt_ids`` to skip rendering and use a prebuilt token sequence —
     pair it with ``multi_modal_data`` when the prebuilt prompt has image /
     video placeholders that need engine-side mm payload, and with
@@ -397,12 +500,17 @@ async def generate(
     vLLM knows the expanded prompt length.
 
     Returns a dict with: request_id, prompt_ids, renderer_prompt_ids,
-    mm_placeholders, completion_ids, completion_logprobs, completion_top_ids,
-    completion_top_logprobs, content,
+    mm_placeholders, completion_ids, completion_logprobs, content,
     reasoning_content, tool_calls, finish_reason, routed_experts,
-    multi_modal_data, prompt_attribution. ``renderer_prompt_ids`` is the
-    unexpanded logical prompt when ``process_multimodal=False`` and ``None``
-    otherwise.
+    weight_versions, multi_modal_data, prompt_attribution.
+    ``renderer_prompt_ids`` is the unexpanded logical prompt when
+    ``process_multimodal=False`` and ``None`` otherwise. ``weight_versions``
+    is vLLM's (>= 0.32) list of ``{version, start, end}`` spans over
+    completion-token indexes, or ``None`` when the engine labels none.
+
+    When ``sampling_params["logprobs"]`` is a positive int, also
+    ``completion_top_ids`` / ``completion_top_logprobs``
+    (original sampler probabilities, retaining full-vocabulary normalization).
 
     ``prompt_attribution`` is the renderer's :class:`RenderedTokens` for
     the prompt — either the one this call computed via
@@ -466,24 +574,18 @@ async def generate(
             )
 
     sp: dict[str, Any] = dict(sampling_params or {})
-    top_k_logprobs = sp.pop("top_logprobs", 0)
-    if (
-        isinstance(top_k_logprobs, bool)
-        or not isinstance(top_k_logprobs, int)
-        or top_k_logprobs < 0
-    ):
-        raise ValueError(
-            f"top_logprobs must be a non-negative int, got {top_k_logprobs!r}"
-        )
     sp["stop_token_ids"] = stop_token_ids
-    # One extra entry makes stock vLLM's JSON head independent of the sampled token
-    # (see _parse_completion_top_logprobs); extra_args asks a prime-rl server for the
-    # packed top-k instead (see _parse_completion_top_k).
-    sp["logprobs"] = top_k_logprobs + 1 if top_k_logprobs else 1
-    if top_k_logprobs:
+    requested_logprobs = sp.get("logprobs")
+    head_size = (
+        requested_logprobs
+        if type(requested_logprobs) is int and requested_logprobs > 0
+        else None
+    )
+    sp["logprobs"] = head_size + 2 if head_size is not None else 1
+    if head_size is not None:
         sp["extra_args"] = {
+            "prl_compact_logprobs": True,
             **(sp.get("extra_args") or {}),
-            "top_logprobs": top_k_logprobs,
         }
     sp.setdefault("skip_special_tokens", False)
     # The endpoint returns token ids, never text: detokenizing only feeds stop strings.
@@ -495,7 +597,9 @@ async def generate(
         "token_ids": prompt_ids,
         "sampling_params": sp,
     }
-    content_parts = _content_parts(messages) if not process_multimodal else None
+    content_parts = (
+        _content_parts(messages, renderer=renderer) if not process_multimodal else None
+    )
     features = (
         _build_mm_features(renderer, mm_data)
         if process_multimodal and mm_data and not mm_data.is_empty()
@@ -544,12 +648,18 @@ async def generate(
             "Engine response must include mm_placeholders when process_multimodal=False."
         )
 
-    completion_logprobs = _parse_completion_logprobs(choice, completion_ids)
-    completion_top_ids, completion_top_logprobs = (
-        _parse_completion_top_k(choice, completion_ids, top_k_logprobs)
-        if top_k_logprobs
-        else (None, None)
-    )
+    completion_top_ids = None
+    completion_top_logprobs = None
+    if choice.get("compact_logprobs") is not None:
+        completion_logprobs, completion_top_ids, completion_top_logprobs = (
+            _parse_compact_logprobs(choice, completion_ids, head_size)
+        )
+    else:
+        completion_logprobs = _parse_completion_logprobs(choice, completion_ids)
+        if head_size is not None:
+            completion_top_ids, completion_top_logprobs = (
+                _parse_completion_top_logprobs(choice, completion_ids, head_size)
+            )
 
     parsed = renderer.parse_response(
         completion_ids,
@@ -559,7 +669,8 @@ async def generate(
 
     routed_experts = choice.get("routed_experts")
     # vLLM's native kept-set sampling masks (``--return-sampling-mask``):
-    # one list of surviving vocab ids per completion token.
+    # one list of surviving vocab ids per completion token, or (prime-rl's
+    # server) packed CSR ``{"ids", "counts"}`` base64 int32 arrays.
     sampling_mask = choice.get("sampling_mask")
 
     # /inference/v1/generate returns finish_reason in {"stop","length",...} —
@@ -594,6 +705,7 @@ async def generate(
         "reasoning_complete": parsed.reasoning_complete,
         "routed_experts": routed_experts,
         "sampling_mask": sampling_mask,
+        "weight_versions": choice.get("weight_versions"),
         # The mm sidecar consumed on the request side, surfaced back so
         # callers can persist it on the trajectory step for downstream
         # multi-turn bridging and training-sample construction.
@@ -619,8 +731,15 @@ _MEDIA_URL_TYPES = {
 }
 
 
-def _content_parts(messages: list[Message]) -> list[dict[str, Any]]:
+def _content_parts(
+    messages: list[Message], *, renderer: Renderer
+) -> list[dict[str, Any]]:
     """Flatten raw media in prompt order for vLLM's token generate endpoint."""
+    # Some templates reorder tool results. Use the same order for raw media,
+    # including when the caller supplies a prebuilt prompt and skips rendering.
+    order_messages = getattr(renderer, "messages_in_prompt_order", None)
+    if order_messages is not None:
+        messages = order_messages(messages)
     parts: list[dict[str, Any]] = []
     for message in messages:
         content = message.get("content")

@@ -4,16 +4,17 @@ from functools import lru_cache
 
 import pytest
 from parity import MODEL_CATALOG
-
 from renderers import create_renderer
-from renderers.base import load_tokenizer
+from renderers.base import ToolCallParseStatus, load_tokenizer
 from renderers.configs import config_from_name
-
 
 # Exercise every registered renderer, including inherited family variants.
 _CASES = {}
 for _case in MODEL_CATALOG:
     _CASES.setdefault(_case.resolved_renderer, _case.model)
+
+_GLM = {"glm-4.5", "glm-5", "glm-5.1", "glm-5.3", "glm-5.3-flash"}
+_REOPENING_TAGS = _GLM | {"deepseek-v4"}
 
 
 @lru_cache(None)
@@ -63,6 +64,14 @@ def _thinking_stream(name, tok, renderer):
             _encode(tok, "unfinished reasoning"),
             [renderer._think_end, *_encode(tok, "Answer")],
         )
+    if name == "muse-glimmer":
+        # The generation prompt is ``<|start|>assistant``; the model samples
+        # its recipient, ``to=self`` for reasoning and ``to=user`` to answer.
+        return (
+            prompt,
+            _encode(tok, " to=self<|message|>unfinished reasoning"),
+            _encode(tok, "<|eom|><|start|>assistant to=user<|message|>Answer"),
+        )
     prefix = tok.decode(prompt, skip_special_tokens=False).rstrip()
     opener = "" if prefix.endswith("<think>") else "<think>"
     return (
@@ -105,6 +114,7 @@ def test_every_reasoning_bridge_preserves_prefix_or_refuses_sampled_stop(name):
         "gemma4": lambda: [renderer._channel_end],
         "inkling": lambda: [renderer._end_message],
         "hy3": lambda: [renderer._think_end],
+        "muse-glimmer": lambda: [renderer._eom],
     }.get(name, lambda: _encode(tok, "</think>"))()
     assert bridge.token_ids[prefix_len : prefix_len + len(close_ids)] == close_ids
     assert not any(bridge.is_content[prefix_len : prefix_len + len(close_ids)])
@@ -157,15 +167,57 @@ def test_gemma_post_tool_prompt_supplies_reasoning_state():
     assert result.reasoning_complete is False
 
 
-@pytest.mark.parametrize(
-    "name", ["qwen3", "qwen3.5", "deepseek-r1", "kimi-k2", "kimi-k2.5", "laguna-xs-2.1"]
-)
+# Formats whose vLLM 0.26 parser ends unclosed reasoning at a tool-call opener,
+# with a well-formed call to ``danger``. The rest keep reasoning open.
+_QWEN_XML_CALL = "<tool_call>\n<function=danger>\n</function>\n</tool_call>"
+_GLM_CALL = "<tool_call>danger</tool_call>"
+_KIMI_CALL = "<|tool_calls_section_begin|><|tool_call_begin|>functions.danger:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>"
+_TOOL_CALLS = {
+    "qwen3": '<tool_call>\n{"name": "danger", "arguments": {}}\n</tool_call>',
+    "qwen3-vl": '<tool_call>\n{"name": "danger", "arguments": {}}\n</tool_call>',
+    "qwen3.5": _QWEN_XML_CALL,
+    "qwen3.6": _QWEN_XML_CALL,
+    "qwen3.8": _QWEN_XML_CALL,
+    "prime-qwen3": _QWEN_XML_CALL,
+    "nemotron-3": _QWEN_XML_CALL,
+    "nemotron-3-ultra": _QWEN_XML_CALL,
+    "nemotron-3.5": _QWEN_XML_CALL,
+    "glm-4.5": _GLM_CALL,
+    "glm-5": _GLM_CALL,
+    "glm-5.1": _GLM_CALL,
+    "glm-5.3": _GLM_CALL,
+    "glm-5.3-flash": _GLM_CALL,
+    "minimax-m2": '<minimax:tool_call>\n<invoke name="danger">\n</invoke>\n</minimax:tool_call>',
+    "deepseek-v4": '\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name="danger">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>',
+    "kimi-k2": _KIMI_CALL,
+    "kimi-k2.5": _KIMI_CALL,
+    "gemma4": "<|tool_call>call:danger{}<tool_call|>",
+    "inkling": '<|content_invoke_tool_json|>{"name": "danger", "args": {}}<|end_message|>',
+}
+_STRICT_TOOL_OPENERS = {
+    "deepseek-r1",
+    "deepseek-v3",
+    "gpt-oss",
+    "hy3",
+    "laguna-m.1",
+    "laguna-s-2.1",
+    "laguna-xs-2.1",
+    "laguna-xs.2",
+    "muse-glimmer",
+}
+
+
+def test_every_reasoning_renderer_classifies_tool_openers():
+    reasoning_renderers = set(_CASES) - {"llama-3", "default"}
+    assert reasoning_renderers == set(_TOOL_CALLS) | _STRICT_TOOL_OPENERS
+    assert not set(_TOOL_CALLS) & _STRICT_TOOL_OPENERS
+
+
+@pytest.mark.parametrize("name", ["deepseek-r1", "laguna-xs-2.1"])
 def test_tool_drafts_in_unfinished_reasoning_are_not_executable(name):
     tok, renderer = _renderer(name)
     prompt, incomplete, _ = _thinking_stream(name, tok, renderer)
     draft = '<tool_call>{"name":"danger","arguments":{}}</tool_call>'
-    if name.startswith("kimi"):
-        draft = "<|tool_calls_section_begin|><|tool_call_begin|>functions.danger:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>"
     if name == "deepseek-r1":
         draft = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>danger\n```json\n{}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
     result = renderer.parse_response(
@@ -175,6 +227,76 @@ def test_tool_drafts_in_unfinished_reasoning_are_not_executable(name):
     assert "danger" in result.reasoning_content
     assert result.tool_calls == []
     assert result.reasoning_complete is False
+
+
+@pytest.mark.parametrize("name", sorted(_TOOL_CALLS))
+@pytest.mark.parametrize("stop", [False, True])
+def test_tool_opener_ends_unclosed_reasoning(name, stop):
+    tok, renderer = _renderer(name)
+    prompt, incomplete, _ = _thinking_stream(name, tok, renderer)
+    call = _encode(tok, _TOOL_CALLS[name])
+    sampled = incomplete + call + (renderer.get_stop_token_ids()[:1] if stop else [])
+    result = renderer.parse_response(sampled, prompt_ids=prompt)
+    assert result.content == ""
+    assert result.reasoning_content == "unfinished reasoning"
+    assert result.reasoning_complete is True
+    assert [(c.name, c.arguments, c.status) for c in result.tool_calls] == [
+        ("danger", {}, ToolCallParseStatus.OK)
+    ]
+    start, end = result.tool_calls[0].token_span
+    assert len(incomplete) <= start < end <= len(incomplete) + len(call)
+    assert "danger" in tok.decode(sampled[start:end], skip_special_tokens=False)
+
+
+@pytest.mark.parametrize(
+    "name", sorted(set(_TOOL_CALLS) - {"inkling"} - _REOPENING_TAGS)
+)
+def test_explicit_reasoning_close_outranks_earlier_tool_opener(name):
+    # Inkling closes thinking and tool segments with the same <|end_message|>.
+    tok, renderer = _renderer(name)
+    prompt, incomplete, closed = _thinking_stream(name, tok, renderer)
+    draft = _encode(tok, _TOOL_CALLS[name])
+    result = renderer.parse_response(incomplete + draft + closed, prompt_ids=prompt)
+    assert result.content == "Answer"
+    assert "danger" in result.reasoning_content
+    assert result.tool_calls == []
+    assert result.reasoning_complete is True
+
+
+def test_inkling_prose_after_tool_opener_is_not_executable():
+    tok, renderer = _renderer("inkling")
+    prompt, incomplete, _ = _thinking_stream("inkling", tok, renderer)
+    draft = _encode(
+        tok, '<|content_invoke_tool_json|>{"name": "danger"} maybe not<|end_message|>'
+    )
+    result = renderer.parse_response(incomplete + draft, prompt_ids=prompt)
+    assert result.reasoning_content == "unfinished reasoning"
+    assert [c.status for c in result.tool_calls] == [ToolCallParseStatus.INVALID_JSON]
+
+
+@pytest.mark.parametrize("name", sorted(_TOOL_CALLS))
+@pytest.mark.parametrize("truncated", [False, True])
+def test_bridge_extends_tool_call_that_ended_reasoning(name, truncated):
+    tok, renderer = _renderer(name)
+    prompt, incomplete, _ = _thinking_stream(name, tok, renderer)
+    call = _encode(tok, _TOOL_CALLS[name])
+    sampled = incomplete + (
+        call[: len(call) // 2]
+        if truncated
+        else call + renderer.get_stop_token_ids()[:1]
+    )
+    bridge = renderer.bridge_to_next_turn(
+        prompt, sampled, [{"role": "user", "content": "Next question."}]
+    )
+    assert bridge is not None
+    prefix_len = len(prompt) + len(sampled)
+    assert bridge.token_ids[:prefix_len] == prompt + sampled
+    assert not any(bridge.sampled_mask[prefix_len:])
+    close_ids = {
+        "gemma4": lambda: [renderer._channel_end],
+        "inkling": lambda: [renderer._end_message],
+    }.get(name, lambda: _encode(tok, "</think>"))()
+    assert bridge.token_ids[prefix_len : prefix_len + len(close_ids)] != close_ids
 
 
 @pytest.mark.parametrize(
@@ -268,7 +390,7 @@ def test_inkling_partial_reasoning_prefix_is_not_returned_as_content():
 
 
 @pytest.mark.parametrize(
-    "name", sorted((set(_CASES) - {"llama-3"}) | {"default-think"})
+    "name", sorted((set(_CASES) - {"llama-3"} - _GLM) | {"default-think"})
 )
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("origin", ["prompt", "completion", "closed_prompt", "both"])
@@ -306,6 +428,10 @@ def test_reasoning_markers_override_generation_mode(name, enabled, origin, endin
             "<|end_message|><|message_model|><|content_text|>",
         ),
         "hy3": ("<think:opensource>", "</think:opensource>"),
+        "muse-glimmer": (
+            "<|start|>assistant to=self<|message|>",
+            "<|eom|><|start|>assistant to=user<|message|>",
+        ),
     }.get(name, ("<think>", "</think>"))
     prompt_text = {
         "prompt": opening + "Earlier reasoning ",
@@ -334,7 +460,12 @@ def test_reasoning_markers_override_generation_mode(name, enabled, origin, endin
 
 
 @pytest.mark.parametrize(
-    "name", sorted(set(_CASES) - {"llama-3", "gpt-oss", "gemma4", "inkling", "default"})
+    "name",
+    sorted(
+        set(_CASES)
+        - {"llama-3", "gpt-oss", "gemma4", "inkling", "default"}
+        - _REOPENING_TAGS
+    ),
 )
 @pytest.mark.parametrize("closed", [False, True])
 def test_late_think_markers_stay_content(name, closed):
@@ -412,9 +543,14 @@ def test_missing_and_empty_prompt_are_self_contained(name):
         tok, renderer = _renderer(name)
     bare = _encode(tok, "Answer")
     expected = renderer.parse_response(bare, prompt_ids=[])
-    assert expected.content == "Answer"
-    assert expected.reasoning_content is None
-    assert expected.reasoning_complete is not False
+    if name in _REOPENING_TAGS:
+        assert expected.content == ""
+        assert expected.reasoning_content == "Answer"
+        assert expected.reasoning_complete is False
+    else:
+        assert expected.content == "Answer"
+        assert expected.reasoning_content is None
+        assert expected.reasoning_complete is not False
     assert renderer.parse_response(bare) == expected
     assert renderer.parse_response(bare, prompt_ids=None) == expected
 
@@ -502,3 +638,8 @@ def test_harmony_later_unfinished_analysis_preserves_earlier_output():
         )
         is None
     )
+
+
+def teardown_module():
+    """Release model resources when this module finishes, not at process exit."""
+    _renderer.cache_clear()

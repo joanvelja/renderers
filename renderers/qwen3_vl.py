@@ -312,6 +312,11 @@ class Qwen3VLRenderer:
     ``thinking_retention`` still controls whether the bridge is attempted.
     """
 
+    @property
+    def is_prefix_stable(self) -> bool:
+        """Whether full renders preserve completed conversation prefixes."""
+        return True
+
     supports_process_multimodal = True
 
     def __init__(
@@ -706,6 +711,7 @@ class Qwen3VLRenderer:
             prompt_ids=previous_prompt_ids,
             stop_ids=set(self.get_stop_token_ids()),
             tool_start_id=self._tool_call,
+            tool_start_closes_reasoning=True,
         )
         if boundary.is_open:
             if any(t in self.get_stop_token_ids() for t in previous_completion_ids):

@@ -47,6 +47,11 @@ class KimiK2Renderer:
     but have no effect on the byte-level output.
     """
 
+    @property
+    def is_prefix_stable(self) -> bool:
+        """Whether full renders preserve completed conversation prefixes."""
+        return True
+
     def __init__(
         self,
         tokenizer: Tokenizer,
@@ -378,6 +383,7 @@ class KimiK2Renderer:
             prompt_ids=previous_prompt_ids,
             stop_ids=set(self.get_stop_token_ids()),
             tool_start_id=self._tool_calls_section_begin,
+            tool_start_closes_reasoning=True,
             assistant_prefix="<|im_assistant|>assistant<|im_middle|>",
         )
         if boundary.is_open:

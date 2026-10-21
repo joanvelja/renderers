@@ -193,6 +193,11 @@ class _TokenBuilder:
 class PrimeQwen3Renderer:
     """Renderer for PrimeIntellect/Qwen3-0.6B and Qwen3-1.7B."""
 
+    @property
+    def is_prefix_stable(self) -> bool:
+        """Whether full renders preserve completed conversation prefixes."""
+        return True
+
     def __init__(
         self,
         tokenizer: Tokenizer,
@@ -660,6 +665,7 @@ class PrimeQwen3Renderer:
             prompt_ids=previous_prompt_ids,
             stop_ids=set(self.get_stop_token_ids()),
             tool_start_id=self._tool_call,
+            tool_start_closes_reasoning=True,
         )
         if boundary.is_open:
             if any(t in self.get_stop_token_ids() for t in previous_completion_ids):

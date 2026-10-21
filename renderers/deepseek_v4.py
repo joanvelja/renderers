@@ -22,8 +22,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
-
 from renderers.base import (
     Message,
     ParsedResponse,
@@ -41,7 +39,7 @@ from renderers.base import (
 )
 from renderers.configs import DeepSeekV4RendererConfig
 from renderers.parsing import parse_deepseek_v4
-
+from renderers.reasoning import prompt_ends_in_reasoning
 
 _BOS = "<｜begin▁of▁sentence｜>"
 _EOS = "<｜end▁of▁sentence｜>"
@@ -294,6 +292,12 @@ def _prepare_messages(messages: list[Message]) -> list[_LogicalMessage]:
 class DeepSeekV4Renderer:
     """Renderer for ``deepseek-ai/DeepSeek-V4-Flash-0731``."""
 
+    @property
+    def is_prefix_stable(self) -> bool:
+        """Whether full renders preserve completed conversation prefixes."""
+        # Task transitions and unterminated assistant continuations can rewrite the prefix.
+        return False
+
     _implied_thinking_retention = "tool_cycle"
 
     def __init__(
@@ -330,6 +334,10 @@ class DeepSeekV4Renderer:
         if len(ids) != 1:
             raise ValueError(f"Expected one token for {token!r}, got {ids}")
         return ids[0]
+
+    def _reasoning_effort_prompt(self) -> str:
+        """Text emitted after BOS in thinking mode; subclasses can replace it."""
+        return _REASONING_EFFORT_PROMPTS[self.config.reasoning_effort]
 
     @staticmethod
     def _render_tools(tools: list[ToolSpec]) -> str:
@@ -573,10 +581,7 @@ class DeepSeekV4Renderer:
         if add_bos:
             emit_special(self._bos, -1)
         if add_effort_prompt and self.config.enable_thinking:
-            emit_text(
-                _REASONING_EFFORT_PROMPTS[self.config.reasoning_effort],
-                -1,
-            )
+            emit_text(self._reasoning_effort_prompt(), -1)
 
         last_query_index = -1
         for index, message in enumerate(logical_messages):
@@ -791,15 +796,18 @@ class DeepSeekV4Renderer:
             self._tokenizer,
             token_ids,
             stop_ids={self._eos},
-            thinking_enabled=prompt_ends_in_reasoning(
-                self._tokenizer,
-                prompt_ids,
-                stop_ids=set(self.get_stop_token_ids()),
-                assistant_prefix="<｜Assistant｜>",
+            thinking_enabled=(
+                prompt_ends_in_reasoning(
+                    self._tokenizer,
+                    prompt_ids,
+                    stop_ids=set(self.get_stop_token_ids()),
+                    assistant_prefix="<｜Assistant｜>",
+                )
+                if prompt_ids
+                else self.config.enable_thinking
             ),
             think_end_id=self._think_end,
             think_start_id=self._think_start,
-            dsml_id=self._dsml,
         )
 
     def get_stop_token_ids(self) -> list[int]:
@@ -820,15 +828,10 @@ class DeepSeekV4Renderer:
         ):
             return None
 
-        boundary = scan_reasoning(
-            self._tokenizer,
-            previous_completion_ids,
-            prompt_ids=previous_prompt_ids,
-            stop_ids=set(self.get_stop_token_ids()),
-            tool_start_id=self._dsml,
-            assistant_prefix="<｜Assistant｜>",
+        boundary = self.parse_response(
+            previous_completion_ids, prompt_ids=previous_prompt_ids, tools=tools
         )
-        if boundary.is_open:
+        if boundary.reasoning_complete is False:
             if any(t in self.get_stop_token_ids() for t in previous_completion_ids):
                 return None
             previous_completion_ids = [*previous_completion_ids, self._think_end]

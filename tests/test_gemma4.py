@@ -760,3 +760,8 @@ def test_unnamed_tool_responses_use_ordered_call_names():
 
     assert "<|tool_response>response:first{" in rendered
     assert "<|tool_response>response:second{" in rendered
+
+
+def teardown_module():
+    """Release model resources when this module finishes, not at process exit."""
+    _gemma4.cache_clear()

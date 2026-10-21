@@ -58,6 +58,12 @@ _TOOLS_INSTRUCTIONS = (
 class MiniMaxM2Renderer:
     """Deterministic message → token renderer for MiniMax M2 / M2.5 models."""
 
+    @property
+    def is_prefix_stable(self) -> bool:
+        """Whether full renders preserve completed conversation prefixes."""
+        # Only assistants after the last user retain reasoning.
+        return False
+
     def __init__(
         self,
         tokenizer: Tokenizer,
@@ -349,6 +355,7 @@ class MiniMaxM2Renderer:
             prompt_ids=previous_prompt_ids,
             stop_ids=set(self.get_stop_token_ids()),
             tool_start_id=self._tool_call_tok,
+            tool_start_closes_reasoning=True,
             assistant_prefix="]~b]ai\n",
         )
         if boundary.is_open:

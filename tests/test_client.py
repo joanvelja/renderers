@@ -245,7 +245,7 @@ class _FakeRenderer:
         return [99]
 
     def parse_response(
-        self, completion_ids: list[int], *, tools=None, prompt_ids=None
+        self, completion_ids: list[int], *, tools=None, prompt_ids=None, tool_calls=True
     ) -> ParsedResponse:
         assert completion_ids == [7, 8]
         # Stores tools so tests can assert the client plumbed them through.
@@ -655,7 +655,7 @@ class _MalformedToolRenderer(_FakeRenderer):
     """Returns only a malformed tool-call attempt — finish_reason must stay "stop"."""
 
     def parse_response(
-        self, completion_ids: list[int], *, tools=None, prompt_ids=None
+        self, completion_ids: list[int], *, tools=None, prompt_ids=None, tool_calls=True
     ) -> ParsedResponse:
         return ParsedResponse(
             content="",
@@ -930,7 +930,9 @@ def test_generate_serializes_nemotron_dynamic_image_features():
         def get_stop_token_ids(self):
             return [99]
 
-        def parse_response(self, completion_ids, *, tools=None, prompt_ids=None):
+        def parse_response(
+            self, completion_ids, *, tools=None, prompt_ids=None, tool_calls=True
+        ):
             return ParsedResponse(content="done")
 
     renderer = object.__new__(_FakeNemotronRenderer)
@@ -1153,7 +1155,9 @@ def test_generate_forwards_reasoning_state_without_classifying_acceptance(
     reasoning_complete,
 ):
     class ContextRenderer(_FakeRenderer):
-        def parse_response(self, completion_ids, *, tools=None, prompt_ids=None):
+        def parse_response(
+            self, completion_ids, *, tools=None, prompt_ids=None, tool_calls=True
+        ):
             assert prompt_ids == [1, 2, 3]
             assert completion_ids == [7, 8]
             return ParsedResponse(

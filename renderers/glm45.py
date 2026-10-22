@@ -14,6 +14,7 @@ import json
 from typing import Any
 
 from renderers.base import (
+    VllmParsers,
     Message,
     ParsedResponse,
     RenderedTokens,
@@ -25,6 +26,7 @@ from renderers.base import (
     reject_assistant_in_extension,
     resolve_thinking_retention,
     should_rerender_for_thinking_retention,
+    without_tool_calls,
 )
 from renderers.configs import GLM45RendererConfig
 from renderers.parsing import parse_glm
@@ -52,6 +54,8 @@ _TOOLS_FOOTER = (
 
 class GLM45Renderer:
     """Deterministic message → token renderer for GLM-4.5 Air models."""
+
+    vllm_parsers = VllmParsers("glm45", "glm45")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -280,8 +284,9 @@ class GLM45Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
-        return parse_glm(
+        parsed = parse_glm(
             self._tokenizer,
             token_ids,
             stop_ids={self._endoftext, self._user, self._observation},
@@ -296,6 +301,7 @@ class GLM45Renderer:
             tools=tools,
             thinking_enabled=self.config.enable_thinking,
         )
+        return parsed if tool_calls else without_tool_calls(parsed)
 
     def get_stop_token_ids(self) -> list[int]:
         return [self._endoftext, self._user, self._observation]

@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from renderers.base import (
+    VllmParsers,
     Message,
     MultiModalData,
     ParsedResponse,
@@ -28,6 +29,7 @@ from renderers.base import (
     reject_assistant_in_extension,
     resolve_thinking_retention,
     should_rerender_for_thinking_retention,
+    without_tool_calls,
 )
 from renderers.configs import (
     GLM5RendererConfig,
@@ -75,6 +77,8 @@ def _tool_contents(content: Any) -> list[Any]:
 
 class GLM5Renderer:
     """Deterministic message → token renderer for GLM-5 models."""
+
+    vllm_parsers = VllmParsers("glm47", "glm45")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -394,8 +398,9 @@ class GLM5Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
-        return parse_glm(
+        parsed = parse_glm(
             self._tokenizer,
             token_ids,
             stop_ids={self._endoftext, self._user, self._observation},
@@ -410,6 +415,7 @@ class GLM5Renderer:
             tools=tools,
             thinking_enabled=getattr(self.config, "enable_thinking", True),
         )
+        return parsed if tool_calls else without_tool_calls(parsed)
 
     def get_stop_token_ids(self) -> list[int]:
         return [self._endoftext, self._user, self._observation]

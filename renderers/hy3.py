@@ -30,6 +30,7 @@ from typing import Any
 from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
+    VllmParsers,
     Message,
     ParsedResponse,
     RenderedTokens,
@@ -75,6 +76,8 @@ _TOOL_RESPONSE_END = f"</tool_response{_HYTK}>"
 
 class Hy3Renderer:
     """Deterministic message → token renderer for Tencent Hy3 models."""
+
+    vllm_parsers = VllmParsers("hy_v3", "hy_v3")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -600,10 +603,12 @@ class Hy3Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         return parse_hy3(
             self._tokenizer,
             token_ids,
+            scan_tool_calls=tool_calls,
             stop_ids={self._eos},
             assistant_id=self._assistant,
             think_id=self._think,

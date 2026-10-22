@@ -17,6 +17,7 @@ failure) — see ``ToolCallParseStatus`` docstring for the rationale.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from renderers.base import (
@@ -164,6 +165,42 @@ def _decode(tokenizer, ids: list[int]) -> str:
     return tokenizer.decode(ids, skip_special_tokens=False)
 
 
+_QWEN3_XML_TERMINAL_RE = re.compile(r"</?tool_call>|<function=|</function>")
+
+
+def _qwen3_xml_content(text: str) -> str:
+    """The text vLLM's qwen3 grammar (``vllm/parser/qwen3.py`` at
+    ``VLLM_CHAT_PARITY``, the ``qwen3_coder`` engine) serves as content when it
+    parses no calls from ``text``: what it reads in its CONTENT state. A
+    ``<tool_call>`` or a bare ``<function=`` leaves CONTENT and only a
+    ``</tool_call>`` returns to it, so the text after a bare ``</function>`` is
+    dropped until one. A terminal with no transition from CONTENT stays text."""
+    kept: list[str] = []
+    state = "content"  # or "tool" (TOOL_NAME/TOOL_ARGS), "wrapper" (PREAMBLE/BETWEEN)
+    cursor = 0
+    for match in _QWEN3_XML_TERMINAL_RE.finditer(text):
+        terminal = match.group()
+        if state == "content":
+            kept.append(text[cursor : match.start()])
+            if terminal == "<tool_call>":
+                state = "wrapper"
+            elif terminal == "<function=":
+                state = "tool"
+            else:
+                kept.append(terminal)
+        elif state == "tool":
+            if terminal == "</function>":
+                state = "wrapper"
+        elif terminal == "</tool_call>":
+            state = "content"
+        elif terminal == "<function=":
+            state = "tool"
+        cursor = match.end()
+    if state == "content":
+        kept.append(text[cursor:])
+    return "".join(kept)
+
+
 def _reasoning_end_token_index(
     tokenizer, ids: list[int], marker: str = "</think>"
 ) -> int:
@@ -209,8 +246,12 @@ def parse_qwen3(
     tool_call_end_id: int,
     reasoning_end_id: int | None = None,
     prefilled_thinking: bool = False,
+    scan_tool_calls: bool = True,
 ) -> ParsedResponse:
-    """Parse Qwen3 completion tokens. Hermes-style JSON tool calls."""
+    """Parse Qwen3 completion tokens. Hermes-style JSON tool calls.
+
+    ``scan_tool_calls=False`` leaves the markup in the content, as a legacy
+    vLLM tool parser serves a reply without tool calls."""
     ids = _strip_stop_tokens(token_ids, stop_ids)
     boundary = scan_reasoning(
         tokenizer,
@@ -237,7 +278,7 @@ def parse_qwen3(
         )
         scan_start = reasoning_end + 1 if reasoning_end != -1 else 0
 
-    tc_start = _find(ids, tool_call_id, scan_start)
+    tc_start = _find(ids, tool_call_id, scan_start) if scan_tool_calls else -1
     tool_calls: list[ParsedToolCall] = []
     if tc_start != -1:
         content_ids = ids[:tc_start]
@@ -331,6 +372,7 @@ def parse_qwen35(
     tool_call_end_id: int,
     tools: list[ToolSpec] | None = None,
     prefilled_thinking: bool = False,
+    drop_tool_calls: bool = False,
 ) -> ParsedResponse:
     """Parse Qwen3.5 completion tokens. XML-style tool calls, token-level thinking.
 
@@ -343,6 +385,9 @@ def parse_qwen35(
 
     ``prefilled_thinking`` declares whether the generation prompt opened reasoning.
     Direct helper calls default to an unprefilled completion.
+
+    ``drop_tool_calls=True`` parses no calls and keeps the text vLLM's
+    ``qwen3_coder`` engine serves without them (``_qwen3_xml_content``).
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
     boundary = scan_reasoning(
@@ -373,7 +418,9 @@ def parse_qwen35(
 
     tc_start = _find(ids, tool_call_id)
     tool_calls: list[ParsedToolCall] = []
-    if tc_start != -1:
+    if drop_tool_calls:
+        content_text = _qwen3_xml_content(_decode(tokenizer, ids)).strip()
+    elif tc_start != -1:
         content_text = _decode(tokenizer, ids[:tc_start]).strip()
         tool_calls = _parse_xml_tool_calls(
             tokenizer,
@@ -651,6 +698,7 @@ def parse_hy3(
     arg_value_end_id: int,
     tools: list[ToolSpec] | None = None,
     prefilled_thinking: bool = False,
+    scan_tool_calls: bool = True,
 ) -> ParsedResponse:
     """Parse Hy3 completion tokens.
 
@@ -659,6 +707,9 @@ def parse_hy3(
     the ``<think>`` opener lives in the generation prompt) and a round-trip
     slice that still carries a leading ``<｜hy_Assistant｜>`` opener and a
     full ``<think>…</think>`` block.
+
+    ``scan_tool_calls=False`` leaves the markup in the content, as a legacy
+    vLLM tool parser serves a reply without tool calls.
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
     boundary = scan_reasoning(
@@ -696,7 +747,9 @@ def parse_hy3(
     # Content ends at the first tool marker — the outer <tool_calls> wrapper
     # or, defensively, a bare <tool_call> the model emitted without it.
     marker_positions = [
-        p for p in (_find(ids, tool_calls_id), _find(ids, tool_call_id)) if p != -1
+        p
+        for p in (_find(ids, tool_calls_id), _find(ids, tool_call_id))
+        if p != -1 and scan_tool_calls
     ]
     tool_calls: list[ParsedToolCall] = []
     if marker_positions:
@@ -848,6 +901,7 @@ def parse_laguna_xs2(
     tools: list[ToolSpec] | None = None,
     strip_newlines: bool = True,
     prefilled_thinking: bool = False,
+    scan_tool_calls: bool = True,
 ) -> ParsedResponse:
     """Parse Laguna-XS.2 / XS-2.1 completion tokens.
 
@@ -867,6 +921,9 @@ def parse_laguna_xs2(
     ``prefilled_thinking`` means the generation prompt already opened
     ``<think>``. Without a sampled ``</think>``, all output is still
     reasoning, including any tool-call-looking text drafted inside it.
+
+    ``scan_tool_calls=False`` leaves the markup in the content, as a legacy
+    vLLM tool parser serves a reply without tool calls.
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
     boundary = scan_reasoning(
@@ -895,7 +952,7 @@ def parse_laguna_xs2(
         ids = ids[think_end + 1 :]
         parse_offset = think_end + 1
 
-    tc_start = _find(ids, tool_call_id)
+    tc_start = _find(ids, tool_call_id) if scan_tool_calls else -1
     tool_calls: list[ParsedToolCall] = []
     if tc_start != -1:
         content_text = _segment(ids[:tc_start])
@@ -1019,6 +1076,7 @@ def parse_deepseek_v3(
     tool_call_end_id: int,
     tool_sep_id: int,
     prefilled_thinking: bool = False,
+    scan_tool_calls: bool = True,
 ) -> ParsedResponse:
     """Parse DeepSeek V3 completion tokens.
 
@@ -1027,6 +1085,9 @@ def parse_deepseek_v3(
         <｜tool▁calls▁begin｜>
           <｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n{args}\\n```<｜tool▁call▁end｜>
         <｜tool▁calls▁end｜>
+
+    ``scan_tool_calls=False`` leaves the markup in the content, as a legacy
+    vLLM tool parser serves a reply without tool calls.
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
     boundary = scan_reasoning(
@@ -1051,7 +1112,9 @@ def parse_deepseek_v3(
         _reasoning_end_token_index(tokenizer, ids) if boundary.text is not None else 0
     )
 
-    tc_section_start = _find(ids, tool_calls_begin_id, reasoning_end)
+    tc_section_start = (
+        _find(ids, tool_calls_begin_id, reasoning_end) if scan_tool_calls else -1
+    )
     tool_calls: list[ParsedToolCall] = []
     if tc_section_start != -1:
         content_ids = ids[:tc_section_start]
@@ -1331,8 +1394,12 @@ def parse_minimax(
     tool_call_end_id: int,
     tools: list[ToolSpec] | None = None,
     prefilled_thinking: bool = False,
+    scan_tool_calls: bool = True,
 ) -> ParsedResponse:
-    """Parse MiniMax M2 completion tokens."""
+    """Parse MiniMax M2 completion tokens.
+
+    ``scan_tool_calls=False`` leaves the markup in the content, as a legacy
+    vLLM tool-parser pair serves a reply without tool calls."""
     import re
 
     ids = _strip_stop_tokens(token_ids, stop_ids)
@@ -1363,7 +1430,7 @@ def parse_minimax(
         parse_offset = think_end + 1
     ids = ids[parse_offset:]
 
-    tc_start = _find(ids, tool_call_id)
+    tc_start = _find(ids, tool_call_id) if scan_tool_calls else -1
     tool_calls: list[ParsedToolCall] = []
     if tc_start != -1:
         content_text = _decode(tokenizer, ids[:tc_start]).strip()
@@ -1819,6 +1886,7 @@ def parse_llama_3(
     token_ids: list[int],
     *,
     stop_ids: set[int],
+    scan_tool_calls: bool = True,
 ) -> ParsedResponse:
     """Parse Llama-3 completion tokens.
 
@@ -1837,6 +1905,13 @@ def parse_llama_3(
     dropping the generation prompt include that scaffold; we skip past the
     final ``<|end_header_id|>`` so the body is what we parse. The sampled
     stream in production carries no header, making this a no-op there.
+
+    ``scan_tool_calls=False`` leaves the body as content, as vLLM's legacy
+    ``llama3_json`` parser serves a reply without tool calls, detokenized as
+    its chat path does it under ``tool_choice="none"``: no parser adjusts the
+    request (there is no reasoning parser), so ``skip_special_tokens`` keeps
+    its default and special tokens such as ``<|python_tag|>`` don't reach the
+    content.
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
 
@@ -1848,6 +1923,9 @@ def parse_llama_3(
         if eh_positions:
             body_start = eh_positions[-1] + 1
     body_ids = ids[body_start:]
+    if not scan_tool_calls:
+        content = tokenizer.decode(body_ids, skip_special_tokens=True).strip()
+        return ParsedResponse(content=content, reasoning_content=None)
     text = _decode(tokenizer, body_ids).strip()
 
     if text.startswith("{") and text.endswith("}"):
@@ -1890,6 +1968,7 @@ def parse_inkling(
     invoke_text_id: int,
     end_message_id: int,
     prefilled_thinking: bool = False,
+    streamed_without_tools: bool = False,
 ) -> ParsedResponse:
     """Parse Inkling completion tokens.
 
@@ -1911,12 +1990,39 @@ def parse_inkling(
     ``token_span`` on each ``ParsedToolCall`` is the half-open slice of the
     stop-stripped stream covering that tool-call segment (from its leading
     ``<|message_model|>`` through the terminating ``<|end_message|>``).
+
+    ``streamed_without_tools`` keeps the content as vLLM's engine streams it
+    to a request without tools, where its tool calls aren't suppressed: until
+    the first non-whitespace text, a whitespace-only token is held back and
+    dropped once a call has opened (``drop_whitespace_only_content_before_tools``).
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
 
     reasoning_parts: list[str] = []
     content_parts: list[str] = []
     tool_calls: list[ParsedToolCall] = []
+    held: list[str] = []  # whitespace-only tokens before any text (streamed)
+    has_text = False
+
+    def add_content(content_ids: list[int]) -> None:
+        nonlocal has_text
+        if not streamed_without_tools or has_text:
+            content_parts.append(_decode(tokenizer, content_ids))
+            return
+        for k, token_id in enumerate(content_ids):
+            piece = _decode(tokenizer, [token_id])
+            if piece.strip():
+                content_parts.extend(held)
+                content_parts.append(_decode(tokenizer, content_ids[k:]))
+                held.clear()
+                has_text = True
+                return
+            if not tool_calls:
+                held.append(piece)
+
+    def add_call(call: ParsedToolCall) -> None:
+        held.clear()
+        tool_calls.append(call)
 
     if prefilled_thinking and not ids:
         return ParsedResponse(
@@ -1945,7 +2051,7 @@ def parse_inkling(
             invoke = _find(reasoning_ids, invoke_json_id)
             if invoke != -1:
                 reasoning_parts.append(_decode(tokenizer, reasoning_ids[:invoke]))
-                tool_calls.append(
+                add_call(
                     _build_inkling_tool_call(
                         name="",
                         payload=_decode(tokenizer, reasoning_ids[invoke + 1 :]),
@@ -1968,13 +2074,13 @@ def parse_inkling(
                     reasoning_complete=False,
                 )
         elif body[0] == content_text_id:
-            content_parts.append(_decode(tokenizer, body[1:]))
+            add_content(body[1:])
         else:
             marker = _find_any(body, {invoke_json_id, invoke_text_id})
             if marker != -1:
                 name = _decode(tokenizer, body[:marker]).strip()
                 payload = _decode(tokenizer, body[marker + 1 :])
-                tool_calls.append(
+                add_call(
                     _build_inkling_tool_call(
                         name=name,
                         payload=payload,
@@ -1985,12 +2091,13 @@ def parse_inkling(
             else:
                 # No content marker and no invoke marker — treat the decoded
                 # bytes as content rather than dropping them.
-                content_parts.append(_decode(tokenizer, body))
+                add_content(body)
 
         if not terminated:
             break
         pos = em + 1
 
+    content_parts.extend(held)
     return ParsedResponse(
         content="".join(content_parts),
         reasoning_content="".join(reasoning_parts) or None,

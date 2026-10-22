@@ -22,7 +22,7 @@ tokenizers and route to the Qwen3 / Llama-3 renderers, not this one.
 
 from __future__ import annotations
 
-from renderers.base import Message
+from renderers.base import Message, VllmParsers
 from renderers.configs import DeepSeekR1RendererConfig
 from renderers.deepseek_v3 import DeepSeekV3Renderer
 
@@ -30,6 +30,7 @@ from renderers.deepseek_v3 import DeepSeekV3Renderer
 class DeepSeekR1Renderer(DeepSeekV3Renderer):
     """Deterministic message → token renderer for DeepSeek-R1 models."""
 
+    vllm_parsers = VllmParsers("deepseek_v3", "deepseek_r1")
     _config_cls: type = DeepSeekR1RendererConfig
     _implied_thinking_retention = "template"
     _GEN_THINK_PREFILL: str = "<think>\n"

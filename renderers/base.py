@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import (
     TYPE_CHECKING,
@@ -646,6 +646,113 @@ class ParsedResponse:
     """
 
 
+VLLM_CHAT_PARITY = "0.32.0"
+"""The vLLM release each renderer's ``vllm_parsers`` names parsers of, and whose
+chat path ``parse_response(tool_calls=False)`` mirrors. Re-read the declarations
+and the parser facts below when bumping it."""
+
+# ``engine_based_streaming`` of the vLLM (``VLLM_CHAT_PARITY``) parser classes the
+# renderers declare. ``openai`` is gpt-oss's tool parser, which vLLM runs through its
+# Harmony parser instead.
+_ENGINE_TOOL_PARSER: dict[str, bool] = {
+    "deepseek_v3": False,
+    "deepseek_v4": True,
+    "gemma4": True,
+    "glm45": True,
+    "glm47": True,
+    "hermes": False,
+    "hy_v3": False,
+    "inkling": True,
+    "kimi_k2": True,
+    "llama3_json": False,
+    "minimax_m2": True,
+    "muse_glimmer": False,
+    "openai": False,
+    "poolside_v1": False,
+    "qwen3_coder": True,
+}
+_ENGINE_REASONING_PARSER: dict[str, bool] = {
+    "deepseek_r1": False,
+    "deepseek_v4": True,
+    "gemma4": True,
+    "glm45": True,
+    "hy_v3": False,
+    "inkling": True,
+    "kimi_k2": True,
+    "minimax_m2_append_think": False,
+    "muse_glimmer": False,
+    "nemotron_v3": True,
+    "poolside_v1": False,
+    "qwen3": True,
+}
+
+
+@dataclass(frozen=True)
+class VllmParsers:
+    """The vLLM parser pair (``--tool-call-parser``, ``--reasoning-parser`` at
+    ``VLLM_CHAT_PARITY``) a renderer's format is served with: declared once per
+    renderer (``Renderer.vllm_parsers``), served by whoever runs vLLM for it, and
+    the source of how ``parse_response(tool_calls=False)`` treats tool markup."""
+
+    tool: str | None
+    reasoning: str | None
+
+    def __post_init__(self) -> None:
+        if self.tool is not None and self.tool not in _ENGINE_TOOL_PARSER:
+            raise ValueError(f"no vLLM {VLLM_CHAT_PARITY} tool parser {self.tool!r}")
+        if (
+            self.reasoning is not None
+            and self.reasoning not in _ENGINE_REASONING_PARSER
+        ):
+            raise ValueError(
+                f"no vLLM {VLLM_CHAT_PARITY} reasoning parser {self.reasoning!r}"
+            )
+
+    @property
+    def engine_based(self) -> bool:
+        """Whether vLLM parses with one engine for both parsers
+        (``abstract_parser.py:151-154``): neither is a legacy parser."""
+        return (self.tool is None or _ENGINE_TOOL_PARSER[self.tool]) and (
+            self.reasoning is None or _ENGINE_REASONING_PARSER[self.reasoning]
+        )
+
+    @property
+    def drops_tool_markup(self) -> bool:
+        """Whether vLLM's chat path leaves a reply's tool-call markup out of its
+        content when it parses no calls from it (``tool_choice="none"``, which a
+        request without tools defaults to). Harmony drops tool messages; an
+        engine-based pair runs its engine and drops the tool events
+        (``abstract_parser.py:394-397``), keeping the text around the blocks. A
+        legacy tool parser hands the reasoning parser's content on whole
+        (``:398``), and without a tool parser nothing is a call (``:390``)."""
+        if self.tool is None:
+            return False
+        return self.tool == "openai" or self.engine_based
+
+
+def without_tool_calls(parsed: ParsedResponse) -> ParsedResponse:
+    """``parsed`` served without its tool calls, for a format whose vLLM pair
+    drops tool markup and whose parse already keeps the text around the calls."""
+    return replace(parsed, tool_calls=[])
+
+
+def _unpinned(name: str) -> ValueError:
+    return ValueError(
+        f"{name} parses tool calls but pins no vLLM parser pair, so it can't "
+        "parse a reply without tool calls as vLLM's chat path would "
+        f"(vLLM {VLLM_CHAT_PARITY}): configure a model-specific renderer"
+    )
+
+
+def require_vllm_parsers(renderer: "Renderer") -> None:
+    """Refuse ``tool_calls=False`` for a renderer that parses tool calls but
+    declares no vLLM pair (``DefaultRenderer`` with a ``tool_parser``)."""
+    if getattr(renderer, "vllm_parsers", None) is None and getattr(
+        renderer, "supports_tools", True
+    ):
+        raise _unpinned(type(renderer).__name__)
+
+
 @dataclass
 class RenderedConversation:
     """Exact token state for a rendered conversation."""
@@ -742,6 +849,13 @@ class Renderer(Protocol):
         """
         ...
 
+    @property
+    def vllm_parsers(self) -> VllmParsers | None:
+        """The vLLM parser pair the format is served with (``VllmParsers``),
+        which ``parse_response(tool_calls=False)`` follows. ``None`` pins none:
+        that parse is then refused, unless the renderer parses no tool calls."""
+        ...
+
     def render(
         self,
         messages: list[Message],
@@ -776,6 +890,7 @@ class Renderer(Protocol):
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         """Parse completion tokens back into a structured message.
 
@@ -794,6 +909,12 @@ class Renderer(Protocol):
         parameter's declared JSON-schema type to preserve string args
         verbatim. Without ``tools``, parsers fall back to the historical
         ``json.loads``-with-text-fallback behavior.
+
+        ``tool_calls=False`` parses the reply as vLLM's chat path serves it
+        under ``tool_choice="none"`` with tools (the whole reply) and without
+        tools (the streamed reply): no tool calls, the reasoning split
+        unchanged, and the tool-call markup kept in the content or dropped from
+        it as ``vllm_parsers`` derives (``VllmParsers.drops_tool_markup``).
         """
         ...
 
@@ -1486,6 +1607,44 @@ def create_renderer(
             f"While creating renderer {renderer_name!r} for tokenizer {model_name!r}."
         )
         raise
+
+
+def vllm_parsers_for(
+    config: "RendererConfig | None", model_name: str
+) -> VllmParsers | None:
+    """``vllm_parsers`` of the renderer ``create_renderer`` builds from ``config``
+    for ``model_name``, read without a tokenizer: ``auto`` resolves through
+    ``MODEL_RENDERER_MAP``, and a model the map lacks gets ``DefaultRenderer``,
+    which pins none. A custom renderer declares it as a class attribute."""
+    from renderers.configs import AutoRendererConfig, CustomRendererConfig
+    from renderers.custom import load_custom_renderer
+
+    if isinstance(config, CustomRendererConfig):
+        renderer_cls = load_custom_renderer(config.import_path)
+    else:
+        if config is None or isinstance(config, AutoRendererConfig):
+            name = MODEL_RENDERER_MAP.get(model_name, "default")
+        else:
+            name = config.name
+        _populate_registry()
+        renderer_cls = RENDERER_REGISTRY[name]
+    return getattr(renderer_cls, "vllm_parsers", None)
+
+
+def require_vllm_parsers_for(config: "RendererConfig | None", model_name: str) -> None:
+    """``require_vllm_parsers`` for the renderer ``config`` builds for
+    ``model_name``, before it is built."""
+    from renderers.configs import AutoRendererConfig, DefaultRendererConfig
+
+    if vllm_parsers_for(config, model_name) is not None:
+        return
+    if (
+        config is None
+        or isinstance(config, AutoRendererConfig)
+        or (isinstance(config, DefaultRendererConfig) and config.tool_parser is None)
+    ):
+        return  # DefaultRenderer without a tool parser: nothing is a call
+    raise _unpinned(f"renderer {config.name!r}")
 
 
 def template_field_names(config: "RendererConfig") -> frozenset[str]:

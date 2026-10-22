@@ -135,6 +135,29 @@ def test_default_renderer_uses_parsers():
     assert parsed.tool_calls[0].status == ToolCallParseStatus.OK
 
 
+def test_default_renderer_with_a_tool_parser_refuses_a_parse_without_tool_calls():
+    """Its vLLM parser pair isn't pinned, so it can't serve a reply as vLLM's chat
+    path would under tool_choice="none"; without a tool parser there's no scan to
+    skip, and the parse is the same."""
+    from renderers import DefaultRendererConfig, create_renderer
+    from renderers.base import require_vllm_parsers_for
+
+    tok = load_tokenizer("Qwen/Qwen3-0.6B")
+    completion = 'ok\n<tool_call>\n{"name": "f", "arguments": {}}\n</tool_call>'
+    ids = tok.encode(completion, add_special_tokens=False)
+    parsing = create_renderer(tok, DefaultRendererConfig(tool_parser="qwen3"))
+    with pytest.raises(ValueError, match="DefaultRenderer parses tool calls but pins"):
+        parsing.parse_response(list(ids), tool_calls=False)
+    with pytest.raises(ValueError, match="renderer 'default' parses tool calls but"):
+        require_vllm_parsers_for(DefaultRendererConfig(tool_parser="qwen3"), "m/x")
+    plain = create_renderer(tok, DefaultRendererConfig())
+    assert plain.parse_response(list(ids), tool_calls=False) == plain.parse_response(
+        list(ids)
+    )
+    require_vllm_parsers_for(DefaultRendererConfig(), "m/x")
+    require_vllm_parsers_for(None, "m/unmapped")
+
+
 def test_default_renderer_without_parsers_is_backward_compatible():
     """Without parsers, DefaultRenderer still does basic <think> extraction."""
     from renderers import DefaultRendererConfig, create_renderer

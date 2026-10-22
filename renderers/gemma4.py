@@ -27,6 +27,7 @@ from typing import Any
 from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
+    VllmParsers,
     Message,
     MultiModalData,
     ParsedResponse,
@@ -44,6 +45,7 @@ from renderers.base import (
     resolve_thinking_retention,
     should_rerender_for_thinking_retention,
     trim_to_turn_close,
+    without_tool_calls,
 )
 
 from renderers.configs import Gemma4RendererConfig
@@ -430,6 +432,8 @@ class _ArgumentParser:
 
 class Gemma4Renderer:
     """Deterministic renderer for the canonical Gemma 4 instruction models."""
+
+    vllm_parsers = VllmParsers("gemma4", "gemma4")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -1140,6 +1144,7 @@ class Gemma4Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         """Parse explicit thought channels and prompt-prefilled continuations.
 
@@ -1147,6 +1152,16 @@ class Gemma4Renderer:
         ordinary first-turn content. Without it, parse the completion as
         self-contained and require an explicit thought channel.
         """
+        parsed = self._parse(token_ids, tools=tools, prompt_ids=prompt_ids)
+        return parsed if tool_calls else without_tool_calls(parsed)
+
+    def _parse(
+        self,
+        token_ids: list[int],
+        *,
+        tools: list[ToolSpec] | None,
+        prompt_ids: list[int] | None,
+    ) -> ParsedResponse:
         stop_ids = {self._turn_end, self._tool_response_start, self._eos}
         end = len(token_ids)
         for i, token_id in enumerate(token_ids):

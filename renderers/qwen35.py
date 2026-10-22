@@ -29,6 +29,7 @@ from typing import Any
 from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
+    VllmParsers,
     Message,
     MultiModalData,
     ParsedResponse,
@@ -125,6 +126,8 @@ def _default_enable_thinking(tokenizer) -> bool:
 
 class Qwen35Renderer:
     """Deterministic message → token renderer for Qwen3.5 models."""
+
+    vllm_parsers = VllmParsers("qwen3_coder", "qwen3")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -684,10 +687,12 @@ class Qwen35Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         return parse_qwen35(
             self._tokenizer,
             token_ids,
+            drop_tool_calls=not tool_calls,
             stop_ids={self._im_end, self._endoftext},
             think_id=self._think,
             think_end_id=self._think_end,

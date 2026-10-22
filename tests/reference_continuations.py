@@ -7,6 +7,7 @@ prefix mismatch by silently slicing at a common prefix or asking our renderer
 to supply the expected output.
 """
 
+import hashlib
 import json
 import re
 
@@ -162,3 +163,52 @@ def reference_continuation(tok, case, kwargs, messages, tools, *, calls=0):
     # non-reasoning templates intentionally ignore reasoning_content inputs.
     reasoning = REASONING if REASONING in tok.decode(completion) else ""
     return prompt, completion, reasoning
+
+
+AFTER = "\nAfter."
+"""Text a reply carries after its last tool call, where vLLM's tool parsers
+part ways once they parse no calls."""
+
+# Hand-written replies, each turning on one rule of its format's vLLM parsers:
+# name -> (model, completion text).
+SERVED_REPLIES = {
+    # llama3_json: no parser adjusts the request, so special tokens are skipped.
+    "llama-3-python-tag": (
+        "meta-llama/Llama-3.2-1B-Instruct",
+        '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Tokyo"}}'
+        "<|eom_id|>",
+    ),
+    # muse_glimmer: the to=user body ends before one final LF (`$`).
+    "muse-glimmer-final-newline": (
+        "meta-models/Muse-Glimmer-30B",
+        " to=user<|message|>Hello\n<|eot|>",
+    ),
+    # qwen3 grammar: a bare <function= opens a call; the text after its
+    # </function> stays out of the content until a </tool_call>.
+    "qwen3.5-bare-function": (
+        "Qwen/Qwen3.5-9B",
+        "Check.\n</think>\n\nSure.\n<function=get_weather>\n<parameter=city>\n"
+        "Tokyo\n</parameter>\n</function>\nafter<|im_end|>",
+    ),
+}
+
+
+def tool_reply_with_text_after(tok, renderer, case, kwargs, messages, tools, calls):
+    """The reference tool-call continuation up to the renderer's first stop
+    token, with ``AFTER`` inserted before that stop."""
+    _, sampled, _ = reference_continuation(
+        tok, case, kwargs, messages, tools, calls=calls
+    )
+    stops = set(renderer.get_stop_token_ids())
+    end = next((i for i, token in enumerate(sampled) if token in stops), None)
+    after = tok.encode(AFTER, add_special_tokens=False)
+    if end is None:
+        return sampled + after
+    return sampled[:end] + after + [sampled[end]]
+
+
+def served_key(tools, completion_ids, prompt_ids, chat_template_kwargs):
+    """A digest of what vLLM serves a reply from: whether the request offers tools, the
+    reply's and the prompt's token ids, and the template kwargs it sends."""
+    inputs = [bool(tools), completion_ids, prompt_ids, chat_template_kwargs]
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:16]

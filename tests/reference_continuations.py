@@ -16,6 +16,10 @@ from reference_rendering import _harmony_messages, render_reference
 REASONING = "Check the weather carefully."
 ANSWER = "It is sunny in Tokyo."
 
+MESSAGES = [{"role": "user", "content": "Check the weather."}]
+"""The conversation every reply served without tool calls answers
+(``served_key``)."""
+
 
 def reference_continuation(tok, case, kwargs, messages, tools, *, calls=0, content=""):
     """(prompt, completion, reasoning) of the reference's live reply: ``ANSWER``,
@@ -255,11 +259,10 @@ def tool_reply_with_text_after(
 
 
 def served_key(model, tools, completion_ids, chat_template_kwargs):
-    """A digest of what vLLM serves a reply from: the model (its tokenizer, the
-    renderer it maps to and the parser pair it is served with), whether the request
-    offers tools, the reply's token ids, and the template kwargs it sends. The prompt
-    is the renderer's for those, up to the current date some templates print (gpt-oss,
-    Muse Glimmer), which vLLM's parse doesn't read: a key over it would expire the
-    fixture daily."""
+    """The fixture's key for a reply: a digest of the model, whether the request
+    offers tools, the reply's token ids and the template kwargs it sends. It
+    names what vLLM serves only for the fixed ``MESSAGES`` and ``TOOLS``. The
+    prompt isn't in it: gpt-oss's and Muse Glimmer's print today's date, which
+    vLLM's parse doesn't read, so a key over it would expire the fixture daily."""
     inputs = [model, bool(tools), completion_ids, chat_template_kwargs]
     return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:16]

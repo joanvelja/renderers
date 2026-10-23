@@ -36,7 +36,6 @@ from pathlib import Path
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 FIXTURE = Path(__file__).parent / "fixtures" / "vllm_chat_content.json"
-MESSAGES = [{"role": "user", "content": "Check the weather."}]
 _REASONING_CLOSE = re.compile(r"</think(?::opensource)?>")
 
 
@@ -53,6 +52,7 @@ def replies(out_path):
     from reference_continuations import (
         BEFORE,
         BEFORE_KWARGS,
+        MESSAGES,
         SERVED_REPLIES,
         tool_reply_with_text_after,
     )
@@ -142,6 +142,7 @@ def _harmony_prefill(tok, prompt_ids):
 
 def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
     """(reasoning, content) of vLLM's reply to ``ids`` under tool_choice="none"."""
+    from reference_continuations import MESSAGES
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.parser.parser_manager import ParserManager
 

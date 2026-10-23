@@ -15,6 +15,7 @@ from reference_continuations import (
     ANSWER,
     BEFORE,
     BEFORE_KWARGS,
+    MESSAGES,
     REASONING,
     SERVED_REPLIES,
     reference_continuation,
@@ -140,7 +141,6 @@ async def test_reference_continuation_through_generate(case, kwargs, calls):
 _SERVED = json.loads(
     (Path(__file__).parent / "fixtures" / "vllm_chat_content.json").read_text()
 )
-_MESSAGES = [{"role": "user", "content": "Check the weather."}]
 
 
 def _in_renderers_convention(renderer_name: str, content: str) -> str:
@@ -169,7 +169,7 @@ async def _served_without_tool_calls(renderer, model, sampled, kwargs, tools):
             client=client,
             renderer=renderer,
             model=model,
-            messages=_MESSAGES,
+            messages=MESSAGES,
             tools=tools,
             max_prompt_len=100000,
             tool_calls=False,
@@ -216,11 +216,11 @@ async def test_reference_tool_calls_parsed_without_tool_calls(
     served = vllm_parsers_for(config_from_name(case.resolved_renderer), case.model)
     assert served == VllmParsers(*_SERVED["pairs"][case.model])
     sampled = tool_reply_with_text_after(
-        tok, renderer, case, kwargs, _MESSAGES, TOOLS, calls, content
+        tok, renderer, case, kwargs, MESSAGES, TOOLS, calls, content
     )
     assert content in tok.decode(sampled)
     _, _, reasoning = reference_continuation(
-        tok, case, kwargs, _MESSAGES, TOOLS, calls=calls, content=content
+        tok, case, kwargs, MESSAGES, TOOLS, calls=calls, content=content
     )
     result, want = await _served_without_tool_calls(
         renderer, case.model, sampled, kwargs, tools

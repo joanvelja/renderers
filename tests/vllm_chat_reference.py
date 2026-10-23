@@ -13,7 +13,8 @@ drives it, with the renderer's ``vllm_parsers`` and ``tool_choice="none"``: with
 the tools, the whole reply (``:997-1047``); without tools, the streamed reply for
 an engine-based pair (``:666``) and the whole one otherwise. Its output is
 detokenized as vLLM's v1 detokenizer does (a ``DecodeStream`` primed with the
-prompt, the stop token excluded).
+prompt, the stop token excluded). A Harmony (gpt-oss) reply is parsed from the
+channel header renderers' prompt prefills, where vLLM's prompt ends.
 
 The fixture maps a digest of each reply's inputs (``served_key``: the model, whether
 tools are offered, the reply's ids and the template kwargs) to an index into its
@@ -115,12 +116,28 @@ def _detokenize(tok, prompt_ids, ids, skip_special_tokens):
     return pieces
 
 
+def _harmony_prefill(tok, prompt_ids):
+    """Split renderers' gpt-oss prompt where vLLM's ends: vLLM's Harmony prompt
+    stops at ``<|start|>assistant`` and the model samples the channel header,
+    which renderers prefills (``<|channel|>analysis<|message|>``). vLLM parses
+    the reply from that header on, so the prefill goes in front of the reply."""
+    start = tok.convert_tokens_to_ids("<|start|>")
+    header = max(i for i, t in enumerate(prompt_ids) if t == start) + 1
+    role = tok.encode("assistant", add_special_tokens=False)
+    assert prompt_ids[header : header + len(role)] == role, "no assistant header"
+    split = header + len(role)
+    return prompt_ids[:split], prompt_ids[split:]
+
+
 def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
     """(reasoning, content) of vLLM's reply to ``ids`` under tool_choice="none"."""
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.parser.parser_manager import ParserManager
 
     harmony = pair.tool == "openai"
+    if harmony:
+        prompt_ids, prefill = _harmony_prefill(tok, prompt_ids)
+        ids = prefill + ids
     data = {"model": model, "messages": MESSAGES, "tool_choice": "none"}
     if tools:
         data["tools"] = tools

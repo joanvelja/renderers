@@ -123,8 +123,10 @@ def _arguments_to_str(arguments: Any) -> str:
 class GptOssRenderer:
     """Deterministic message → token renderer for OpenAI gpt-oss (harmony)."""
 
-    # vLLM serves gpt-oss through its Harmony parser, with no reasoning parser.
-    vllm_parsers = VllmParsers("openai", None)
+    # vLLM serves gpt-oss through its Harmony parser, which keeps the analysis
+    # channel as reasoning only with the gpt-oss reasoning parser and otherwise
+    # drops it (vllm/parser/harmony.py:211, :267).
+    vllm_parsers = VllmParsers("openai", "openai_gptoss")
 
     @property
     def is_prefix_stable(self) -> bool:

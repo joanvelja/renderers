@@ -682,6 +682,7 @@ _ENGINE_REASONING_PARSER: dict[str, bool] = {
     "minimax_m2_append_think": False,
     "muse_glimmer": False,
     "nemotron_v3": True,
+    "openai_gptoss": False,
     "poolside_v1": False,
     "qwen3": True,
 }

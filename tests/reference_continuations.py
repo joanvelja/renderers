@@ -183,6 +183,21 @@ SERVED_REPLIES = {
         "meta-models/Muse-Glimmer-30B",
         " to=user<|message|>Hello\n<|eot|>",
     ),
+    # Harmony: commentary without a recipient is content, the tool message is
+    # dropped. The reply follows the analysis header renderers' prompt prefills.
+    "gpt-oss-preamble-call": (
+        "openai/gpt-oss-20b",
+        "Need weather.<|end|><|start|>assistant<|channel|>commentary<|message|>"
+        "Let me check.<|end|><|start|>assistant<|channel|>commentary "
+        'to=functions.get_weather <|constrain|>json<|message|>{"city": "Tokyo"}'
+        "<|call|>",
+    ),
+    # Harmony: the final channel is content.
+    "gpt-oss-final": (
+        "openai/gpt-oss-20b",
+        "Need weather.<|end|><|start|>assistant<|channel|>final<|message|>"
+        "Sunny in Tokyo.<|return|>",
+    ),
     # qwen3 grammar: a bare <function= opens a call; the text after its
     # </function> stays out of the content until a </tool_call>.
     "qwen3.5-bare-function": (

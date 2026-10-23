@@ -144,9 +144,8 @@ async def _served_without_tool_calls(renderer, model, sampled, kwargs, tools):
     """Parse sampled through generate(tool_calls=False) and check it
     against the content vLLM serves for it (vllm_chat_reference.py)."""
     assert _SERVED["vllm"] == VLLM_CHAT_PARITY
-    prompt = renderer.render_ids(_MESSAGES, tools=tools, add_generation_prompt=True)
     ctk = {k: v for k, v in kwargs.items() if v is not None}
-    key = served_key(tools, sampled, prompt, ctk)
+    key = served_key(model, tools, sampled, ctk)
     assert key in _SERVED["served"], (
         "no vLLM content for this reply: regenerate fixtures/vllm_chat_content.json"
     )

@@ -15,8 +15,9 @@ an engine-based pair (``:666``) and the whole one otherwise. Its output is
 detokenized as vLLM's v1 detokenizer does (a ``DecodeStream`` primed with the
 prompt, the stop token excluded).
 
-The fixture maps a digest of each reply's inputs (``served_key``) to an index
-into its ``contents``. Where vLLM's pair leaves the reasoning in the content (a legacy or disabled
+The fixture maps a digest of each reply's inputs (``served_key``: the model, whether
+tools are offered, the reply's ids and the template kwargs) to an index into its
+``contents``. Where vLLM's pair leaves the reasoning in the content (a legacy or disabled
 reasoning parser) and renderers splits it off, the fixture keeps the content
 after vLLM's reasoning closer: the reasoning split is renderers' convention on
 every reply, not this parse's.
@@ -26,6 +27,7 @@ import json
 import os
 import re
 import sys
+from functools import cache
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -35,13 +37,20 @@ MESSAGES = [{"role": "user", "content": "Check the weather."}]
 _REASONING_CLOSE = re.compile(r"</think(?::opensource)?>")
 
 
+@cache
+def _tokenizer(model):
+    from renderers.base import load_tokenizer
+
+    return load_tokenizer(model)
+
+
 def replies(out_path):
     """Every reply the tests parse, with what serving it needs."""
     from parity import MODEL_CATALOG, TOOLS, kwarg_combinations
     from reference_continuations import SERVED_REPLIES, tool_reply_with_text_after
 
     from renderers import create_renderer
-    from renderers.base import MODEL_RENDERER_MAP, load_tokenizer
+    from renderers.base import MODEL_RENDERER_MAP
     from renderers.configs import config_from_name
 
     cases = []
@@ -58,7 +67,7 @@ def replies(out_path):
 
     out = []
     for reply_id, case, model, name, kwargs, how in cases:
-        tok = load_tokenizer(model)
+        tok = _tokenizer(model)
         renderer = create_renderer(
             tok, config_from_name(name), chat_template_kwargs=kwargs or None
         )
@@ -166,11 +175,10 @@ def serve(in_path):
     from reference_continuations import served_key
 
     from renderers import VLLM_CHAT_PARITY, VllmParsers
-    from renderers.base import load_tokenizer
 
     pairs, served = {}, {}
     for reply in json.loads(Path(in_path).read_text()):
-        tok = load_tokenizer(reply["model"])
+        tok = _tokenizer(reply["model"])
         pair = VllmParsers(*reply["pair"])
         pairs[reply["renderer"]] = reply["pair"]
         for label, tools in (("tools", TOOLS), ("no_tools", None)):
@@ -196,7 +204,7 @@ def serve(in_path):
                         f"{reply['id']}: no reasoning closer in {content!r}"
                     )
                 content = content[close.end() :]
-            key = served_key(tools, reply["ids"], prompt, ctk)
+            key = served_key(reply["model"], tools, reply["ids"], ctk)
             if served.setdefault(key, content) != content:
                 raise ValueError(f"{reply['id']}: one input, two contents")
         print(reply["id"], flush=True)

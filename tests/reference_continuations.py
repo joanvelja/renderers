@@ -207,8 +207,12 @@ def tool_reply_with_text_after(tok, renderer, case, kwargs, messages, tools, cal
     return sampled[:end] + after + [sampled[end]]
 
 
-def served_key(tools, completion_ids, prompt_ids, chat_template_kwargs):
-    """A digest of what vLLM serves a reply from: whether the request offers tools, the
-    reply's and the prompt's token ids, and the template kwargs it sends."""
-    inputs = [bool(tools), completion_ids, prompt_ids, chat_template_kwargs]
+def served_key(model, tools, completion_ids, chat_template_kwargs):
+    """A digest of what vLLM serves a reply from: the model (its tokenizer, the
+    renderer it maps to and the parser pair it is served with), whether the request
+    offers tools, the reply's token ids, and the template kwargs it sends. The prompt
+    is the renderer's for those, up to the current date some templates print (gpt-oss,
+    Muse Glimmer), which vLLM's parse doesn't read: a key over it would expire the
+    fixture daily."""
+    inputs = [model, bool(tools), completion_ids, chat_template_kwargs]
     return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:16]

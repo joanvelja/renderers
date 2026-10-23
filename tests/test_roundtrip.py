@@ -143,6 +143,18 @@ _SERVED = json.loads(
 _MESSAGES = [{"role": "user", "content": "Check the weather."}]
 
 
+def _in_renderers_convention(renderer_name: str, content: str) -> str:
+    """vLLM's ``content`` under renderers' whitespace convention for the format:
+    outer whitespace stripped, as every parse but these does; kept by Inkling's
+    and Muse Glimmer's; kept by DeepSeek V4's, whose whitespace-only content is
+    "" (``parse_deepseek_v4``)."""
+    if renderer_name in {"inkling", "muse-glimmer"}:
+        return content
+    if renderer_name == "deepseek-v4":
+        return content if content.strip() else ""
+    return content.strip()
+
+
 async def _served_without_tool_calls(renderer, model, sampled, kwargs, tools):
     """Parse sampled through generate(tool_calls=False) and check it
     against the content vLLM serves for it (vllm_chat_reference.py)."""
@@ -163,9 +175,10 @@ async def _served_without_tool_calls(renderer, model, sampled, kwargs, tools):
             tool_calls=False,
         )
     want = _SERVED["contents"][_SERVED["served"][key]]
-    # renderers strips a reply's outer whitespace on every parse, where vLLM
-    # keeps it; any other difference from vLLM's content is this parse's.
-    assert result["content"] in (want, want.strip())
+    # Exactly vLLM's content, up to the format's own whitespace convention on
+    # every reply; any other difference is this parse's.
+    name = MODEL_RENDERER_MAP[model]
+    assert result["content"] == _in_renderers_convention(name, want)
     assert result["tool_calls"] == []
     assert result["finish_reason"] == "stop"
     return result, want

@@ -1463,6 +1463,23 @@ def _load_tokenizer_via_auto(model_name_or_path: str, **kwargs) -> Any:
         return tok
 
 
+def _require_tokens(tok: Any, name_or_path: str) -> None:
+    """Refuse a tokenizer that encodes text to nothing. With only a checkpoint's
+    ``config.json`` in the HF cache, offline, or in a local copy, transformers
+    builds the config's tokenizer class with a one-entry vocabulary instead of
+    raising, so every text encodes to ``[]`` and every token name to id 0.
+    Refused as transformers refuses a missing tokenizer file, with an
+    ``OSError``; a real tokenizer encodes any text to at least one id."""
+    if not tok.encode("Hello, world.", add_special_tokens=False):
+        raise OSError(
+            f"{name_or_path!r} encodes text to no tokens ({type(tok).__name__} "
+            f"with {len(tok.get_vocab())} vocabulary entries): its tokenizer "
+            "files aren't fully cached, and offline transformers builds an empty "
+            "tokenizer from config.json alone. Download the tokenizer files, or "
+            "load it online"
+        )
+
+
 def load_tokenizer(model_name_or_path: str):
     """Load a tokenizer with the renderers-package security policy.
 
@@ -1483,12 +1500,16 @@ def load_tokenizer(model_name_or_path: str):
     ``unsloth`` mirrors instead, then restore ``tokenizer.name_or_path`` to
     the requested Meta ID so auto-resolution still selects ``Llama3Renderer``.
     Requires the ``renderers[transformers]`` extra.
+
+    A tokenizer that encodes text to no tokens, whose files aren't fully cached,
+    is refused with an ``OSError`` (``_require_tokens``).
     """
     try:
         _require_transformers("Loading a tokenizer")
         load_name_or_path = _tokenizer_source_for(model_name_or_path)
         kwargs = _tokenizer_load_kwargs(load_name_or_path)
         tok = _load_tokenizer_via_auto(load_name_or_path, **kwargs)
+        _require_tokens(tok, load_name_or_path)
         return _preserve_requested_tokenizer_name(
             tok,
             requested_name_or_path=model_name_or_path,

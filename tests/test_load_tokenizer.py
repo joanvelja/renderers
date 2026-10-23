@@ -8,9 +8,12 @@ repo doesn't auto-propagate.
 
 from __future__ import annotations
 
+import json
 import re
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from renderers import base
 from renderers.base import TOKENIZER_SOURCE_OVERRIDES, TRUSTED_REVISIONS, load_tokenizer
@@ -79,7 +82,9 @@ def test_meta_llama_loads_tokenizer_from_unsloth_mirror(mock_from_pretrained):
     canonical name for renderer auto-resolution."""
     canonical = "meta-llama/Llama-3.2-1B-Instruct"
     mirror = "unsloth/Llama-3.2-1B-Instruct"
-    mock_from_pretrained.return_value = SimpleNamespace(name_or_path=mirror)
+    mock_from_pretrained.return_value = SimpleNamespace(
+        name_or_path=mirror, encode=lambda text, add_special_tokens: [1]
+    )
 
     tok = load_tokenizer(canonical)
 
@@ -169,3 +174,35 @@ def test_load_tokenizer_real_kimi_uses_pinned_revision():
     assert tok is not None
     ids = tok.encode("hello", add_special_tokens=False)
     assert len(ids) > 0
+
+
+@pytest.mark.parametrize("where", ["hf-cache-offline", "local-dir"])
+def test_a_tokenizer_whose_files_are_not_cached_is_refused(
+    where, tmp_path, monkeypatch
+):
+    """With only a checkpoint's config.json in the HF cache, offline, or in a
+    local copy, transformers builds the config's tokenizer class with a
+    one-entry vocabulary that encodes every text to []: it is refused, naming
+    the model, as a missing tokenizer file is."""
+    import huggingface_hub.constants
+
+    config = json.dumps({"model_type": "qwen3"})
+    if where == "local-dir":
+        (tmp_path / "config.json").write_text(config)
+        name = str(tmp_path)
+    else:
+        name = "my-org/config-only"
+        repo = tmp_path / "models--my-org--config-only"
+        snapshot = repo / "snapshots" / ("0" * 40)
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").write_text(config)
+        (repo / "refs").mkdir()
+        (repo / "refs" / "main").write_text("0" * 40)
+        monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+        monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    with pytest.raises(
+        OSError,
+        match=rf"{re.escape(repr(name))} encodes text to no tokens .*: its "
+        "tokenizer files aren't fully cached",
+    ):
+        load_tokenizer(name)

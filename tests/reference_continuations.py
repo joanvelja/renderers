@@ -210,6 +210,23 @@ SERVED_REPLIES = {
         "meta-models/Muse-Glimmer-30B",
         " to=user<|message|>Hello\n<|eot|>",
     ),
+    # muse_glimmer: the whitespace before that LF stays content.
+    "muse-glimmer-trailing-whitespace": (
+        "meta-models/Muse-Glimmer-30B",
+        " to=user<|message|>Sunny in Tokyo.  \n\n<|eot|>",
+    ),
+    # inkling: a text segment's trailing whitespace stays content.
+    "inkling-trailing-whitespace": (
+        "thinkingmachines/Inkling",
+        "<|content_thinking|>Need weather.<|end_message|><|message_model|>"
+        "<|content_text|>Sunny in Tokyo.  \n<|content_model_end_sampling|>",
+    ),
+    # hermes + qwen3: vLLM keeps the content's trailing whitespace, which
+    # renderers strips.
+    "qwen3-trailing-whitespace": (
+        "Qwen/Qwen3-8B",
+        "<think>\nNeed weather.\n</think>\n\nSunny in Tokyo.  \n<|im_end|>",
+    ),
     # Harmony: commentary without a recipient is content, the tool message is
     # dropped. The reply follows the analysis header renderers' prompt prefills.
     "gpt-oss-preamble-call": (

@@ -168,52 +168,60 @@ class TextOnlyRendererConfig(BaseRendererConfig):
     name: Literal["text-only"] = "text-only"
 
 
-class TextOnlyRenderer:
+class DeclaredTextOnly:
     config_class = TextOnlyRendererConfig
     supports_tools = False
 
     def __init__(self, tokenizer, config):
         self.config = config
+
+
+class DerivedTextOnly(DeclaredTextOnly):
+    @property
+    def supports_tools(self):
+        return False
 """
 
 
 @pytest.mark.asyncio
-async def test_tools_on_a_renderer_that_parses_no_tool_calls_are_refused_before_it_is_built(
+async def test_tools_on_a_renderer_that_parses_no_tool_calls_are_refused_before_any_request(
     tmp_path,
 ):
-    """A renderer takes tools only if it parses tool calls (``supports_tools``):
-    not DefaultRenderer without a tool_parser, which auto falls back to for a
-    model the renderer map lacks, nor a custom renderer declaring none. Tools
-    for one are refused from its config, before it is built, and by generate on
-    the built one before any request, with one error naming it and the fix."""
+    """A renderer takes tools only if the built renderer parses tool calls
+    (``supports_tools``, a class attribute or a property): not DefaultRenderer
+    without a tool_parser, which auto falls back to for a model the renderer
+    map lacks, nor a custom renderer declaring none either way. generate
+    refuses tools for one before any request, with one error naming it and the
+    fix."""
     from replay import replay_client
 
     from renderers import (
-        AutoRendererConfig,
         CustomRendererConfig,
         DefaultRendererConfig,
         ToolsUnsupportedError,
         create_renderer,
     )
-    from renderers.base import require_tool_support_for
+    from renderers.base import require_tool_support
     from renderers.client import generate
     from renderers.configs import config_from_name
 
     (tmp_path / "text_only.py").write_text(_TEXT_ONLY_RENDERER)
-    text_only = f"{tmp_path / 'text_only.py'}:TextOnlyRenderer"
     tok = load_tokenizer("Qwen/Qwen3-0.6B")
     tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
-    fix = "configure a renderer that parses them"
-    for config, name in [
-        (DefaultRendererConfig(), "renderer 'default' without a tool_parser"),
-        (CustomRendererConfig(import_path=text_only), f"custom renderer {text_only!r}"),
-    ]:
-        with pytest.raises(ToolsUnsupportedError, match=f"^{name} parses no tool"):
-            require_tool_support_for(config, "Qwen/Qwen3-0.6B")
+    refused = [DefaultRendererConfig()] + [
+        CustomRendererConfig(import_path=f"{tmp_path / 'text_only.py'}:{name}")
+        for name in ["DeclaredTextOnly", "DerivedTextOnly"]
+    ]
+    for config in refused:
         renderer = create_renderer(tok, config)
         requests = []
         async with replay_client([], requests) as client:
-            with pytest.raises(ToolsUnsupportedError, match=fix) as refused:
+            with pytest.raises(
+                ToolsUnsupportedError,
+                match=f"^{type(renderer).__name__} parses no tool calls, so it "
+                r"can't take tools: configure a renderer that parses them \(a "
+                "model-specific one, or the default one with a tool_parser\\)$",
+            ):
                 await generate(
                     client=client,
                     renderer=renderer,
@@ -221,21 +229,12 @@ async def test_tools_on_a_renderer_that_parses_no_tool_calls_are_refused_before_
                     messages=[{"role": "user", "content": "hi"}],
                     tools=tools,
                 )
-        assert str(refused.value).startswith(f"{type(renderer).__name__} parses no")
         assert requests == []
-    for config in [None, AutoRendererConfig()]:
-        with pytest.raises(
-            ToolsUnsupportedError,
-            match="^the default renderer auto falls back to for 'my-org/unmapped' "
-            rf"\(not in MODEL_RENDERER_MAP\) parses no tool calls, .*{fix}",
-        ):
-            require_tool_support_for(config, "my-org/unmapped")
     for config in [
-        None,
         config_from_name("qwen3"),
         DefaultRendererConfig(tool_parser="qwen3"),
     ]:
-        require_tool_support_for(config, "Qwen/Qwen3-0.6B")
+        require_tool_support(create_renderer(tok, config))
 
 
 def test_a_checkpoint_is_served_its_own_pair_under_the_renderer_it_maps_to(

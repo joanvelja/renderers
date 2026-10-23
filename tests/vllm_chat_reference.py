@@ -13,8 +13,9 @@ Each reply goes through vLLM's own parser stack as ``chat_completion/serving.py`
 drives it, with the pair its model is served with (``vllm_parsers_for``) and
 ``tool_choice="none"``: with the tools, the whole reply (``:997-1047``); without
 tools, the streamed reply for an engine-based pair (``:666``) and the whole one
-otherwise. Its output is detokenized as vLLM's v1 detokenizer does (a
-``DecodeStream`` primed with the prompt, the stop token excluded). A Harmony
+otherwise. Its output is detokenized by vLLM's own v1 detokenizer
+(``IncrementalDetokenizer``, primed with the prompt, the stop token excluded),
+fast or slow as the tokenizer is. A Harmony
 (gpt-oss) reply is parsed from the channel header renderers' prompt prefills,
 where vLLM's prompt ends.
 
@@ -112,20 +113,32 @@ def replies(out_path):
     Path(out_path).write_text(json.dumps(out))
 
 
-def _detokenize(tok, prompt_ids, ids, skip_special_tokens):
-    import tokenizers
+def _detokenize(tok, request, prompt_ids, ids):
+    """The text of each of ``ids`` as vLLM's v1 detokenizer emits it for
+    ``request``: its own ``IncrementalDetokenizer``, primed with the prompt (a
+    ``DecodeStream`` for a fast tokenizer, ``detokenize_incrementally`` for a
+    slow one)."""
+    from vllm.v1.engine import EngineCoreRequest
+    from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 
-    backend = getattr(tok, "_tokenizer", None)
-    if isinstance(backend, tokenizers.Tokenizer):
-        stream = tokenizers.decoders.DecodeStream(
-            ids=list(prompt_ids), skip_special_tokens=skip_special_tokens
-        )
-        return [stream.step(backend, t) or "" for t in ids]
-    pieces, previous = [], ""
-    for i in range(len(ids)):
-        current = tok.decode(ids[: i + 1], skip_special_tokens=skip_special_tokens)
-        pieces.append(current[len(previous) :])
-        previous = current
+    detokenizer = IncrementalDetokenizer.from_new_request(
+        tok,
+        EngineCoreRequest(
+            request_id="fixture",
+            prompt_token_ids=list(prompt_ids),
+            mm_features=None,
+            sampling_params=request.to_sampling_params(len(ids) + 1, {}),
+            pooling_params=None,
+            arrival_time=0.0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+        ),
+    )
+    pieces = []
+    for t in ids:
+        detokenizer.update([t], stop_terminated=False)
+        pieces.append(detokenizer.get_next_output_text(finished=False, delta=True))
     return pieces
 
 
@@ -178,7 +191,7 @@ def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
         request = parser().adjust_request(request=request) or request
     stopped = bool(ids) and ids[-1] in stop_ids
     text_ids = ids[:-1] if stopped else ids
-    pieces = _detokenize(tok, prompt_ids, text_ids, request.skip_special_tokens)
+    pieces = _detokenize(tok, request, prompt_ids, text_ids)
     if not stream:
         whole = parser()
         whole.set_prompt_token_ids(list(prompt_ids))

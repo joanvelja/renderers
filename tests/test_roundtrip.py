@@ -18,6 +18,7 @@ from reference_continuations import (
     MESSAGES,
     REASONING,
     SERVED_REPLIES,
+    reasoning_left_in_content,
     reference_continuation,
     served_key,
     tool_reply_with_text_after,
@@ -143,7 +144,7 @@ _SERVED = json.loads(
 )
 
 
-def _in_renderers_convention(renderer_name: str, content: str) -> str:
+def _content_in_renderers_convention(renderer_name: str, content: str) -> str:
     """vLLM's ``content`` under renderers' whitespace convention for the format:
     outer whitespace stripped, as every parse but these does; kept by Inkling's
     and Muse Glimmer's; kept by DeepSeek V4's, whose whitespace-only content is
@@ -153,6 +154,21 @@ def _in_renderers_convention(renderer_name: str, content: str) -> str:
     if renderer_name == "deepseek-v4":
         return content if content.strip() else ""
     return content.strip()
+
+
+def _reasoning_in_renderers_convention(renderer_name: str, reasoning: str) -> str:
+    """vLLM's ``reasoning`` under renderers' whitespace convention for the
+    format: outer whitespace stripped, as every parse but these does; kept by
+    Inkling's, Muse Glimmer's, and Laguna XS-2.1's and S-2.1's; right-stripped by
+    GLM's and DeepSeek V4's; outer newlines stripped by Laguna XS.2's and M.1's
+    (``parse_laguna_xs2``)."""
+    if renderer_name in {"inkling", "muse-glimmer", "laguna-xs-2.1", "laguna-s-2.1"}:
+        return reasoning
+    if renderer_name == "deepseek-v4" or renderer_name.startswith("glm-"):
+        return reasoning.rstrip()
+    if renderer_name in {"laguna-xs.2", "laguna-m.1"}:
+        return reasoning.strip("\n")
+    return reasoning.strip()
 
 
 async def _served_without_tool_calls(renderer, model, sampled, kwargs, tools):
@@ -174,14 +190,22 @@ async def _served_without_tool_calls(renderer, model, sampled, kwargs, tools):
             max_prompt_len=100000,
             tool_calls=False,
         )
-    want = _SERVED["contents"][_SERVED["served"][key]]
-    # Exactly vLLM's content, up to the format's own whitespace convention on
-    # every reply; any other difference is this parse's.
+    served = _SERVED["messages"][_SERVED["served"][key]]
+    # Exactly vLLM's content and reasoning, up to the format's own whitespace
+    # convention on every reply; any other difference is this parse's. Where
+    # vLLM's pair leaves the reasoning in its content (a listed gap), the fixture
+    # holds the content after its closer, and the split is renderers' own.
     name = MODEL_RENDERER_MAP[model]
-    assert result["content"] == _in_renderers_convention(name, want)
+    assert result["content"] == _content_in_renderers_convention(
+        name, served["content"]
+    )
+    if served["reasoning"] is not None or not reasoning_left_in_content(model, ctk):
+        assert (result["reasoning_content"] or "") == (
+            _reasoning_in_renderers_convention(name, served["reasoning"] or "")
+        )
     assert result["tool_calls"] == []
     assert result["finish_reason"] == "stop"
-    return result, want
+    return result, served["content"]
 
 
 # Every reference tool-call reply, and one per checkpoint with text beside its
@@ -206,7 +230,7 @@ async def test_reference_tool_calls_parsed_without_tool_calls(
     tool_choice="none" with the pair the checkpoint is served with
     (``vllm_parsers_for``): with the tools, the whole reply; without tools, the
     streamed one (they differ only for an engine-based pair). No calls, finish
-    "stop", and the reasoning split of the tool-call parse."""
+    "stop", and the reasoning: vLLM's, and the reference's."""
     tok = _tokenizer(case.model)
     renderer = create_renderer(
         tok,

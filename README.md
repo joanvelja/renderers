@@ -94,12 +94,14 @@ without tools, its streamed reply for an engine-based pair, else its one reply
 whose whole reply this is). No tool calls, the reasoning split unchanged, and the
 tool-call markup kept in the content (a legacy tool parser) or dropped from it
 (an engine-based pair, or Harmony), as `VllmParsers.drops_tool_markup` derives.
-`tests/fixtures/vllm_chat_content.json` pins the content vLLM serves for each
-reference reply (`tests/vllm_chat_reference.py` regenerates it); where vLLM's
-pair leaves the reasoning in the content and renderers splits it off (Hy3,
-MiniMax M2, Laguna-S-2.1, Qwen3.5-0.8B/2B with thinking on), it pins the content
-after vLLM's reasoning closer. A renderer that parses tool calls but pins no
-pair (`DefaultRenderer` with a `tool_parser`) refuses the parse.
+`tests/fixtures/vllm_chat_content.json` pins the content and reasoning vLLM
+serves for each reference reply (`tests/vllm_chat_reference.py` regenerates
+it); where vLLM's pair leaves the reasoning in the content and renderers splits
+it off (Hy3 under `reasoning_effort` `no_think`, MiniMax-M2.5, Laguna-S-2.1
+unless the request turns thinking on, Qwen3.5-0.8B/2B with thinking on), it pins
+the content after vLLM's reasoning closer, and the regeneration refuses any
+other checkpoint doing so. A renderer that parses tool calls but pins no pair
+(`DefaultRenderer` with a `tool_parser`) refuses the parse.
 
 Summary consumers should require normal termination (`finish_reason="stop"`),
 nonempty final content, and no tool calls. A length-limited final answer remains

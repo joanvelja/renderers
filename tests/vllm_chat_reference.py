@@ -1,5 +1,6 @@
-"""Regenerate ``fixtures/vllm_chat_content.json``: the content vLLM's chat path
-serves for each reply ``test_roundtrip.py`` parses without tool calls.
+"""Regenerate ``fixtures/vllm_chat_content.json``: the content and reasoning
+vLLM's chat path serves for each reply ``test_roundtrip.py`` parses without tool
+calls.
 
 Two steps, from the repo root. The replies come from this project's environment,
 so they are the ones the tests build:
@@ -19,11 +20,12 @@ where vLLM's prompt ends.
 
 The fixture maps a digest of each reply's inputs (``served_key``: the model,
 whether tools are offered, the reply's ids and the template kwargs) to an index
-into its ``contents``, and records each model's pair. Where vLLM's pair leaves
-the reasoning in the content (a legacy or disabled reasoning parser) and
-renderers splits it off, the fixture keeps the content after vLLM's reasoning
-closer: the reasoning split is renderers' convention on every reply, not this
-parse's.
+into its ``messages``, vLLM's content and reasoning, and records each model's
+pair. Where vLLM's pair leaves the reasoning in the content and renderers splits
+it off, a gap listed per checkpoint (``reasoning_left_in_content``), the fixture
+keeps the content after vLLM's reasoning closer: there the split is renderers'
+convention, not this parse's. Anywhere else the pair is wrong, and the
+regeneration refuses it.
 """
 
 import json
@@ -201,23 +203,22 @@ def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
 
 def serve(in_path):
     from parity import TOOLS
-    from reference_continuations import served_key
+    from reference_continuations import reasoning_left_in_content, served_key
 
     from renderers import VLLM_CHAT_PARITY, VllmParsers
 
     pairs, served = {}, {}
     for reply in json.loads(Path(in_path).read_text()):
-        tok = _tokenizer(reply["model"])
+        model, ctk = reply["model"], reply["chat_template_kwargs"]
+        tok = _tokenizer(model)
         pair = VllmParsers(*reply["pair"])
-        pairs[reply["model"]] = reply["pair"]
+        pairs[model] = reply["pair"]
         for label, tools in (("tools", TOOLS), ("no_tools", None)):
-            prompt = reply[label]["prompt"]
-            ctk = reply["chat_template_kwargs"]
             reasoning, content = _serve(
                 tok,
-                reply["model"],
+                model,
                 pair,
-                prompt,
+                reply[label]["prompt"],
                 reply["ids"],
                 set(reply["stops"]),
                 tools=tools,
@@ -227,22 +228,29 @@ def serve(in_path):
             content = content or ""
             split = reply[label]["reasoning"]
             if reasoning is None and split and split.strip() in content:
+                if not reasoning_left_in_content(model, ctk):
+                    raise ValueError(
+                        f"{reply['id']}: vLLM's pair {pair} leaves the reasoning "
+                        f"in the content for {model}: fix the pair or list the "
+                        "gap (reasoning_left_in_content)"
+                    )
                 close = _REASONING_CLOSE.search(content)
                 if close is None:
                     raise ValueError(
                         f"{reply['id']}: no reasoning closer in {content!r}"
                     )
                 content = content[close.end() :]
-            key = served_key(reply["model"], tools, reply["ids"], ctk)
-            if served.setdefault(key, content) != content:
-                raise ValueError(f"{reply['id']}: one input, two contents")
+            key = served_key(model, tools, reply["ids"], ctk)
+            if served.setdefault(key, (content, reasoning)) != (content, reasoning):
+                raise ValueError(f"{reply['id']}: one input, two replies")
         print(reply["id"], flush=True)
-    contents = sorted(set(served.values()))
+    messages = sorted(set(served.values()), key=json.dumps)
+    index = {message: i for i, message in enumerate(messages)}
     fixture = {
         "vllm": VLLM_CHAT_PARITY,
         "pairs": pairs,
-        "contents": contents,
-        "served": {key: contents.index(content) for key, content in served.items()},
+        "messages": [{"content": c, "reasoning": r} for c, r in messages],
+        "served": {key: index[message] for key, message in served.items()},
     }
     FIXTURE.write_text(json.dumps(fixture, indent=0, sort_keys=True) + "\n")
 

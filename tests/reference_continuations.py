@@ -258,6 +258,29 @@ def tool_reply_with_text_after(
     return sampled[:end] + after + [sampled[end]]
 
 
+def reasoning_left_in_content(model, chat_template_kwargs):
+    """Whether the pair ``model`` is served with leaves a reply's reasoning in
+    vLLM's content, where renderers splits it off, for a request sending
+    ``chat_template_kwargs``: the README's listed gaps, by checkpoint. There the
+    fixture pins the content after vLLM's reasoning closer and the split is
+    renderers' own; anywhere else reasoning left in the content is the pair's."""
+    kwargs = chat_template_kwargs
+    if model == "tencent/Hy3":
+        # hy_v3 doesn't split under reasoning_effort "no_think", its default
+        # (vllm/reasoning/hy_v3_reasoning_parser.py:40-50).
+        return kwargs.get("reasoning_effort", "no_think") == "no_think"
+    if model == "poolside/Laguna-S-2.1":
+        # poolside_v1 splits only when the request turns thinking on
+        # (deepseek_v3_reasoning_parser.py:28-37); the template thinks unasked.
+        return not (kwargs.get("thinking") or kwargs.get("enable_thinking"))
+    if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"}:
+        # Served without a reasoning parser (MODEL_VLLM_PARSERS).
+        return kwargs.get("enable_thinking") is True
+    # minimax_m2_append_think serves the whole reply as content, behind a
+    # "<think>" (minimax_m2_reasoning_parser.py:58-61).
+    return model == "MiniMaxAI/MiniMax-M2.5"
+
+
 def served_key(model, tools, completion_ids, chat_template_kwargs):
     """The fixture's key for a reply: a digest of the model, whether the request
     offers tools, the reply's token ids and the template kwargs it sends. It

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from renderers.base import (
+    VllmParsers,
     Message,
     ParsedResponse,
     RenderedTokens,
@@ -36,6 +37,7 @@ from renderers.base import (
     resolve_thinking_retention,
     should_rerender_for_thinking_retention,
     trim_to_turn_close,
+    without_tool_calls,
 )
 from renderers.configs import DeepSeekV4RendererConfig
 from renderers.parsing import parse_deepseek_v4
@@ -291,6 +293,8 @@ def _prepare_messages(messages: list[Message]) -> list[_LogicalMessage]:
 
 class DeepSeekV4Renderer:
     """Renderer for ``deepseek-ai/DeepSeek-V4-Flash-0731``."""
+
+    vllm_parsers = VllmParsers("deepseek_v4", "deepseek_v4")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -791,8 +795,9 @@ class DeepSeekV4Renderer:
         *,
         tools: list[ToolSpec] | None = None,  # noqa: ARG002
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
-        return parse_deepseek_v4(
+        parsed = parse_deepseek_v4(
             self._tokenizer,
             token_ids,
             stop_ids={self._eos},
@@ -809,6 +814,7 @@ class DeepSeekV4Renderer:
             think_end_id=self._think_end,
             think_start_id=self._think_start,
         )
+        return parsed if tool_calls else without_tool_calls(parsed)
 
     def get_stop_token_ids(self) -> list[int]:
         return [self._eos]

@@ -23,6 +23,7 @@ import json
 from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
+    VllmParsers,
     Message,
     ParsedResponse,
     RenderedTokens,
@@ -58,6 +59,8 @@ _TOOLS_FOOTER = (
 
 class Qwen3Renderer:
     """Deterministic message → token renderer for Qwen3 models."""
+
+    vllm_parsers = VllmParsers("hermes", "qwen3")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -312,10 +315,12 @@ class Qwen3Renderer:
         *,
         tools: list[ToolSpec] | None = None,  # noqa: ARG002 — hermes wire format quotes strings, schema not needed
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         return parse_qwen3(
             self._tokenizer,
             token_ids,
+            scan_tool_calls=tool_calls,
             stop_ids={self._im_end, self._endoftext},
             tool_call_id=self._tool_call,
             tool_call_end_id=self._tool_call_end,

@@ -42,6 +42,7 @@ import numpy as np
 from renderers.reasoning import prompt_ends_in_reasoning
 
 from renderers.base import (
+    VllmParsers,
     Content,
     Message,
     MultiModalData,
@@ -57,6 +58,7 @@ from renderers.base import (
     resolve_thinking_retention,
     should_rerender_for_thinking_retention,
     trim_to_turn_close,
+    without_tool_calls,
 )
 from renderers.configs import INKLING_EFFORT_MAP, InklingRendererConfig
 from renderers.parsing import parse_inkling
@@ -172,6 +174,8 @@ class InklingRenderer:
     the native ``InklingProcessor`` (placeholder expansion included). Satisfies
     the :class:`~renderers.base.MultimodalRenderer` protocol.
     """
+
+    vllm_parsers = VllmParsers("inkling", "inkling")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -522,10 +526,13 @@ class InklingRenderer:
         self,
         token_ids: list[int],
         *,
-        tools: list[ToolSpec] | None = None,  # noqa: ARG002 — args are native JSON, no schema coercion
+        tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
-        return parse_inkling(
+        # Tool args are native JSON, so ``tools`` only tells a request without
+        # tools apart: vLLM serves its streamed reply there.
+        parsed = parse_inkling(
             self._tokenizer,
             token_ids,
             stop_ids=set(self.get_stop_token_ids()),
@@ -547,7 +554,9 @@ class InklingRenderer:
                 },
                 initial_only=False,
             ),
+            streamed_without_tools=not tool_calls and not tools,
         )
+        return parsed if tool_calls else without_tool_calls(parsed)
 
     def get_stop_token_ids(self) -> list[int]:
         stop = [self._content_model_end_sampling]

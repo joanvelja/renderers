@@ -53,6 +53,7 @@ import json
 from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
+    VllmParsers,
     Content,
     Message,
     ParsedResponse,
@@ -120,6 +121,8 @@ _TOOLS_HEADER_XS21 = (
 
 
 class LagunaXS2Renderer:
+    vllm_parsers = VllmParsers("poolside_v1", "poolside_v1")
+
     @property
     def is_prefix_stable(self) -> bool:
         """Whether full renders preserve completed conversation prefixes."""
@@ -360,10 +363,12 @@ class LagunaXS2Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         return parse_laguna_xs2(
             self._tokenizer,
             token_ids,
+            scan_tool_calls=tool_calls,
             stop_ids={self._assistant_end, self._eos},
             think_id=self._think,
             think_end_id=self._think_end,
@@ -923,12 +928,14 @@ class LagunaXS21Renderer(LagunaXS2Renderer):
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         # The XS-2.1 template renders reasoning and content verbatim (no
         # newline wrapping), so the parse is verbatim too.
         return parse_laguna_xs2(
             self._tokenizer,
             token_ids,
+            scan_tool_calls=tool_calls,
             stop_ids={self._assistant_end, self._eos},
             think_id=self._think,
             think_end_id=self._think_end,

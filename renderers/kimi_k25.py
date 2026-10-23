@@ -28,6 +28,7 @@ from typing import Any
 from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
+    VllmParsers,
     Message,
     MultiModalData,
     ParsedResponse,
@@ -44,6 +45,7 @@ from renderers.base import (
     resolve_thinking_retention,
     should_rerender_for_thinking_retention,
     trim_to_turn_close,
+    without_tool_calls,
 )
 from renderers.configs import KimiK25RendererConfig
 from renderers.parsing import (
@@ -593,6 +595,8 @@ class KimiK25Renderer:
     The tokenizer should be ``moonshotai/Kimi-K2-Instruct`` (same as K2).
     """
 
+    vllm_parsers = VllmParsers("kimi_k2", "kimi_k2")
+
     @property
     def is_prefix_stable(self) -> bool:
         """Whether full renders preserve completed conversation prefixes."""
@@ -993,12 +997,13 @@ class KimiK25Renderer:
         *,
         tools: list[ToolSpec] | None = None,  # noqa: ARG002 — section-JSON wire format quotes strings, schema not needed
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         stop_ids: set[int] = {self._im_end}
         if self._endoftext is not None:
             stop_ids.add(self._endoftext)
 
-        return _parse_kimi_k2_response(
+        parsed = _parse_kimi_k2_response(
             self._tokenizer,
             token_ids,
             stop_ids=stop_ids,
@@ -1014,6 +1019,7 @@ class KimiK25Renderer:
             tool_call_argument_begin_id=self._tool_call_argument_begin,
             tool_call_end_id=self._tool_call_end,
         )
+        return parsed if tool_calls else without_tool_calls(parsed)
 
     def get_stop_token_ids(self) -> list[int]:
         stop = [self._im_end]

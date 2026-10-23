@@ -19,6 +19,7 @@ import json
 from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
+    VllmParsers,
     Message,
     ParsedResponse,
     RenderedTokens,
@@ -30,6 +31,7 @@ from renderers.base import (
     resolve_thinking_retention,
     should_rerender_for_thinking_retention,
     trim_to_turn_close,
+    without_tool_calls,
 )
 from renderers.configs import KimiK2RendererConfig
 from renderers.parsing import parse_kimi_k2
@@ -46,6 +48,8 @@ class KimiK2Renderer:
     stored for protocol uniformity with the rest of the renderer family
     but have no effect on the byte-level output.
     """
+
+    vllm_parsers = VllmParsers("kimi_k2", "kimi_k2")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -341,8 +345,9 @@ class KimiK2Renderer:
         *,
         tools: list[ToolSpec] | None = None,  # noqa: ARG002 — section-JSON wire format quotes strings, schema not needed
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
-        return parse_kimi_k2(
+        parsed = parse_kimi_k2(
             self._tokenizer,
             token_ids,
             stop_ids={self._im_end},
@@ -358,6 +363,7 @@ class KimiK2Renderer:
                 assistant_prefix="<|im_assistant|>assistant<|im_middle|>",
             ),
         )
+        return parsed if tool_calls else without_tool_calls(parsed)
 
     def get_stop_token_ids(self) -> list[int]:
         return [self._im_end]

@@ -35,6 +35,7 @@ from datetime import datetime
 from typing import Any
 
 from renderers.base import (
+    VllmParsers,
     Message,
     MultiModalData,
     ParsedResponse,
@@ -112,6 +113,25 @@ _STRIP_OPEN_REASONING_RE = re.compile(
     r"(?=to=[^\s<]+<\|message\|>|$)",
     re.DOTALL,
 )
+# vLLM's first ``to=user`` body; ``$`` stops before one final LF.
+_CONTENT_RE = re.compile(
+    r"to=user<\|message\|>(.*?)(?=<\|eot\|>|<\|eom\|>|$)", re.DOTALL
+)
+
+
+def _vllm_content(output: str) -> str:
+    """The content vLLM's muse_glimmer reasoning parser
+    (``MuseGlimmerReasoningParser.extract_reasoning`` at ``VLLM_CHAT_PARITY``)
+    reads off a decoded completion: the text outside reasoning spans when it
+    carries ATEM markup, else the first ``to=user`` body, else nothing after a
+    ``to=self`` header, else the whole output."""
+    remainder = _STRIP_REASONING_RE.sub("", output)
+    remainder = _STRIP_OPEN_REASONING_RE.sub("", remainder)
+    if "<atem:invoke" in remainder or "<atem:function_calls>" in remainder:
+        return remainder
+    if match := _CONTENT_RE.search(output):
+        return match.group(1)
+    return "" if "to=self<|message|>" in output else output
 
 
 def _json(value: Any) -> str:
@@ -249,6 +269,7 @@ class _TokenStream:
 class MuseGlimmerRenderer:
     """Deterministic message → token renderer for Muse Glimmer (ATEM)."""
 
+    vllm_parsers = VllmParsers("muse_glimmer", "muse_glimmer")
     _config_cls = MuseGlimmerRendererConfig
     supports_process_multimodal = True
 
@@ -639,6 +660,7 @@ class MuseGlimmerRenderer:
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         stops = set(self.get_stop_token_ids())
         ids = list(token_ids)
@@ -731,6 +753,15 @@ class MuseGlimmerRenderer:
         reasoning = (
             "\n".join(p for p in reasoning_parts if p) if reasoning_parts else None
         )
+        if not tool_calls:
+            # vLLM's chat path serves the reasoning parser's content under
+            # tool_choice="none" (the muse_glimmer tool parser is legacy), read
+            # off the decoded completion with its framing.
+            return ParsedResponse(
+                content=_vllm_content(self._decode(ids)),
+                reasoning_content=reasoning,
+                reasoning_complete=reasoning_complete,
+            )
         registered = {_function(tool)["name"] for tool in tools or []}
         calls = [
             c

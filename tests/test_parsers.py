@@ -164,7 +164,9 @@ def test_a_checkpoint_is_served_its_own_pair_under_the_renderer_it_maps_to(
     """Kimi-K2-Instruct answers without thinking, so it is served without a
     reasoning parser, through auto or its own renderer; any other model or
     renderer gets the renderer's pair. An entry may change only the reasoning
-    parser: the renderer's parse follows the tool parser's markup rule."""
+    parser: the renderer's parse follows the tool parser's markup rule, so an
+    entry changing the tool parser, or the markup rule with a legacy reasoning
+    parser, is refused."""
     from renderers import VllmParsers
     from renderers.base import MODEL_VLLM_PARSERS, vllm_parsers_for
     from renderers.configs import config_from_name
@@ -176,9 +178,39 @@ def test_a_checkpoint_is_served_its_own_pair_under_the_renderer_it_maps_to(
     thinking = VllmParsers("kimi_k2", "kimi_k2")
     assert vllm_parsers_for(config_from_name("kimi-k2"), "m/kimi-ft") == thinking
     assert vllm_parsers_for(config_from_name("kimi-k2.5"), model) == thinking
-    monkeypatch.setitem(MODEL_VLLM_PARSERS, model, VllmParsers("hermes", None))
-    with pytest.raises(ValueError, match="only the reasoning parser"):
-        vllm_parsers_for(None, model)
+    for entry in [VllmParsers("hermes", None), VllmParsers("kimi_k2", "deepseek_r1")]:
+        monkeypatch.setitem(MODEL_VLLM_PARSERS, model, entry)
+        with pytest.raises(ValueError, match="only the reasoning parser"):
+            vllm_parsers_for(None, model)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "Qwen/Qwen3-4B-Instruct-2507",
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "Qwen/Qwen3-VL-4B-Instruct",
+        "Qwen/Qwen3-VL-8B-Instruct",
+        "Qwen/Qwen3-VL-30B-A3B-Instruct",
+        "moonshotai/Kimi-K2-Instruct",
+        "Qwen/Qwen3.5-0.8B",
+        "Qwen/Qwen3.5-2B",
+    ],
+)
+def test_a_checkpoint_that_answers_without_thinking_is_served_without_a_reasoning_parser(
+    model,
+):
+    """Its default reply opens no think block, which vLLM's qwen3 and kimi_k2
+    reasoning parsers would serve as reasoning: through auto and through the
+    renderer it maps to, it is served with its format's tool parser alone."""
+    from renderers import VllmParsers
+    from renderers.base import MODEL_RENDERER_MAP, vllm_parsers_for
+    from renderers.configs import config_from_name
+
+    config = config_from_name(MODEL_RENDERER_MAP[model])
+    tool = vllm_parsers_for(config, "m/fine-tune").tool
+    assert vllm_parsers_for(None, model) == VllmParsers(tool, None)
+    assert vllm_parsers_for(config, model) == VllmParsers(tool, None)
 
 
 def test_default_renderer_without_parsers_is_backward_compatible():

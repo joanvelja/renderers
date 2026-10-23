@@ -1660,7 +1660,15 @@ def vllm_parsers_for(
     _populate_registry()
     pair = getattr(RENDERER_REGISTRY[name], "vllm_parsers", None)
     served = MODEL_VLLM_PARSERS.get(model_name)
-    if served is None or MODEL_RENDERER_MAP[model_name] != name:
+    if served is None:
+        return pair
+    if model_name not in MODEL_RENDERER_MAP:
+        raise ValueError(
+            f"MODEL_VLLM_PARSERS[{model_name!r}] = {served} names a checkpoint "
+            "MODEL_RENDERER_MAP doesn't map: map it to its renderer, or drop the "
+            "entry"
+        )
+    if MODEL_RENDERER_MAP[model_name] != name:
         return pair
     if pair is None or (served.tool, served.drops_tool_markup) != (
         pair.tool,

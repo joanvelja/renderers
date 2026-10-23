@@ -184,6 +184,28 @@ def test_a_checkpoint_is_served_its_own_pair_under_the_renderer_it_maps_to(
             vllm_parsers_for(None, model)
 
 
+def test_an_entry_for_a_checkpoint_the_renderer_map_lacks_is_refused_by_name(
+    monkeypatch,
+):
+    """An entry's pair holds only under the renderer its checkpoint maps to, so
+    an entry for a checkpoint ``MODEL_RENDERER_MAP`` lacks is a broken table,
+    refused naming the entry and the fix, through auto or a named renderer."""
+    from renderers import VllmParsers
+    from renderers.base import MODEL_VLLM_PARSERS, vllm_parsers_for
+    from renderers.configs import config_from_name
+
+    model = "my-org/unmapped-ckpt"
+    monkeypatch.setitem(MODEL_VLLM_PARSERS, model, VllmParsers("hermes", None))
+    for config in [None, config_from_name("qwen3")]:
+        with pytest.raises(
+            ValueError,
+            match=r"MODEL_VLLM_PARSERS\['my-org/unmapped-ckpt'\] .* "
+            r"MODEL_RENDERER_MAP doesn't map: map it to its renderer, or drop "
+            "the entry",
+        ):
+            vllm_parsers_for(config, model)
+
+
 @pytest.mark.parametrize(
     "model",
     [

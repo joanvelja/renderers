@@ -53,7 +53,15 @@ def test_trusted_revisions_are_full_shas():
 # ---------------------------------------------------------------------------
 
 
-@patch("transformers.AutoTokenizer.from_pretrained")
+def _from_pretrained(name, **kwargs):
+    """A patched ``AutoTokenizer.from_pretrained``: a tokenizer that encodes
+    text to a known token, as ``load_tokenizer`` requires."""
+    return SimpleNamespace(
+        name_or_path=name, encode=lambda text, add_special_tokens: [1], unk_token_id=0
+    )
+
+
+@patch("transformers.AutoTokenizer.from_pretrained", side_effect=_from_pretrained)
 def test_unlisted_model_loads_without_remote_code(mock_from_pretrained):
     """Default path: trust_remote_code=False, no revision pin."""
     load_tokenizer("Qwen/Qwen3-0.6B")
@@ -62,7 +70,7 @@ def test_unlisted_model_loads_without_remote_code(mock_from_pretrained):
     assert kwargs == {"trust_remote_code": False}
 
 
-@patch("transformers.AutoTokenizer.from_pretrained")
+@patch("transformers.AutoTokenizer.from_pretrained", side_effect=_from_pretrained)
 def test_kimi_loads_with_pinned_revision(mock_from_pretrained):
     """Kimi-K2 family: trust_remote_code=True, revision pinned to the
     sha listed in TRUSTED_REVISIONS — never a branch name."""
@@ -75,16 +83,13 @@ def test_kimi_loads_with_pinned_revision(mock_from_pretrained):
     }
 
 
-@patch("transformers.AutoTokenizer.from_pretrained")
+@patch("transformers.AutoTokenizer.from_pretrained", side_effect=_from_pretrained)
 def test_meta_llama_loads_tokenizer_from_unsloth_mirror(mock_from_pretrained):
     """Canonical Meta Llama repos are gated; load their tokenizer/chat
     template from the audited unrestricted mirror while preserving the
     canonical name for renderer auto-resolution."""
     canonical = "meta-llama/Llama-3.2-1B-Instruct"
     mirror = "unsloth/Llama-3.2-1B-Instruct"
-    mock_from_pretrained.return_value = SimpleNamespace(
-        name_or_path=mirror, encode=lambda text, add_special_tokens: [1]
-    )
 
     tok = load_tokenizer(canonical)
 
@@ -94,7 +99,7 @@ def test_meta_llama_loads_tokenizer_from_unsloth_mirror(mock_from_pretrained):
     assert tok.name_or_path == canonical
 
 
-@patch("transformers.AutoTokenizer.from_pretrained")
+@patch("transformers.AutoTokenizer.from_pretrained", side_effect=_from_pretrained)
 def test_unknown_path_falls_through_to_no_remote_code(mock_from_pretrained):
     """Unknown / fine-tuned model paths — including ``moonshotai/Kimi-K2*``
     look-alikes that aren't in the allow-list — must fall through to
@@ -176,33 +181,50 @@ def test_load_tokenizer_real_kimi_uses_pinned_revision():
     assert len(ids) > 0
 
 
+# A checkpoint's files without its tokenizer files, from which transformers
+# builds a tokenizer instead of raising.
+_PARTIAL_CHECKPOINTS = {
+    # An empty Qwen2Tokenizer: every text encodes to [].
+    "config-only": {"config.json": {"model_type": "qwen3"}},
+    # A GemmaTokenizer of the named special tokens: every text encodes to <unk>.
+    "config-and-tokenizer-config": {
+        "config.json": {"model_type": "gemma4"},
+        "tokenizer_config.json": {
+            "tokenizer_class": "GemmaTokenizer",
+            "unk_token": "<unk>",
+        },
+    },
+}
+
+
+@pytest.mark.parametrize("files", sorted(_PARTIAL_CHECKPOINTS))
 @pytest.mark.parametrize("where", ["hf-cache-offline", "local-dir"])
 def test_a_tokenizer_whose_files_are_not_cached_is_refused(
-    where, tmp_path, monkeypatch
+    where, files, tmp_path, monkeypatch
 ):
-    """With only a checkpoint's config.json in the HF cache, offline, or in a
-    local copy, transformers builds the config's tokenizer class with a
-    one-entry vocabulary that encodes every text to []: it is refused, naming
-    the model, as a missing tokenizer file is."""
+    """With a checkpoint's config.json, and maybe its tokenizer_config.json,
+    but not its tokenizer files in the HF cache, offline, or in a local copy,
+    transformers builds the config's tokenizer class from what it has: it
+    encodes every text to [] or to its unknown token. It is refused, naming the
+    model, as a missing tokenizer file is."""
     import huggingface_hub.constants
 
-    config = json.dumps({"model_type": "qwen3"})
     if where == "local-dir":
-        (tmp_path / "config.json").write_text(config)
-        name = str(tmp_path)
+        directory, name = tmp_path, str(tmp_path)
     else:
-        name = "my-org/config-only"
-        repo = tmp_path / "models--my-org--config-only"
-        snapshot = repo / "snapshots" / ("0" * 40)
-        snapshot.mkdir(parents=True)
-        (snapshot / "config.json").write_text(config)
+        name = "my-org/partial"
+        repo = tmp_path / "models--my-org--partial"
+        directory = repo / "snapshots" / ("0" * 40)
+        directory.mkdir(parents=True)
         (repo / "refs").mkdir()
         (repo / "refs" / "main").write_text("0" * 40)
         monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
         monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    for file, content in _PARTIAL_CHECKPOINTS[files].items():
+        (directory / file).write_text(json.dumps(content))
     with pytest.raises(
         OSError,
-        match=rf"{re.escape(repr(name))} encodes text to no tokens .*: its "
+        match=rf"{re.escape(repr(name))} encodes text to no known token .*: its "
         "tokenizer files aren't fully cached",
     ):
         load_tokenizer(name)

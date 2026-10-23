@@ -915,7 +915,8 @@ class Renderer(Protocol):
 
         ``tool_calls=False`` parses the reply as vLLM's chat path serves it
         under ``tool_choice="none"`` with tools (the whole reply) and without
-        tools (the streamed reply): no tool calls, the reasoning split
+        tools (the streamed reply for an engine-based pair, else the one reply;
+        Muse Glimmer: the whole one): no tool calls, the reasoning split
         unchanged, and the tool-call markup kept in the content or dropped from
         it as ``vllm_parsers`` derives (``VllmParsers.drops_tool_markup``).
         """

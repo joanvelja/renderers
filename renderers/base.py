@@ -745,6 +745,28 @@ def _unpinned(name: str) -> ValueError:
     )
 
 
+class ToolsUnsupportedError(ValueError):
+    """Tools offered to a renderer that parses no tool calls (its
+    ``supports_tools`` is False), refused before anything is rendered or
+    sampled: ``require_tool_support`` for a built renderer, as ``generate``
+    refuses them, and ``require_tool_support_for`` from its config."""
+
+
+def _takes_no_tools(name: str) -> ToolsUnsupportedError:
+    return ToolsUnsupportedError(
+        f"{name} parses no tool calls, so it can't take tools: configure a "
+        "renderer that parses them (a model-specific one, or the default one "
+        "with a tool_parser)"
+    )
+
+
+def require_tool_support(renderer: "Renderer") -> None:
+    """Refuse tools for a renderer that parses no tool calls (``supports_tools``
+    False; a renderer that doesn't declare it parses them)."""
+    if not getattr(renderer, "supports_tools", True):
+        raise _takes_no_tools(type(renderer).__name__)
+
+
 def require_vllm_parsers(renderer: "Renderer") -> None:
     """Refuse ``tool_calls=False`` for a renderer that parses tool calls but
     declares no vLLM pair (``DefaultRenderer`` with a ``tool_parser``)."""
@@ -1717,6 +1739,46 @@ def require_vllm_parsers_for(config: "RendererConfig | None", model_name: str) -
     ):
         return  # DefaultRenderer without a tool parser: nothing is a call
     raise _unpinned(f"renderer {config.name!r}")
+
+
+def require_tool_support_for(config: "RendererConfig | None", model_name: str) -> None:
+    """``require_tool_support`` for the renderer ``config`` builds for
+    ``model_name``, before it is built, read without a tokenizer: auto resolves
+    through ``MODEL_RENDERER_MAP`` and falls back to ``DefaultRenderer`` for a
+    model the map lacks; ``DefaultRenderer`` parses tool calls only with a
+    ``tool_parser``; any other renderer as its class declares
+    ``supports_tools``, which a custom renderer sets as a class attribute."""
+    from renderers.configs import (
+        AutoRendererConfig,
+        CustomRendererConfig,
+        DefaultRendererConfig,
+        config_from_name,
+    )
+    from renderers.custom import load_custom_renderer
+
+    if isinstance(config, CustomRendererConfig):
+        renderer_cls = load_custom_renderer(config.import_path)
+        name = f"custom renderer {config.import_path!r}"
+    else:
+        if config is None or isinstance(config, AutoRendererConfig):
+            renderer_name = MODEL_RENDERER_MAP.get(model_name)
+            if renderer_name is None:
+                raise _takes_no_tools(
+                    f"the default renderer auto falls back to for {model_name!r} "
+                    "(not in MODEL_RENDERER_MAP)"
+                )
+            resolved = config_from_name(renderer_name)
+        else:
+            renderer_name, resolved = config.name, config
+        if isinstance(resolved, DefaultRendererConfig):
+            if resolved.tool_parser is None:
+                raise _takes_no_tools("renderer 'default' without a tool_parser")
+            return
+        _populate_registry()
+        renderer_cls = RENDERER_REGISTRY[renderer_name]
+        name = f"renderer {renderer_name!r}"
+    if not getattr(renderer_cls, "supports_tools", True):
+        raise _takes_no_tools(name)
 
 
 def template_field_names(config: "RendererConfig") -> frozenset[str]:

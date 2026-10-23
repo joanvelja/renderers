@@ -158,6 +158,86 @@ def test_default_renderer_with_a_tool_parser_refuses_a_parse_without_tool_calls(
     require_vllm_parsers_for(None, "m/unmapped")
 
 
+_TEXT_ONLY_RENDERER = """
+from typing import Literal
+
+from renderers.configs import BaseRendererConfig
+
+
+class TextOnlyRendererConfig(BaseRendererConfig):
+    name: Literal["text-only"] = "text-only"
+
+
+class TextOnlyRenderer:
+    config_class = TextOnlyRendererConfig
+    supports_tools = False
+
+    def __init__(self, tokenizer, config):
+        self.config = config
+"""
+
+
+@pytest.mark.asyncio
+async def test_tools_on_a_renderer_that_parses_no_tool_calls_are_refused_before_it_is_built(
+    tmp_path,
+):
+    """A renderer takes tools only if it parses tool calls (``supports_tools``):
+    not DefaultRenderer without a tool_parser, which auto falls back to for a
+    model the renderer map lacks, nor a custom renderer declaring none. Tools
+    for one are refused from its config, before it is built, and by generate on
+    the built one before any request, with one error naming it and the fix."""
+    from replay import replay_client
+
+    from renderers import (
+        AutoRendererConfig,
+        CustomRendererConfig,
+        DefaultRendererConfig,
+        ToolsUnsupportedError,
+        create_renderer,
+    )
+    from renderers.base import require_tool_support_for
+    from renderers.client import generate
+    from renderers.configs import config_from_name
+
+    (tmp_path / "text_only.py").write_text(_TEXT_ONLY_RENDERER)
+    text_only = f"{tmp_path / 'text_only.py'}:TextOnlyRenderer"
+    tok = load_tokenizer("Qwen/Qwen3-0.6B")
+    tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+    fix = "configure a renderer that parses them"
+    for config, name in [
+        (DefaultRendererConfig(), "renderer 'default' without a tool_parser"),
+        (CustomRendererConfig(import_path=text_only), f"custom renderer {text_only!r}"),
+    ]:
+        with pytest.raises(ToolsUnsupportedError, match=f"^{name} parses no tool"):
+            require_tool_support_for(config, "Qwen/Qwen3-0.6B")
+        renderer = create_renderer(tok, config)
+        requests = []
+        async with replay_client([], requests) as client:
+            with pytest.raises(ToolsUnsupportedError, match=fix) as refused:
+                await generate(
+                    client=client,
+                    renderer=renderer,
+                    model="Qwen/Qwen3-0.6B",
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=tools,
+                )
+        assert str(refused.value).startswith(f"{type(renderer).__name__} parses no")
+        assert requests == []
+    for config in [None, AutoRendererConfig()]:
+        with pytest.raises(
+            ToolsUnsupportedError,
+            match="^the default renderer auto falls back to for 'my-org/unmapped' "
+            rf"\(not in MODEL_RENDERER_MAP\) parses no tool calls, .*{fix}",
+        ):
+            require_tool_support_for(config, "my-org/unmapped")
+    for config in [
+        None,
+        config_from_name("qwen3"),
+        DefaultRendererConfig(tool_parser="qwen3"),
+    ]:
+        require_tool_support_for(config, "Qwen/Qwen3-0.6B")
+
+
 def test_a_checkpoint_is_served_its_own_pair_under_the_renderer_it_maps_to(
     monkeypatch,
 ):

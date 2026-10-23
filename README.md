@@ -298,7 +298,7 @@ Downstream TOML configs select it the same way, with `name = "custom"` and an `i
 
 ## `DefaultRenderer`
 
-Fallback for unsupported text-only models. Wraps `apply_chat_template` and accepts `tool_parser` / `reasoning_parser` (vLLM convention) plus arbitrary Jinja kwargs via `DefaultRendererConfig`'s `extra="allow"`. Explicit `thinking_retention` is rejected: `bridge_to_next_turn` returns `None` because the template's close is unknown, so multi-turn rollouts fall back to full re-render. Implementing a hand-coded renderer is a few hundred lines of Python (`render_ids` + `parse_response` + `bridge_to_next_turn`) and is the only path that closes the failure modes above by construction.
+Fallback for unsupported text-only models. Wraps `apply_chat_template` and accepts `tool_parser` / `reasoning_parser` (vLLM convention) plus arbitrary Jinja kwargs via `DefaultRendererConfig`'s `extra="allow"`. Without a `tool_parser` it parses no tool calls (`supports_tools` is False, as a custom renderer may declare too), so tools for it raise `ToolsUnsupportedError`: in `generate`, and before the renderer is built in `require_tool_support_for(config, model)`. Explicit `thinking_retention` is rejected: `bridge_to_next_turn` returns `None` because the template's close is unknown, so multi-turn rollouts fall back to full re-render. Implementing a hand-coded renderer is a few hundred lines of Python (`render_ids` + `parse_response` + `bridge_to_next_turn`) and is the only path that closes the failure modes above by construction.
 
 ## Roadmap
 

@@ -158,6 +158,29 @@ def test_default_renderer_with_a_tool_parser_refuses_a_parse_without_tool_calls(
     require_vllm_parsers_for(None, "m/unmapped")
 
 
+def test_a_checkpoint_is_served_its_own_pair_under_the_renderer_it_maps_to(
+    monkeypatch,
+):
+    """Kimi-K2-Instruct answers without thinking, so it is served without a
+    reasoning parser, through auto or its own renderer; any other model or
+    renderer gets the renderer's pair. An entry may change only the reasoning
+    parser: the renderer's parse follows the tool parser's markup rule."""
+    from renderers import VllmParsers
+    from renderers.base import MODEL_VLLM_PARSERS, vllm_parsers_for
+    from renderers.configs import config_from_name
+
+    model = "moonshotai/Kimi-K2-Instruct"
+    instruct = VllmParsers("kimi_k2", None)
+    assert vllm_parsers_for(None, model) == instruct
+    assert vllm_parsers_for(config_from_name("kimi-k2"), model) == instruct
+    thinking = VllmParsers("kimi_k2", "kimi_k2")
+    assert vllm_parsers_for(config_from_name("kimi-k2"), "m/kimi-ft") == thinking
+    assert vllm_parsers_for(config_from_name("kimi-k2.5"), model) == thinking
+    monkeypatch.setitem(MODEL_VLLM_PARSERS, model, VllmParsers("hermes", None))
+    with pytest.raises(ValueError, match="only the reasoning parser"):
+        vllm_parsers_for(None, model)
+
+
 def test_default_renderer_without_parsers_is_backward_compatible():
     """Without parsers, DefaultRenderer still does basic <think> extraction."""
     from renderers import DefaultRendererConfig, create_renderer

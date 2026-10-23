@@ -13,6 +13,8 @@ import pytest
 from parity import MODEL_CATALOG, TOOLS, kwarg_combinations
 from reference_continuations import (
     ANSWER,
+    BEFORE,
+    BEFORE_KWARGS,
     REASONING,
     SERVED_REPLIES,
     reference_continuation,
@@ -26,6 +28,7 @@ from renderers.base import (
     MODEL_RENDERER_MAP,
     ToolCallParseStatus,
     load_tokenizer,
+    vllm_parsers_for,
 )
 from renderers.client import generate
 from renderers.configs import config_from_name
@@ -168,15 +171,27 @@ async def _served_without_tool_calls(renderer, model, sampled, kwargs, tools):
     return result, want
 
 
+# Every reference tool-call reply, and one per checkpoint with text beside its
+# call (``BEFORE_KWARGS``).
+_SERVED_CASES = [pytest.param(*p.values, "", id=p.id) for p in _CASES if p.values[2]]
+_SERVED_CASES += [
+    pytest.param(case, kwargs, 1, BEFORE, id=f"{case.model}-{kwargs}-{BEFORE}-calls=1")
+    for case in MODEL_CATALOG
+    if case.resolved_renderer != "default"
+    and (kwargs := BEFORE_KWARGS.get(case.resolved_renderer, {})) is not None
+]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tools", [TOOLS, None], ids=["tools", "no-tools"])
-@pytest.mark.parametrize("case,kwargs,calls", [p for p in _CASES if p.values[2]])
+@pytest.mark.parametrize("case,kwargs,calls,content", _SERVED_CASES)
 async def test_reference_tool_calls_parsed_without_tool_calls(
-    case, kwargs, calls, tools
+    case, kwargs, calls, content, tools
 ):
-    """``tool_calls=False`` serves a reply carrying tool calls and text after
-    them as vLLM's chat path does under tool_choice="none" with the renderer's
-    vLLM parser pair: with the tools, the whole reply; without tools, the
+    """``tool_calls=False`` serves a reply carrying tool calls, text after them
+    and ``content`` beside them as vLLM's chat path does under
+    tool_choice="none" with the pair the checkpoint is served with
+    (``vllm_parsers_for``): with the tools, the whole reply; without tools, the
     streamed one (they differ only for an engine-based pair). No calls, finish
     "stop", and the reasoning split of the tool-call parse."""
     tok = _tokenizer(case.model)
@@ -185,20 +200,20 @@ async def test_reference_tool_calls_parsed_without_tool_calls(
         config_from_name(case.resolved_renderer),
         chat_template_kwargs=kwargs or None,
     )
-    assert renderer.vllm_parsers == VllmParsers(
-        *_SERVED["pairs"][case.resolved_renderer]
-    )
+    served = vllm_parsers_for(config_from_name(case.resolved_renderer), case.model)
+    assert served == VllmParsers(*_SERVED["pairs"][case.model])
     sampled = tool_reply_with_text_after(
-        tok, renderer, case, kwargs, _MESSAGES, TOOLS, calls
+        tok, renderer, case, kwargs, _MESSAGES, TOOLS, calls, content
     )
+    assert content in tok.decode(sampled)
     _, _, reasoning = reference_continuation(
-        tok, case, kwargs, _MESSAGES, TOOLS, calls=calls
+        tok, case, kwargs, _MESSAGES, TOOLS, calls=calls, content=content
     )
     result, want = await _served_without_tool_calls(
         renderer, case.model, sampled, kwargs, tools
     )
-    # The markup rule renderers derives from the declared pair is vLLM's.
-    assert ("get_weather" in want) is not renderer.vllm_parsers.drops_tool_markup
+    # The markup rule renderers derives from the served pair is vLLM's.
+    assert ("get_weather" in want) is not served.drops_tool_markup
     assert (result["reasoning_content"] or "").strip() == reasoning
     assert result["reasoning_complete"] is True
 

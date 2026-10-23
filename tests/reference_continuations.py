@@ -17,7 +17,9 @@ REASONING = "Check the weather carefully."
 ANSWER = "It is sunny in Tokyo."
 
 
-def reference_continuation(tok, case, kwargs, messages, tools, *, calls=0):
+def reference_continuation(tok, case, kwargs, messages, tools, *, calls=0, content=""):
+    """(prompt, completion, reasoning) of the reference's live reply: ``ANSWER``,
+    or ``calls`` tool calls with ``content`` beside them."""
     options = {
         k: v for k, v in (dict(case.oracle_defaults) | kwargs).items() if v is not None
     }
@@ -43,7 +45,7 @@ def reference_continuation(tok, case, kwargs, messages, tools, *, calls=0):
     disabled = bool(
         re.search(r"(?:</think>|</think:opensource>|<channel\|>)\s*$", mode_prefix)
     )
-    assistant = {"role": "assistant", "content": "" if calls else ANSWER}
+    assistant = {"role": "assistant", "content": content if calls else ANSWER}
     if not disabled:
         assistant["reasoning_content"] = REASONING
     if calls:
@@ -57,7 +59,7 @@ def reference_continuation(tok, case, kwargs, messages, tools, *, calls=0):
         ]
         if case.resolved_renderer in {"deepseek-v3", "deepseek-r1"}:
             # These upstream templates require null content and JSON strings.
-            assistant["content"] = None
+            assistant["content"] = content or None
             for call in assistant["tool_calls"]:
                 fn = call["function"]
                 fn["arguments"] = json.dumps(fn["arguments"])
@@ -169,6 +171,27 @@ AFTER = "\nAfter."
 """Text a reply carries after its last tool call, where vLLM's tool parsers
 part ways once they parse no calls."""
 
+BEFORE = "Before."
+"""Content a reference tool-call reply carries beside its call, where the
+template puts it (before the call, except Gemma 4 and Harmony's final message)."""
+
+BEFORE_KWARGS: dict[str, dict | None] = {
+    # The template can't render text beside a call: DeepSeek V3 drops the
+    # calls, Llama 3 and Muse Glimmer the text.
+    "deepseek-v3": None,
+    "llama-3": None,
+    "muse-glimmer": None,
+    # The template renders a tool-call turn without its reasoning, while the
+    # checkpoints think by default: vLLM's qwen3 parser reads a reply that opens
+    # no think block as reasoning, and the template has no switch to turn it off.
+    "prime-qwen3": None,
+    # vLLM renders DeepSeek V4 in thinking mode unless the request turns it off
+    # (vllm/tokenizers/deepseek_v4.py:28-33); renderers defaults to chat mode.
+    "deepseek-v4": {"enable_thinking": True},
+}
+"""Template settings of the reply with ``BEFORE`` beside its call, by renderer
+(default: the template's defaults); ``None`` has no such reply."""
+
 # Hand-written replies, each turning on one rule of its format's vLLM parsers:
 # name -> (model, completion text).
 SERVED_REPLIES = {
@@ -198,6 +221,13 @@ SERVED_REPLIES = {
         "Need weather.<|end|><|start|>assistant<|channel|>final<|message|>"
         "Sunny in Tokyo.<|return|>",
     ),
+    # gemma4: text before a call stays content (its template renders text after
+    # calls, so no reference reply has it before).
+    "gemma4-text-before-call": (
+        "google/gemma-4-31B-it",
+        'Before.<|tool_call>call:get_weather{city:<|"|>Tokyo<|"|>}<tool_call|>'
+        "<|tool_response>",
+    ),
     # qwen3 grammar: a bare <function= opens a call; the text after its
     # </function> stays out of the content until a </tool_call>.
     "qwen3.5-bare-function": (
@@ -208,11 +238,13 @@ SERVED_REPLIES = {
 }
 
 
-def tool_reply_with_text_after(tok, renderer, case, kwargs, messages, tools, calls):
-    """The reference tool-call continuation up to the renderer's first stop
-    token, with ``AFTER`` inserted before that stop."""
+def tool_reply_with_text_after(
+    tok, renderer, case, kwargs, messages, tools, calls, content=""
+):
+    """The reference tool-call continuation (``content`` beside the calls) up to
+    the renderer's first stop token, with ``AFTER`` inserted before that stop."""
     _, sampled, _ = reference_continuation(
-        tok, case, kwargs, messages, tools, calls=calls
+        tok, case, kwargs, messages, tools, calls=calls, content=content
     )
     stops = set(renderer.get_stop_token_ids())
     end = next((i for i, token in enumerate(sampled) if token in stops), None)

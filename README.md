@@ -81,7 +81,11 @@ tool_calls=True)`; formats that do not need prompt context can ignore it.
 
 Each renderer declares the vLLM parser pair its format is served with,
 `vllm_parsers = VllmParsers(tool, reasoning)`, named as in the vLLM release
-`VLLM_CHAT_PARITY`; `vllm_parsers_for(config, model)` reads it without a
+`VLLM_CHAT_PARITY`. A checkpoint served differently has its own pair in
+`MODEL_VLLM_PARSERS`: one whose default reply opens no think block
+(Qwen3-*-Instruct-2507, Qwen3-VL-*-Instruct, Kimi-K2-Instruct, Qwen3.5-0.8B/2B)
+is served without a reasoning parser, under which vLLM would read that reply as
+reasoning. `vllm_parsers_for(config, model)` returns the pair to serve, without a
 tokenizer, for whoever launches vLLM. `parse_response(..., tool_calls=False)`
 (and `generate(..., tool_calls=False)`) parses a reply as vLLM's chat path serves
 it under that pair with `tool_choice="none"`: with the tools, its whole reply;

@@ -853,8 +853,10 @@ class Renderer(Protocol):
     @property
     def vllm_parsers(self) -> VllmParsers | None:
         """The vLLM parser pair the format is served with (``VllmParsers``),
-        which ``parse_response(tool_calls=False)`` follows. ``None`` pins none:
-        that parse is then refused, unless the renderer parses no tool calls."""
+        which ``parse_response(tool_calls=False)`` follows. A checkpoint's entry
+        in ``MODEL_VLLM_PARSERS`` overrides it, so the pair to serve is
+        ``vllm_parsers_for``'s. ``None`` pins none: that parse is then refused,
+        unless the renderer parses no tool calls."""
         ...
 
     def render(
@@ -1197,6 +1199,31 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     # ``interleaved_thinking`` instead of ``preserved_thinking``).
     "tencent/Hy3": "hy3",
     "tencent/Hy3-FP8": "hy3",
+}
+
+
+# The vLLM parser pair of a mapped checkpoint served differently from its
+# renderer's format (``Renderer.vllm_parsers``); ``vllm_parsers_for`` reads it.
+# vLLM's qwen3 and kimi_k2 reasoning parsers start in reasoning unless the request
+# turns thinking off (vllm/parser/qwen3.py:231, kimi_k2.py:163-167), so a
+# checkpoint whose default reply opens no think block is served without one:
+# under it, that reply is all reasoning and its content null. The tool parser,
+# and with it how the renderer parses a reply without tool calls, stays the
+# format's (checked in ``vllm_parsers_for``).
+MODEL_VLLM_PARSERS: dict[str, VllmParsers] = {
+    # Non-thinking checkpoints: they never open a think block.
+    "Qwen/Qwen3-4B-Instruct-2507": VllmParsers("hermes", None),
+    "Qwen/Qwen3-30B-A3B-Instruct-2507": VllmParsers("hermes", None),
+    "Qwen/Qwen3-VL-4B-Instruct": VllmParsers("hermes", None),
+    "Qwen/Qwen3-VL-8B-Instruct": VllmParsers("hermes", None),
+    "Qwen/Qwen3-VL-30B-A3B-Instruct": VllmParsers("hermes", None),
+    "moonshotai/Kimi-K2-Instruct": VllmParsers("kimi_k2", None),
+    # Their template's default turns thinking off (an empty think block closes
+    # the generation prompt), which the parser can't see unless the request
+    # sends enable_thinking=false. A request turning thinking on gets its
+    # reasoning back in the content.
+    "Qwen/Qwen3.5-0.8B": VllmParsers("qwen3_coder", None),
+    "Qwen/Qwen3.5-2B": VllmParsers("qwen3_coder", None),
 }
 
 
@@ -1613,23 +1640,37 @@ def create_renderer(
 def vllm_parsers_for(
     config: "RendererConfig | None", model_name: str
 ) -> VllmParsers | None:
-    """``vllm_parsers`` of the renderer ``create_renderer`` builds from ``config``
-    for ``model_name``, read without a tokenizer: ``auto`` resolves through
-    ``MODEL_RENDERER_MAP``, and a model the map lacks gets ``DefaultRenderer``,
-    which pins none. A custom renderer declares it as a class attribute."""
+    """The vLLM parser pair to serve ``model_name`` with, rendered by the renderer
+    ``create_renderer`` builds from ``config``, read without a tokenizer: the
+    checkpoint's ``MODEL_VLLM_PARSERS`` entry when ``config`` renders it with the
+    renderer it maps to, else that renderer's ``vllm_parsers``. ``auto`` resolves
+    through ``MODEL_RENDERER_MAP``, and a model the map lacks gets
+    ``DefaultRenderer``, which pins none. A custom renderer declares it as a class
+    attribute."""
     from renderers.configs import AutoRendererConfig, CustomRendererConfig
     from renderers.custom import load_custom_renderer
 
     if isinstance(config, CustomRendererConfig):
-        renderer_cls = load_custom_renderer(config.import_path)
+        return getattr(load_custom_renderer(config.import_path), "vllm_parsers", None)
+    if config is None or isinstance(config, AutoRendererConfig):
+        name = MODEL_RENDERER_MAP.get(model_name, "default")
     else:
-        if config is None or isinstance(config, AutoRendererConfig):
-            name = MODEL_RENDERER_MAP.get(model_name, "default")
-        else:
-            name = config.name
-        _populate_registry()
-        renderer_cls = RENDERER_REGISTRY[name]
-    return getattr(renderer_cls, "vllm_parsers", None)
+        name = config.name
+    _populate_registry()
+    pair = getattr(RENDERER_REGISTRY[name], "vllm_parsers", None)
+    served = MODEL_VLLM_PARSERS.get(model_name)
+    if served is None or MODEL_RENDERER_MAP[model_name] != name:
+        return pair
+    if pair is None or (served.tool, served.drops_tool_markup) != (
+        pair.tool,
+        pair.drops_tool_markup,
+    ):
+        raise ValueError(
+            f"MODEL_VLLM_PARSERS[{model_name!r}] = {served} changes renderer "
+            f"{name!r}'s tool parser or its markup rule ({pair}): only the "
+            "reasoning parser is the checkpoint's"
+        )
+    return served
 
 
 def require_vllm_parsers_for(config: "RendererConfig | None", model_name: str) -> None:

@@ -7,6 +7,7 @@ prefix mismatch by silently slicing at a common prefix or asking our renderer
 to supply the expected output.
 """
 
+import hashlib
 import json
 import re
 
@@ -15,8 +16,14 @@ from reference_rendering import _harmony_messages, render_reference
 REASONING = "Check the weather carefully."
 ANSWER = "It is sunny in Tokyo."
 
+MESSAGES = [{"role": "user", "content": "Check the weather."}]
+"""The conversation every reply served without tool calls answers
+(``served_key``)."""
 
-def reference_continuation(tok, case, kwargs, messages, tools, *, calls=0):
+
+def reference_continuation(tok, case, kwargs, messages, tools, *, calls=0, content=""):
+    """(prompt, completion, reasoning) of the reference's live reply: ``ANSWER``,
+    or ``calls`` tool calls with ``content`` beside them."""
     options = {
         k: v for k, v in (dict(case.oracle_defaults) | kwargs).items() if v is not None
     }
@@ -42,7 +49,7 @@ def reference_continuation(tok, case, kwargs, messages, tools, *, calls=0):
     disabled = bool(
         re.search(r"(?:</think>|</think:opensource>|<channel\|>)\s*$", mode_prefix)
     )
-    assistant = {"role": "assistant", "content": "" if calls else ANSWER}
+    assistant = {"role": "assistant", "content": content if calls else ANSWER}
     if not disabled:
         assistant["reasoning_content"] = REASONING
     if calls:
@@ -56,7 +63,7 @@ def reference_continuation(tok, case, kwargs, messages, tools, *, calls=0):
         ]
         if case.resolved_renderer in {"deepseek-v3", "deepseek-r1"}:
             # These upstream templates require null content and JSON strings.
-            assistant["content"] = None
+            assistant["content"] = content or None
             for call in assistant["tool_calls"]:
                 fn = call["function"]
                 fn["arguments"] = json.dumps(fn["arguments"])
@@ -162,3 +169,140 @@ def reference_continuation(tok, case, kwargs, messages, tools, *, calls=0):
     # non-reasoning templates intentionally ignore reasoning_content inputs.
     reasoning = REASONING if REASONING in tok.decode(completion) else ""
     return prompt, completion, reasoning
+
+
+AFTER = "\nAfter."
+"""Text a reply carries after its last tool call, where vLLM's tool parsers
+part ways once they parse no calls."""
+
+BEFORE = "Before."
+"""Content a reference tool-call reply carries beside its call, where the
+template puts it (before the call, except Gemma 4 and Harmony's final message)."""
+
+BEFORE_KWARGS: dict[str, dict | None] = {
+    # The template can't render text beside a call: DeepSeek V3 drops the
+    # calls, Llama 3 and Muse Glimmer the text.
+    "deepseek-v3": None,
+    "llama-3": None,
+    "muse-glimmer": None,
+    # The template renders a tool-call turn without its reasoning, while the
+    # checkpoints think by default: vLLM's qwen3 parser reads a reply that opens
+    # no think block as reasoning, and the template has no switch to turn it off.
+    "prime-qwen3": None,
+    # vLLM renders DeepSeek V4 in thinking mode unless the request turns it off
+    # (vllm/tokenizers/deepseek_v4.py:28-33); renderers defaults to chat mode.
+    "deepseek-v4": {"enable_thinking": True},
+}
+"""Template settings of the reply with ``BEFORE`` beside its call, by renderer
+(default: the template's defaults); ``None`` has no such reply."""
+
+# Hand-written replies, each turning on one rule of its format's vLLM parsers:
+# name -> (model, completion text).
+SERVED_REPLIES = {
+    # llama3_json: no parser adjusts the request, so special tokens are skipped.
+    "llama-3-python-tag": (
+        "meta-llama/Llama-3.2-1B-Instruct",
+        '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Tokyo"}}'
+        "<|eom_id|>",
+    ),
+    # muse_glimmer: the to=user body ends before one final LF (`$`).
+    "muse-glimmer-final-newline": (
+        "meta-models/Muse-Glimmer-30B",
+        " to=user<|message|>Hello\n<|eot|>",
+    ),
+    # muse_glimmer: the whitespace before that LF stays content.
+    "muse-glimmer-trailing-whitespace": (
+        "meta-models/Muse-Glimmer-30B",
+        " to=user<|message|>Sunny in Tokyo.  \n\n<|eot|>",
+    ),
+    # inkling: a text segment's trailing whitespace stays content.
+    "inkling-trailing-whitespace": (
+        "thinkingmachines/Inkling",
+        "<|content_thinking|>Need weather.<|end_message|><|message_model|>"
+        "<|content_text|>Sunny in Tokyo.  \n<|content_model_end_sampling|>",
+    ),
+    # hermes + qwen3: vLLM keeps the content's trailing whitespace, which
+    # renderers strips.
+    "qwen3-trailing-whitespace": (
+        "Qwen/Qwen3-8B",
+        "<think>\nNeed weather.\n</think>\n\nSunny in Tokyo.  \n<|im_end|>",
+    ),
+    # Harmony: commentary without a recipient is content, the tool message is
+    # dropped. The reply follows the analysis header renderers' prompt prefills.
+    "gpt-oss-preamble-call": (
+        "openai/gpt-oss-20b",
+        "Need weather.<|end|><|start|>assistant<|channel|>commentary<|message|>"
+        "Let me check.<|end|><|start|>assistant<|channel|>commentary "
+        'to=functions.get_weather <|constrain|>json<|message|>{"city": "Tokyo"}'
+        "<|call|>",
+    ),
+    # Harmony: the final channel is content.
+    "gpt-oss-final": (
+        "openai/gpt-oss-20b",
+        "Need weather.<|end|><|start|>assistant<|channel|>final<|message|>"
+        "Sunny in Tokyo.<|return|>",
+    ),
+    # gemma4: text before a call stays content (its template renders text after
+    # calls, so no reference reply has it before).
+    "gemma4-text-before-call": (
+        "google/gemma-4-31B-it",
+        'Before.<|tool_call>call:get_weather{city:<|"|>Tokyo<|"|>}<tool_call|>'
+        "<|tool_response>",
+    ),
+    # qwen3 grammar: a bare <function= opens a call; the text after its
+    # </function> stays out of the content until a </tool_call>.
+    "qwen3.5-bare-function": (
+        "Qwen/Qwen3.5-9B",
+        "Check.\n</think>\n\nSure.\n<function=get_weather>\n<parameter=city>\n"
+        "Tokyo\n</parameter>\n</function>\nafter<|im_end|>",
+    ),
+}
+
+
+def tool_reply_with_text_after(
+    tok, renderer, case, kwargs, messages, tools, calls, content=""
+):
+    """The reference tool-call continuation (``content`` beside the calls) up to
+    the renderer's first stop token, with ``AFTER`` inserted before that stop."""
+    _, sampled, _ = reference_continuation(
+        tok, case, kwargs, messages, tools, calls=calls, content=content
+    )
+    stops = set(renderer.get_stop_token_ids())
+    end = next((i for i, token in enumerate(sampled) if token in stops), None)
+    after = tok.encode(AFTER, add_special_tokens=False)
+    if end is None:
+        return sampled + after
+    return sampled[:end] + after + [sampled[end]]
+
+
+def reasoning_left_in_content(model, chat_template_kwargs):
+    """Whether the pair ``model`` is served with leaves a reply's reasoning in
+    vLLM's content, where renderers splits it off, for a request sending
+    ``chat_template_kwargs``: the README's listed gaps, by checkpoint. There the
+    fixture pins the content after vLLM's reasoning closer and the split is
+    renderers' own; anywhere else reasoning left in the content is the pair's."""
+    kwargs = chat_template_kwargs
+    if model == "tencent/Hy3":
+        # hy_v3 doesn't split under reasoning_effort "no_think", its default
+        # (vllm/reasoning/hy_v3_reasoning_parser.py:40-50).
+        return kwargs.get("reasoning_effort", "no_think") == "no_think"
+    if model == "poolside/Laguna-S-2.1":
+        # poolside_v1 splits only when the request turns thinking on
+        # (deepseek_v3_reasoning_parser.py:28-37); the template thinks unasked.
+        return not (kwargs.get("thinking") or kwargs.get("enable_thinking"))
+    if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"}:
+        # Served without a reasoning parser (MODEL_VLLM_PARSERS).
+        return kwargs.get("enable_thinking") is True
+    # minimax_m2_append_think serves the whole reply as content, behind a
+    # "<think>" (minimax_m2_reasoning_parser.py:58-61).
+    return model == "MiniMaxAI/MiniMax-M2.5"
+
+
+def served_key(model, tools, completion_ids, chat_template_kwargs):
+    """The fixture's key for a reply: a digest of the model, whether the request
+    offers tools, the reply's token ids and the template kwargs it sends. It
+    names what vLLM serves only for the fixed ``MESSAGES`` and ``TOOLS``. The
+    prompt isn't in it: gpt-oss's and Muse Glimmer's print today's date, which
+    vLLM's parse doesn't read, so a key over it would expire the fixture daily."""
+    inputs = [model, bool(tools), completion_ids, chat_template_kwargs]
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:16]

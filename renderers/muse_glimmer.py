@@ -35,6 +35,7 @@ from datetime import datetime
 from typing import Any
 
 from renderers.base import (
+    VllmParsers,
     Message,
     MultiModalData,
     ParsedResponse,
@@ -51,7 +52,6 @@ from renderers.base import (
     should_rerender_for_thinking_retention,
 )
 from renderers.configs import MuseGlimmerRendererConfig
-from renderers.parsing import _build_param_type_index, _coerce_arg_value
 
 _IMAGE_TYPES = ("image", "image_url")
 _UNSUPPORTED_MEDIA_TYPES = ("video", "video_url", "audio", "audio_url", "input_audio")
@@ -104,6 +104,34 @@ _PARAM_RE = re.compile(
     r'<atem:parameter\b[^>]*?\bname="(?P<key>[^"]+)"[^>]*?>(?P<value>.*?)</atem:parameter>',
     re.DOTALL,
 )
+_STRIP_REASONING_RE = re.compile(
+    r"(?:<\|start\|>assistant\s*)?to=self<\|message\|>.*?<\|eom\|>", re.DOTALL
+)
+_STRIP_OPEN_REASONING_RE = re.compile(
+    r"(?:<\|start\|>assistant\s*)?to=self<\|message\|>"
+    r"(?:(?!<\|eom\|>)(?!to=[^\s<]+<\|message\|>).)*"
+    r"(?=to=[^\s<]+<\|message\|>|$)",
+    re.DOTALL,
+)
+# vLLM's first ``to=user`` body; ``$`` stops before one final LF.
+_CONTENT_RE = re.compile(
+    r"to=user<\|message\|>(.*?)(?=<\|eot\|>|<\|eom\|>|$)", re.DOTALL
+)
+
+
+def _vllm_content(output: str) -> str:
+    """The content vLLM's muse_glimmer reasoning parser
+    (``MuseGlimmerReasoningParser.extract_reasoning`` at ``VLLM_CHAT_PARITY``)
+    reads off a decoded completion: the text outside reasoning spans when it
+    carries ATEM markup, else the first ``to=user`` body, else nothing after a
+    ``to=self`` header, else the whole output."""
+    remainder = _STRIP_REASONING_RE.sub("", output)
+    remainder = _STRIP_OPEN_REASONING_RE.sub("", remainder)
+    if "<atem:invoke" in remainder or "<atem:function_calls>" in remainder:
+        return remainder
+    if match := _CONTENT_RE.search(output):
+        return match.group(1)
+    return "" if "to=self<|message|>" in output else output
 
 
 def _json(value: Any) -> str:
@@ -241,6 +269,7 @@ class _TokenStream:
 class MuseGlimmerRenderer:
     """Deterministic message → token renderer for Muse Glimmer (ATEM)."""
 
+    vllm_parsers = VllmParsers("muse_glimmer", "muse_glimmer")
     _config_cls = MuseGlimmerRendererConfig
     supports_process_multimodal = True
 
@@ -631,6 +660,7 @@ class MuseGlimmerRenderer:
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         stops = set(self.get_stop_token_ids())
         ids = list(token_ids)
@@ -723,23 +753,51 @@ class MuseGlimmerRenderer:
         reasoning = (
             "\n".join(p for p in reasoning_parts if p) if reasoning_parts else None
         )
-        param_types = _build_param_type_index(tools)
+        if not tool_calls:
+            # vLLM's chat path serves the reasoning parser's content under
+            # tool_choice="none" (the muse_glimmer tool parser is legacy), read
+            # off the decoded completion with its framing.
+            return ParsedResponse(
+                content=_vllm_content(self._decode(ids)),
+                reasoning_content=reasoning,
+                reasoning_complete=reasoning_complete,
+            )
+        registered = {_function(tool)["name"] for tool in tools or []}
         calls = [
             c
             for recipient, body, closed in tool_bodies
-            for c in self._parse_calls(recipient, body, param_types)
+            for c in self._parse_calls(body, registered)
         ]
+        content = "".join(content_parts)
+        if (
+            messages
+            and messages[-1][0] == "user"
+            and not messages[-1][2]
+            and not any(call.name for call in calls)
+            and content.endswith("\n")
+            and "<atem:invoke" not in content
+            and "<atem:function_calls>" not in content
+        ):
+            # vLLM's non-streaming content regex ends at `$`, before one final LF.
+            content = content[:-1]
+        if tool_bodies and not any(call.name for call in calls):
+            # Stock vLLM preserves malformed tool markup as content when no
+            # complete invocation can be dispatched; it does not invent a call.
+            remainder = _STRIP_REASONING_RE.sub("", text)
+            remainder = _STRIP_OPEN_REASONING_RE.sub("", remainder)
+            if "<atem:invoke" in remainder or "<atem:function_calls>" in remainder:
+                content = remainder
+            elif not content:
+                content = "" if "to=self<|message|>" in text else text
         return ParsedResponse(
-            content="".join(content_parts),
+            content=content,
             reasoning_content=reasoning,
             tool_calls=calls,
             reasoning_complete=reasoning_complete,
         )
 
     @staticmethod
-    def _parse_calls(
-        recipient: str, body: str, param_types: dict[str, dict[str, dict[str, Any]]]
-    ) -> list[ParsedToolCall]:
+    def _parse_calls(body: str, registered: set[str]) -> list[ParsedToolCall]:
         """Every ``<atem:invoke>`` in one tool-channel message."""
         calls: list[ParsedToolCall] = []
         last_end = 0
@@ -754,23 +812,24 @@ class MuseGlimmerRenderer:
                     )
                 )
                 continue
-            schema = param_types.get(name, {})
+            if name not in registered:
+                head, sep, tail = name.partition(".")
+                if sep and head == tail and head in registered:
+                    name = head
             arguments: dict[str, Any] = {}
-            fallback = False
             for p in _PARAM_RE.finditer(m.group("body")):
-                value, used = _coerce_arg_value(
-                    p.group("value"), schema.get(p.group("key"))
-                )
+                value = p.group("value")
+                try:
+                    value = json.loads(value)
+                except (json.JSONDecodeError, ValueError):
+                    pass
                 arguments[p.group("key")] = value
-                fallback = fallback or used
             calls.append(
                 ParsedToolCall(
                     raw=m.group(0),
                     name=name,
                     arguments=arguments,
-                    status=ToolCallParseStatus.INVALID_JSON
-                    if fallback
-                    else ToolCallParseStatus.OK,
+                    status=ToolCallParseStatus.OK,
                 )
             )
         rest = body[last_end:]
@@ -779,7 +838,6 @@ class MuseGlimmerRenderer:
             calls.append(
                 ParsedToolCall(
                     raw=rest.strip(),
-                    name=recipient,
                     status=ToolCallParseStatus.UNCLOSED_BLOCK,
                 )
             )
@@ -787,7 +845,6 @@ class MuseGlimmerRenderer:
             calls.append(
                 ParsedToolCall(
                     raw=body,
-                    name=recipient,
                     status=ToolCallParseStatus.MALFORMED_STRUCTURE,
                 )
             )

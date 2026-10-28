@@ -20,6 +20,7 @@ from renderers.base import (
     RenderedTokens,
     ToolSpec,
     extract_message_tool_names,
+    require_vllm_parsers,
     resolve_thinking_retention,
 )
 from renderers.parsing import (
@@ -130,6 +131,11 @@ class DefaultRenderer:
     def supports_tools(self) -> bool:
         return self._tool_parser is not None
 
+    # The model's own template pins no vLLM parser pair. Without a tool parser
+    # nothing is a call, as on a vLLM server without one, so a parse without
+    # tool calls is this parse; with one it is refused (``require_vllm_parsers``).
+    vllm_parsers = None
+
     def render(
         self,
         messages: list[Message],
@@ -191,7 +197,10 @@ class DefaultRenderer:
         *,
         tools: list[ToolSpec] | None = None,  # noqa: ARG002 — DefaultRenderer relies on configured tool_parser, schema not consulted here
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
+        if not tool_calls:
+            require_vllm_parsers(self)  # no tool parser, so no scan to skip
         ids = _strip_stop_tokens(token_ids, set(self.get_stop_token_ids()))
         boundary = scan_reasoning(
             self._tokenizer,
@@ -214,15 +223,15 @@ class DefaultRenderer:
         # 1. Extract tool calls while we still have token ids (most formats
         #    use special-token delimiters, so id-level matching is reliable).
         if self._tool_parser is not None:
-            content_ids, tool_calls = self._tool_parser.extract(ids[reasoning_end:])
+            content_ids, calls = self._tool_parser.extract(ids[reasoning_end:])
             content_ids = [*ids[:reasoning_end], *content_ids]
-            for tc in tool_calls:
+            for tc in calls:
                 if tc.token_span is not None:
                     start, end = tc.token_span
                     tc.token_span = (start + reasoning_end, end + reasoning_end)
         else:
             content_ids = ids
-            tool_calls = []
+            calls = []
 
         # 2. Decode (keep special tokens so a downstream reasoning parser can
         #    still see things like <think>/</think> when they're tokens).
@@ -245,7 +254,7 @@ class DefaultRenderer:
         return ParsedResponse(
             content=text,
             reasoning_content=reasoning_content if reasoning_content else None,
-            tool_calls=tool_calls,
+            tool_calls=calls,
             reasoning_complete=True
             if isinstance(self._reasoning_parser, ThinkTextReasoningParser)
             or reasoning_content is not None

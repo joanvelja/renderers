@@ -42,6 +42,7 @@ import json
 from typing import Any
 
 from renderers.base import (
+    VllmParsers,
     Message,
     ParsedResponse,
     RenderedTokens,
@@ -90,6 +91,8 @@ _TOOLS_IN_USER_INTRO = (
 
 class Llama3Renderer:
     """Deterministic message → token renderer for Llama-3.x Instruct models."""
+
+    vllm_parsers = VllmParsers("llama3_json", None)
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -418,10 +421,12 @@ class Llama3Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         return parse_llama_3(
             self._tokenizer,
             token_ids,
+            scan_tool_calls=tool_calls,
             stop_ids={self._eot, self._end_of_text, self._eom},
         )
 

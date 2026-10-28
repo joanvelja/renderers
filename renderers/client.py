@@ -28,6 +28,8 @@ from renderers.base import (
     ToolCallParseStatus,
     ToolSpec,
     _require_transformers,
+    require_tool_support,
+    require_vllm_parsers,
 )
 
 _request_logger = logging.getLogger("renderers.client")
@@ -455,6 +457,7 @@ async def generate(
     extra_headers: dict[str, str] | None = None,
     max_prompt_len: int | None = None,
     process_multimodal: bool = True,
+    tool_calls: bool = True,
 ) -> dict[str, Any]:
     """Tokenize messages, call vLLM /inference/v1/generate, parse the response.
 
@@ -512,6 +515,14 @@ async def generate(
     ``completion_top_ids`` / ``completion_top_logprobs``
     (original sampler probabilities, retaining full-vocabulary normalization).
 
+    ``tool_calls=False`` parses the completion as vLLM's chat path serves
+    ``tool_choice="none"``, and a request without tools
+    (``Renderer.parse_response(tool_calls=False)``): the reply carries no tool
+    calls, so its finish reason stays the engine's. A renderer that parses tool
+    calls but pins no vLLM parser pair is refused before anything is sampled.
+    Tools for a renderer that parses no tool calls are refused before anything
+    is rendered (``ToolsUnsupportedError``, ``require_tool_support``).
+
     ``prompt_attribution`` is the renderer's :class:`RenderedTokens` for
     the prompt — either the one this call computed via
     ``renderer.render(...)`` or the one the caller threaded in alongside
@@ -524,11 +535,10 @@ async def generate(
     pass. ``None`` when the caller passed pre-built ``prompt_ids``
     without attribution.
     """
-    if tools and not getattr(renderer, "supports_tools", True):
-        raise ValueError(
-            f"{type(renderer).__name__} does not support tools. "
-            "Choose a model-specific renderer instead of the default fallback."
-        )
+    if tools:
+        require_tool_support(renderer)  # refused before anything is rendered
+    if not tool_calls:
+        require_vllm_parsers(renderer)  # refused before anything is sampled
     if not process_multimodal and not getattr(
         renderer, "supports_process_multimodal", False
     ):
@@ -665,6 +675,7 @@ async def generate(
         completion_ids,
         prompt_ids=list(effective_prompt_ids or prompt_ids),
         tools=tools,
+        tool_calls=tool_calls,
     )
 
     routed_experts = choice.get("routed_experts")

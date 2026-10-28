@@ -17,6 +17,7 @@ import json
 from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
+    VllmParsers,
     Message,
     ParsedResponse,
     RenderedTokens,
@@ -55,6 +56,9 @@ class DeepSeekV3Renderer:
     this one. ``thinking_retention`` is a no-op here (no reasoning channel),
     stored for protocol uniformity.
     """
+
+    # vLLM refuses deepseek_r1 on the V3 tokenizer (no think tokens); R1 adds it.
+    vllm_parsers = VllmParsers("deepseek_v3", None)
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -291,10 +295,12 @@ class DeepSeekV3Renderer:
         *,
         tools: list[ToolSpec] | None = None,  # noqa: ARG002 — args land in a ```json fence, schema not needed
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         return parse_deepseek_v3(
             self._tokenizer,
             token_ids,
+            scan_tool_calls=tool_calls,
             stop_ids={self._eos},
             tool_calls_begin_id=self._tool_calls_begin,
             tool_calls_end_id=self._tool_calls_end,

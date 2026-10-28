@@ -22,6 +22,7 @@ from typing import Any
 from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
+    VllmParsers,
     Message,
     MultiModalData,
     ParsedResponse,
@@ -117,6 +118,8 @@ class Nemotron3Renderer:
     :class:`Nemotron3UltraRenderer` subclass below; both are registered under
     their own discriminator and differ only by the class-level hooks here.
     """
+
+    vllm_parsers = VllmParsers("qwen3_coder", "nemotron_v3")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -522,6 +525,7 @@ class Nemotron3Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         stop_ids = {self._im_end}
         if self._endoftext is not None:
@@ -529,6 +533,7 @@ class Nemotron3Renderer:
         return parse_qwen35(
             self._tokenizer,
             token_ids,
+            drop_tool_calls=not tool_calls,
             stop_ids=stop_ids,
             think_id=self._think,
             think_end_id=self._think_end,

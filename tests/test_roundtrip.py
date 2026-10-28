@@ -7,14 +7,31 @@ catalog checkpoint and every declared template-setting combination participates.
 
 import json
 from functools import lru_cache
+from pathlib import Path
 
 import pytest
 from parity import MODEL_CATALOG, TOOLS, kwarg_combinations
-from reference_continuations import ANSWER, REASONING, reference_continuation
+from reference_continuations import (
+    ANSWER,
+    BEFORE,
+    BEFORE_KWARGS,
+    MESSAGES,
+    REASONING,
+    SERVED_REPLIES,
+    reasoning_left_in_content,
+    reference_continuation,
+    served_key,
+    tool_reply_with_text_after,
+)
 from replay import assert_evidence, replay_client
 
-from renderers import create_renderer
-from renderers.base import MODEL_RENDERER_MAP, ToolCallParseStatus, load_tokenizer
+from renderers import VLLM_CHAT_PARITY, VllmParsers, create_renderer
+from renderers.base import (
+    MODEL_RENDERER_MAP,
+    ToolCallParseStatus,
+    load_tokenizer,
+    vllm_parsers_for,
+)
 from renderers.client import generate
 from renderers.configs import config_from_name
 
@@ -120,6 +137,135 @@ async def test_reference_continuation_through_generate(case, kwargs, calls):
             assert truncated["reasoning_complete"] is False
             assert truncated["tool_calls"] == []
             assert truncated["finish_reason"] == "length"
+
+
+_SERVED = json.loads(
+    (Path(__file__).parent / "fixtures" / "vllm_chat_content.json").read_text()
+)
+
+
+def _content_in_renderers_convention(renderer_name: str, content: str) -> str:
+    """vLLM's ``content`` under renderers' whitespace convention for the format:
+    outer whitespace stripped, as every parse but these does; kept by Inkling's
+    and Muse Glimmer's; kept by DeepSeek V4's, whose whitespace-only content is
+    "" (``parse_deepseek_v4``)."""
+    if renderer_name in {"inkling", "muse-glimmer"}:
+        return content
+    if renderer_name == "deepseek-v4":
+        return content if content.strip() else ""
+    return content.strip()
+
+
+def _reasoning_in_renderers_convention(renderer_name: str, reasoning: str) -> str:
+    """vLLM's ``reasoning`` under renderers' whitespace convention for the
+    format: outer whitespace stripped, as every parse but these does; kept by
+    Inkling's, Muse Glimmer's, and Laguna XS-2.1's and S-2.1's; right-stripped by
+    GLM's and DeepSeek V4's; outer newlines stripped by Laguna XS.2's and M.1's
+    (``parse_laguna_xs2``)."""
+    if renderer_name in {"inkling", "muse-glimmer", "laguna-xs-2.1", "laguna-s-2.1"}:
+        return reasoning
+    if renderer_name == "deepseek-v4" or renderer_name.startswith("glm-"):
+        return reasoning.rstrip()
+    if renderer_name in {"laguna-xs.2", "laguna-m.1"}:
+        return reasoning.strip("\n")
+    return reasoning.strip()
+
+
+async def _served_without_tool_calls(renderer, model, sampled, kwargs, tools):
+    """Parse sampled through generate(tool_calls=False) and check it
+    against the content vLLM serves for it (vllm_chat_reference.py)."""
+    assert _SERVED["vllm"] == VLLM_CHAT_PARITY
+    ctk = {k: v for k, v in kwargs.items() if v is not None}
+    key = served_key(model, tools, sampled, ctk)
+    assert key in _SERVED["served"], (
+        "no vLLM content for this reply: regenerate fixtures/vllm_chat_content.json"
+    )
+    async with replay_client([(sampled, "stop")], []) as client:
+        result = await generate(
+            client=client,
+            renderer=renderer,
+            model=model,
+            messages=MESSAGES,
+            tools=tools,
+            max_prompt_len=100000,
+            tool_calls=False,
+        )
+    served = _SERVED["messages"][_SERVED["served"][key]]
+    # Exactly vLLM's content and reasoning, up to the format's own whitespace
+    # convention on every reply; any other difference is this parse's. Where
+    # vLLM's pair leaves the reasoning in its content (a listed gap), the fixture
+    # holds the content after its closer, and the split is renderers' own.
+    name = MODEL_RENDERER_MAP[model]
+    assert result["content"] == _content_in_renderers_convention(
+        name, served["content"]
+    )
+    if served["reasoning"] is not None or not reasoning_left_in_content(model, ctk):
+        assert (result["reasoning_content"] or "") == (
+            _reasoning_in_renderers_convention(name, served["reasoning"] or "")
+        )
+    assert result["tool_calls"] == []
+    assert result["finish_reason"] == "stop"
+    return result, served["content"]
+
+
+# Every reference tool-call reply, and one per checkpoint with text beside its
+# call (``BEFORE_KWARGS``).
+_SERVED_CASES = [pytest.param(*p.values, "", id=p.id) for p in _CASES if p.values[2]]
+_SERVED_CASES += [
+    pytest.param(case, kwargs, 1, BEFORE, id=f"{case.model}-{kwargs}-{BEFORE}-calls=1")
+    for case in MODEL_CATALOG
+    if case.resolved_renderer != "default"
+    and (kwargs := BEFORE_KWARGS.get(case.resolved_renderer, {})) is not None
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools", [TOOLS, None], ids=["tools", "no-tools"])
+@pytest.mark.parametrize("case,kwargs,calls,content", _SERVED_CASES)
+async def test_reference_tool_calls_parsed_without_tool_calls(
+    case, kwargs, calls, content, tools
+):
+    """``tool_calls=False`` serves a reply carrying tool calls, text after them
+    and ``content`` beside them as vLLM's chat path does under
+    tool_choice="none" with the pair the checkpoint is served with
+    (``vllm_parsers_for``): with the tools, the whole reply; without tools, the
+    streamed one (they differ only for an engine-based pair). No calls, finish
+    "stop", and the reasoning: vLLM's, and the reference's."""
+    tok = _tokenizer(case.model)
+    renderer = create_renderer(
+        tok,
+        config_from_name(case.resolved_renderer),
+        chat_template_kwargs=kwargs or None,
+    )
+    served = vllm_parsers_for(config_from_name(case.resolved_renderer), case.model)
+    assert served == VllmParsers(*_SERVED["pairs"][case.model])
+    sampled = tool_reply_with_text_after(
+        tok, renderer, case, kwargs, MESSAGES, TOOLS, calls, content
+    )
+    assert content in tok.decode(sampled)
+    _, _, reasoning = reference_continuation(
+        tok, case, kwargs, MESSAGES, TOOLS, calls=calls, content=content
+    )
+    result, want = await _served_without_tool_calls(
+        renderer, case.model, sampled, kwargs, tools
+    )
+    # The markup rule renderers derives from the served pair is vLLM's.
+    assert ("get_weather" in want) is not served.drops_tool_markup
+    assert (result["reasoning_content"] or "").strip() == reasoning
+    assert result["reasoning_complete"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tools", [TOOLS, None], ids=["tools", "no-tools"])
+@pytest.mark.parametrize("reply", sorted(SERVED_REPLIES))
+async def test_reply_parsed_without_tool_calls_as_vllm_serves_it(reply, tools):
+    """Replies turning on one rule of the format's vLLM parsers
+    (``SERVED_REPLIES``), parsed without tool calls."""
+    model, text = SERVED_REPLIES[reply]
+    tok = _tokenizer(model)
+    renderer = create_renderer(tok, config_from_name(MODEL_RENDERER_MAP[model]))
+    sampled = tok.encode(text, add_special_tokens=False)
+    await _served_without_tool_calls(renderer, model, sampled, {}, tools)
 
 
 @pytest.mark.asyncio

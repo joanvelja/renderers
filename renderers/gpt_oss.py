@@ -50,6 +50,7 @@ from openai_harmony import (
     load_harmony_encoding,
 )
 from renderers.base import (
+    VllmParsers,
     Message,
     ParsedResponse,
     RenderedTokens,
@@ -61,6 +62,7 @@ from renderers.base import (
     resolve_thinking_retention,
     should_rerender_for_thinking_retention,
     trim_to_turn_close,
+    without_tool_calls,
 )
 from renderers.configs import GptOssRendererConfig
 from renderers.parsing import harmony_blocks, parse_gpt_oss
@@ -120,6 +122,11 @@ def _arguments_to_str(arguments: Any) -> str:
 
 class GptOssRenderer:
     """Deterministic message → token renderer for OpenAI gpt-oss (harmony)."""
+
+    # vLLM serves gpt-oss through its Harmony parser, which keeps the analysis
+    # channel as reasoning only with the gpt-oss reasoning parser and otherwise
+    # drops it (vllm/parser/harmony.py:211, :267).
+    vllm_parsers = VllmParsers("openai", "openai_gptoss")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -504,6 +511,7 @@ class GptOssRenderer:
         *,
         tools: list[ToolSpec] | None = None,  # noqa: ARG002 — harmony args land in a JSON object, schema not needed
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         prefix = self._response_prefix(token_ids, prompt_ids)
         if not prefix and (not token_ids or token_ids[0] != self._start):
@@ -532,7 +540,7 @@ class GptOssRenderer:
             if tc.token_span is not None:
                 start, end = tc.token_span
                 tc.token_span = (max(0, start - len(prefix)), end - len(prefix))
-        return parsed
+        return parsed if tool_calls else without_tool_calls(parsed)
 
     def get_stop_token_ids(self) -> list[int]:
         return [self._return, self._call]

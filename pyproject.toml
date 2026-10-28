@@ -115,12 +115,21 @@ dev = [
 # *without* the cooldown — bypassing this security policy.
 required-version = ">=0.11.1"
 exclude-newer = "7 days"
+# Security floors (October 2026): certifi 2026.10.23 drops a further distrusted root after the
+# eMudhra compromise; pillow 13.0.0 carries the decoder fixes.
+constraint-dependencies = [
+    "certifi>=2026.10.23",
+    "pillow>=13.0.0",
+]
 
 [tool.uv.exclude-newer-package]
 # PrimeIntellect-published packages in this project's dependency closure —
 # fast-track so first-party releases can land same-day. Only packages that
 # appear in `uv tree` are listed.
 prime-pydantic-config = false
+# CA bundle: security fixes (e.g. 2026.10.19 for the eMudhra compromise) must not wait out the cooldown
+certifi = false
+pillow = false
 
 [tool.ty.environment]
 python-version = "3.13"

@@ -36,6 +36,7 @@ from urllib.parse import urlparse
 from renderers.reasoning import scan_reasoning, prompt_ends_in_reasoning
 
 from renderers.base import (
+    VllmParsers,
     Message,
     MultiModalData,
     ParsedResponse,
@@ -311,6 +312,8 @@ class Qwen3VLRenderer:
     default bridge policy therefore resolves to ``"all"``; explicit
     ``thinking_retention`` still controls whether the bridge is attempted.
     """
+
+    vllm_parsers = VllmParsers("hermes", "qwen3")
 
     @property
     def is_prefix_stable(self) -> bool:
@@ -661,10 +664,12 @@ class Qwen3VLRenderer:
         *,
         tools: list[ToolSpec] | None = None,  # noqa: ARG002 — hermes wire format quotes strings, schema not needed
         prompt_ids: list[int] | None = None,
+        tool_calls: bool = True,
     ) -> ParsedResponse:
         return parse_qwen3(
             self._tokenizer,
             token_ids,
+            scan_tool_calls=tool_calls,
             stop_ids={self._im_end, self._endoftext},
             tool_call_id=self._tool_call,
             tool_call_end_id=self._tool_call_end,

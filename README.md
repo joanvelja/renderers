@@ -76,8 +76,32 @@ Gemma, and Inkling follow their explicit channel or message-segment grammar.
 its state cannot be determined. It does not certify tool syntax, normal engine
 termination, nonempty final output, or task success. The generate client forwards
 this narrow signal and passes prompt context automatically. Custom renderers used
-with `generate` should accept `parse_response(..., tools=None, prompt_ids=None)`;
-formats that do not need prompt context can ignore it.
+with `generate` should accept `parse_response(..., tools=None, prompt_ids=None,
+tool_calls=True)`; formats that do not need prompt context can ignore it.
+
+Each renderer declares the vLLM parser pair its format is served with,
+`vllm_parsers = VllmParsers(tool, reasoning)`, named as in the vLLM release
+`VLLM_CHAT_PARITY`. A checkpoint served differently has its own pair in
+`MODEL_VLLM_PARSERS`: one whose default reply opens no think block
+(Qwen3-*-Instruct-2507, Qwen3-VL-*-Instruct, Kimi-K2-Instruct, Qwen3.5-0.8B/2B)
+is served without a reasoning parser, under which vLLM would read that reply as
+reasoning. `vllm_parsers_for(config, model)` returns the pair to serve, without a
+tokenizer, for whoever launches vLLM. `parse_response(..., tool_calls=False)`
+(and `generate(..., tool_calls=False)`) parses a reply as vLLM's chat path serves
+it under that pair with `tool_choice="none"`: with the tools, its whole reply;
+without tools, its streamed reply for an engine-based pair, else its one reply
+(a legacy pair serves the same reply whole and streamed, except Muse Glimmer's,
+whose whole reply this is). No tool calls, the reasoning split unchanged, and the
+tool-call markup kept in the content (a legacy tool parser) or dropped from it
+(an engine-based pair, or Harmony), as `VllmParsers.drops_tool_markup` derives.
+`tests/fixtures/vllm_chat_content.json` pins the content and reasoning vLLM
+serves for each reference reply (`tests/vllm_chat_reference.py` regenerates
+it); where vLLM's pair leaves the reasoning in the content and renderers splits
+it off (Hy3 under `reasoning_effort` `no_think`, MiniMax-M2.5, Laguna-S-2.1
+unless the request turns thinking on, Qwen3.5-0.8B/2B with thinking on), it pins
+the content after vLLM's reasoning closer, and the regeneration refuses any
+other checkpoint doing so. A renderer that parses tool calls but pins no pair
+(`DefaultRenderer` with a `tool_parser`) refuses the parse.
 
 Summary consumers should require normal termination (`finish_reason="stop"`),
 nonempty final content, and no tool calls. A length-limited final answer remains
@@ -102,9 +126,11 @@ Hand-coded renderers ship for `qwen3`, `qwen3-vl`, `qwen3.5`, `qwen3.6`, `qwen3.
 class Renderer(Protocol):
     @property
     def is_prefix_stable(self) -> bool: ...
+    @property
+    def vllm_parsers(self) -> VllmParsers | None: ...
     def render(messages, *, tools=None, add_generation_prompt=False) -> RenderedTokens: ...
     def render_ids(messages, *, tools=None, add_generation_prompt=False) -> list[int]: ...
-    def parse_response(token_ids) -> ParsedResponse: ...
+    def parse_response(token_ids, *, tools=None, prompt_ids=None, tool_calls=True) -> ParsedResponse: ...
     def get_stop_token_ids() -> list[int]: ...
     def bridge_to_next_turn(prev_prompt_ids, prev_completion_ids, new_messages, *, tools=None) -> list[int] | None: ...
 ```
@@ -272,7 +298,7 @@ Downstream TOML configs select it the same way, with `name = "custom"` and an `i
 
 ## `DefaultRenderer`
 
-Fallback for unsupported text-only models. Wraps `apply_chat_template` and accepts `tool_parser` / `reasoning_parser` (vLLM convention) plus arbitrary Jinja kwargs via `DefaultRendererConfig`'s `extra="allow"`. Explicit `thinking_retention` is rejected: `bridge_to_next_turn` returns `None` because the template's close is unknown, so multi-turn rollouts fall back to full re-render. Implementing a hand-coded renderer is a few hundred lines of Python (`render_ids` + `parse_response` + `bridge_to_next_turn`) and is the only path that closes the failure modes above by construction.
+Fallback for unsupported text-only models. Wraps `apply_chat_template` and accepts `tool_parser` / `reasoning_parser` (vLLM convention) plus arbitrary Jinja kwargs via `DefaultRendererConfig`'s `extra="allow"`. Without a `tool_parser` it parses no tool calls (`supports_tools` is False, as a custom renderer may declare too), so `generate` refuses tools for it with `ToolsUnsupportedError` before anything is rendered. Explicit `thinking_retention` is rejected: `bridge_to_next_turn` returns `None` because the template's close is unknown, so multi-turn rollouts fall back to full re-render. Implementing a hand-coded renderer is a few hundred lines of Python (`render_ids` + `parse_response` + `bridge_to_next_turn`) and is the only path that closes the failure modes above by construction.
 
 ## Roadmap
 

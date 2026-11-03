@@ -6,8 +6,12 @@ import pytest
 from parity import models_for
 
 from renderers import Gemma4Renderer, create_renderer
-from renderers.base import MODEL_RENDERER_MAP, MULTIMODAL_MODELS, load_tokenizer
+from renderers.base import MODEL_RENDERER_MAP, MULTIMODAL_MODELS
 from renderers.configs import Gemma4RendererConfig
+from tests.model_assets import load_test_processor
+from tests.model_assets import load_test_tokenizer as load_tokenizer
+
+pytestmark = pytest.mark.model
 
 
 _MODELS = tuple(case.model for case in models_for("gemma-checkpoints"))
@@ -283,7 +287,9 @@ def test_parser_recovers_prompt_opened_post_tool_reasoning():
 def _image_renderer():
     """A Gemma 4 renderer with a live ``Gemma4Processor``, or a skip."""
     tokenizer, _ = _gemma4()
-    renderer = Gemma4Renderer(tokenizer)
+    renderer = Gemma4Renderer(
+        tokenizer, processor=load_test_processor("google/gemma-4-31B-it")
+    )
     try:
         renderer._get_processor()
     except (RuntimeError, OSError) as exc:  # pragma: no cover - env dependent
@@ -297,6 +303,7 @@ def _tiny_image():
     return Image.new("RGB", (224, 224), color=(128, 192, 255))
 
 
+@pytest.mark.multimodal
 @pytest.mark.parametrize("size", [(224, 224), (448, 224), (224, 448)])
 def test_real_processor_keeps_one_batched_row_per_image(size):
     """Guard the ``MultiModalFieldConfig.batched('image')`` contract with
@@ -317,6 +324,7 @@ def test_real_processor_keeps_one_batched_row_per_image(size):
     assert placeholder.length > 0
 
 
+@pytest.mark.multimodal
 def test_schema_unified_image_parts_still_expand_image_tokens():
     """``Dataset.from_list`` unifies the Arrow schema across a content list,
     so an image part round-tripped through a dataset carries ``text: None``
@@ -359,6 +367,7 @@ def test_schema_unified_image_parts_still_expand_image_tokens():
     )
 
 
+@pytest.mark.multimodal
 def test_schema_unified_tool_response_image_parts_survive():
     """Same hazard on the tool-response path, which also has to keep
     accepting untyped text parts."""
@@ -518,30 +527,48 @@ _WEATHER_TOOLS = [
 ]
 
 
-def _weather_call(index: int, city: str, content: str, reasoning: str | None):
+def _weather_call(index: int, cities: list[str], content: str, reasoning: str | None):
+    """Assistant turn ``index``: one ``weather`` call per city, in order."""
     return {
         "role": "assistant",
         "reasoning_content": reasoning,
         "content": content,
         "tool_calls": [
             {
-                "id": f"call-{index}",
+                "id": f"call-{index}-{k}",
                 "type": "function",
                 "function": {"name": "weather", "arguments": {"city": city}},
             }
+            for k, city in enumerate(cities)
         ],
     }
 
 
+def _weather_responses(index: int, cities: list[str]):
+    """The tool responses to ``_weather_call(index, cities, ...)``, in call order."""
+    return [
+        {
+            "role": "tool",
+            "tool_call_id": f"call-{index}-{k}",
+            "content": f'{{"temperature": {20 + k}}}',
+        }
+        for k in range(len(cities))
+    ]
+
+
 @pytest.mark.parametrize("enable_thinking", [False, True])
 @pytest.mark.parametrize("cycles", [1, 2])
-def test_content_before_tool_call_rerenders_as_sampled(enable_thinking, cycles):
-    """Visible content on a tool-calling turn precedes its calls in the stream.
+@pytest.mark.parametrize("calls", [1, 2])
+def test_content_before_tool_call_rerenders_as_sampled(enable_thinking, cycles, calls):
+    """Visible content on a tool-calling turn precedes all its calls in the stream.
 
     Generation halts at ``<|tool_response>`` right after the calls, so a
-    sampled ``[thought] prose <|tool_call>...<tool_call|>`` turn can only carry
-    its prose before the call. A full re-render of the parsed messages must
-    reproduce that stream byte for byte, across one and two tool cycles.
+    sampled ``[thought] prose <|tool_call>A<tool_call|>[<|tool_call>B<tool_call|>]``
+    turn can only carry its prose before its calls. Re-rendering the parsed
+    messages must reproduce that stream byte for byte, across one and two tool
+    cycles of one or two calls each: the open turn, the bridged prompt once its
+    responses land, and the completed episode. Prose moved after a call, or
+    after the responses where the template places it, breaks it.
     """
     tokenizer, _ = _gemma4()
     renderer = Gemma4Renderer(
@@ -551,50 +578,59 @@ def test_content_before_tool_call_rerenders_as_sampled(enable_thinking, cycles):
     def encode(text: str) -> list[int]:
         return tokenizer.encode(text, add_special_tokens=False)
 
-    user = {"role": "user", "content": "Weather in Berlin and Paris?"}
+    user = {"role": "user", "content": "Weather in Berlin, Paris, Rome and Oslo?"}
     stream = renderer.render_ids(
         [user], tools=_WEATHER_TOOLS, add_generation_prompt=True
     )
     messages = [user]
-    for index, city in enumerate(["Berlin", "Paris"][:cycles]):
+    turns = [["Berlin", "Paris"], ["Rome", "Oslo"]]
+    for index, turn_cities in enumerate(turns[:cycles]):
+        cities = turn_cities[:calls]
         thought = ""
         if enable_thinking:
             # The first turn samples its own opener; after a tool response the
             # bridged prompt already ends with ``<|channel>thought\n``.
             opener = "<|channel>thought\n" if index == 0 else ""
-            thought = f"{opener}Need {city}.\n<channel|>"
+            thought = f"{opener}Need {' and '.join(cities)}.\n<channel|>"
+        prose = f"Checking {' and '.join(cities)}."
         completion = encode(
-            f"{thought}Checking {city}."
-            f'<|tool_call>call:weather{{city:<|"|>{city}<|"|>}}<tool_call|>'
-            "<|tool_response>"
+            thought
+            + prose
+            + "".join(
+                f'<|tool_call>call:weather{{city:<|"|>{city}<|"|>}}<tool_call|>'
+                for city in cities
+            )
+            + "<|tool_response>"
         )
         parsed = renderer.parse_response(
             completion, tools=_WEATHER_TOOLS, prompt_ids=stream
         )
-        assert parsed.content == f"Checking {city}."
-        assert [call.name for call in parsed.tool_calls] == ["weather"]
+        assert parsed.content == prose
+        assert [(call.name, call.arguments) for call in parsed.tool_calls] == [
+            ("weather", {"city": city}) for city in cities
+        ]
         assert parsed.reasoning_content == (
-            f"Need {city}." if enable_thinking else None
+            f"Need {' and '.join(cities)}." if enable_thinking else None
+        )
+        turn = _weather_call(index, cities, parsed.content, parsed.reasoning_content)
+        assert renderer.render_ids([*messages, turn], tools=_WEATHER_TOOLS) == (
+            stream + completion
         )
 
-        tool_response = {
-            "role": "tool",
-            "tool_call_id": f"call-{index}",
-            "content": f'{{"temperature": {20 + index}}}',
-        }
+        responses = _weather_responses(index, cities)
         bridged = renderer.bridge_to_next_turn(
-            stream, completion, [tool_response], tools=_WEATHER_TOOLS
+            stream, completion, responses, tools=_WEATHER_TOOLS
         )
         assert bridged is not None
         assert bridged.token_ids[: len(stream) + len(completion)] == stream + completion
+        messages += [turn, *responses]
+        assert bridged.token_ids == renderer.render_ids(
+            messages, tools=_WEATHER_TOOLS, add_generation_prompt=True
+        )
         stream = list(bridged.token_ids)
-        messages += [
-            _weather_call(index, city, parsed.content, parsed.reasoning_content),
-            tool_response,
-        ]
 
     final_thought = "Done.\n<channel|>" if enable_thinking else ""
-    final = encode(f"{final_thought}Berlin 20 C, Paris 21 C.") + [renderer._turn_end]
+    final = encode(f"{final_thought}All checked.") + [renderer._turn_end]
     parsed_final = renderer.parse_response(
         final, tools=_WEATHER_TOOLS, prompt_ids=stream
     )
@@ -626,12 +662,8 @@ def test_bridge_after_tool_response_matches_rerender_with_pre_call_content(
     )
     user = {"role": "user", "content": "Weather in Berlin?"}
     reasoning = "Need Berlin." if enable_thinking else None
-    call = _weather_call(0, "Berlin", "Checking Berlin.", reasoning)
-    tool_response = {
-        "role": "tool",
-        "tool_call_id": "call-0",
-        "content": '{"temperature": 20}',
-    }
+    call = _weather_call(0, ["Berlin"], "Checking Berlin.", reasoning)
+    responses = _weather_responses(0, ["Berlin"])
 
     prompt = renderer.render_ids(
         [user], tools=_WEATHER_TOOLS, add_generation_prompt=True
@@ -644,36 +676,36 @@ def test_bridge_after_tool_response_matches_rerender_with_pre_call_content(
     assert completion[-1] == renderer._tool_response_start
 
     bridged = renderer.bridge_to_next_turn(
-        prompt, completion, [tool_response], tools=_WEATHER_TOOLS
+        prompt, completion, responses, tools=_WEATHER_TOOLS
     )
     assert bridged is not None
     assert bridged.token_ids == renderer.render_ids(
-        [user, call, tool_response], tools=_WEATHER_TOOLS, add_generation_prompt=True
+        [user, call, *responses], tools=_WEATHER_TOOLS, add_generation_prompt=True
     )
 
 
-def test_content_before_tool_call_is_a_documented_template_deviation():
-    """Pins the stock template's behaviour so its eventual fix is noticed.
+@pytest.mark.parametrize("calls", [1, 2])
+def test_content_before_tool_call_is_a_documented_template_deviation(calls):
+    """Pins the stock template's placement so a change to it is noticed.
 
-    Google's template renders a tool-calling message's content after the
-    folded tool response and then closes the turn (HF discussion #115, open
-    since revision 842da37). The renderer deviates on purpose: content goes
-    before the calls, where the sampled stream has it, and the turn stays open
-    after the responses. With a later assistant message the turn close is
-    absent in both, so only the content moves; mid-episode the template also
-    emits a ``<turn|>`` that the renderer omits. When this test fails because
-    the template changed, drop the deviation.
+    Google's template renders a tool-calling message's content after its calls
+    and the folded tool responses, then closes the turn: the order the model
+    was trained on (tool_calls → tool_responses → content, per vLLM #42776).
+    When the model samples prose before a call, the stream has it there, and
+    the trainer needs re-render and bridge byte-identical to that stream, so
+    the renderer keeps the prose before the calls and leaves the turn open
+    after the responses, whatever the template does. With a later assistant
+    message the turn close is absent in both, so only the prose moves;
+    mid-episode the template also emits a ``<turn|>`` that the renderer omits.
+    Pinned for one call and for two calls in the turn.
     """
     tokenizer, _ = _gemma4()
     renderer = Gemma4Renderer(tokenizer, Gemma4RendererConfig(enable_thinking=True))
-    prose = "Checking Berlin."
-    user = {"role": "user", "content": "Weather in Berlin?"}
-    call = _weather_call(0, "Berlin", prose, "Need Berlin.")
-    tool_response = {
-        "role": "tool",
-        "tool_call_id": "call-0",
-        "content": '{"temperature": 20}',
-    }
+    prose = "Checking the weather."
+    cities = ["Berlin", "Paris"][:calls]
+    user = {"role": "user", "content": "Weather in Berlin and Paris?"}
+    call = _weather_call(0, cities, prose, "Need the weather.")
+    responses = _weather_responses(0, cities)
     final = {"role": "assistant", "reasoning_content": "Done.", "content": "20 C."}
 
     def template(messages):
@@ -684,11 +716,12 @@ def test_content_before_tool_call_is_a_documented_template_deviation():
     def ours(messages):
         return tokenizer.decode(renderer.render_ids(messages, tools=_WEATHER_TOOLS))
 
-    completed = [user, call, tool_response, final]
-    assert template(completed).index("<tool_response|>") < template(completed).index(
+    completed = [user, call, *responses, final]
+    assert template(completed).rindex("<tool_response|>") < template(completed).index(
         prose
     )
     rendered = ours(completed)
+    assert rendered.count("<|tool_call>") == calls
     assert (
         rendered.index("<channel|>")
         < rendered.index(prose)
@@ -696,7 +729,7 @@ def test_content_before_tool_call_is_a_documented_template_deviation():
     )
     assert rendered.replace(prose, "") == template(completed).replace(prose, "")
 
-    mid_episode = [user, call, tool_response]
+    mid_episode = [user, call, *responses]
     assert template(mid_episode).endswith(f"<tool_response|>{prose}<turn|>\n")
     assert ours(mid_episode).endswith("<tool_response|>")
     assert ours(mid_episode).replace(prose, "") + f"{prose}<turn|>\n" == template(

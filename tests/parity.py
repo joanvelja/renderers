@@ -202,6 +202,7 @@ MODEL_CATALOG = (
             "tool-call-content",
             "tool-call-none",
             "multiple-tool-calls",
+            "multiple-tool-calls-content",
             "tool-response",
             "named-tool-response",
             "consecutive-tool-responses",
@@ -217,6 +218,7 @@ MODEL_CATALOG = (
             "tool-call-content",
             "tool-call-none",
             "multiple-tool-calls",
+            "multiple-tool-calls-content",
             "tool-response",
             "named-tool-response",
             "consecutive-tool-responses",
@@ -246,7 +248,11 @@ MODEL_CATALOG = (
     _model(
         "meta-llama/Llama-3.2-1B-Instruct",
         bridge=True,
-        excluded={"multiple-tool-calls", "consecutive-tool-responses"},
+        excluded={
+            "multiple-tool-calls",
+            "multiple-tool-calls-content",
+            "consecutive-tool-responses",
+        },
         oracle_defaults={"date_string": "26 Jul 2024"},
         extra_suites={"llama-checkpoints"},
     ),
@@ -254,7 +260,11 @@ MODEL_CATALOG = (
         "meta-llama/Llama-3.2-3B-Instruct",
         shared=False,
         roundtrip=False,
-        excluded={"multiple-tool-calls", "consecutive-tool-responses"},
+        excluded={
+            "multiple-tool-calls",
+            "multiple-tool-calls-content",
+            "consecutive-tool-responses",
+        },
         oracle_defaults={"date_string": "26 Jul 2024"},
         extra_suites={"llama-checkpoints"},
     ),
@@ -487,6 +497,21 @@ SCENARIOS = (
         tools=TOOLS,
     ),
     _scenario(
+        "multiple-tool-calls-content",
+        [
+            {"role": "user", "content": "Weather in Paris and London?"},
+            {
+                "role": "assistant",
+                "content": "Let me check both.",
+                "tool_calls": [
+                    _call("Paris", id="call_1"),
+                    _call("London", id="call_2"),
+                ],
+            },
+        ],
+        tools=TOOLS,
+    ),
+    _scenario(
         "tool-response",
         [
             {"role": "user", "content": "Weather?"},
@@ -660,7 +685,13 @@ SCENARIOS = (
             {"role": "system", "content": "Late instruction"},
             {"role": "user", "content": "B"},
         ],
-        only_renderers={"laguna-xs-2.1", "laguna-s-2.1"},
+        only_renderers={
+            "laguna-xs-2.1",
+            "laguna-s-2.1",
+            "nemotron-3",
+            "nemotron-3-ultra",
+            "nemotron-3.5",
+        },
     ),
     _scenario(
         "tool-declare-message",
@@ -747,10 +778,16 @@ def scenario_is_valid(
 ) -> bool:
     if scenario.id in case.excluded_scenarios:
         return False
-    # Gemma 4 places visible tool-call content before the calls, where it
-    # occurs in the sampled stream. The template places it after them
-    # (HF discussion #115); test_gemma4.py pins this intentional deviation.
-    if case.resolved_renderer == "gemma4" and scenario.id == "tool-call-content":
+    # Gemma 4's template renders an assistant turn's content after its calls
+    # and their responses: Google's training order (tool_calls →
+    # tool_responses → content, per vLLM #42776). When the model samples prose
+    # before a call, the trainer must reproduce that sampled stream, so the HF
+    # oracle doesn't apply to prose + calls; test_gemma4.py pins the sampled
+    # order (7263bf0).
+    if case.resolved_renderer == "gemma4" and scenario.id in {
+        "tool-call-content",
+        "multiple-tool-calls-content",
+    }:
         return False
     if (
         scenario.only_renderers

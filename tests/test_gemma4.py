@@ -745,16 +745,17 @@ def test_bridge_after_tool_response_matches_rerender_with_pre_call_content(
 
 
 def test_content_before_tool_call_is_a_documented_template_deviation():
-    """Pins the stock template's behaviour so its eventual fix is noticed.
+    """Pins the stock template's placement so a change to it is noticed.
 
-    Google's template renders a tool-calling message's content after the
-    folded tool response and then closes the turn (HF discussion #115, open
-    since revision 842da37). The renderer deviates on purpose: content goes
-    before the calls, where the sampled stream has it, and the turn stays open
-    after the responses. With a later assistant message the turn close is
-    absent in both, so only the content moves; mid-episode the template also
-    emits a ``<turn|>`` that the renderer omits. When this test fails because
-    the template changed, drop the deviation.
+    Google's template renders a tool-calling message's content after its calls
+    and the folded tool responses, then closes the turn: the order the model
+    was trained on (tool_calls → tool_responses → content, per vLLM #42776).
+    When the model samples prose before a call, the stream has it there, and
+    the trainer needs re-render and bridge byte-identical to that stream, so
+    the renderer keeps the prose before the calls and leaves the turn open
+    after the responses, whatever the template does. With a later assistant
+    message the turn close is absent in both, so only the prose moves;
+    mid-episode the template also emits a ``<turn|>`` that the renderer omits.
     """
     tokenizer, _ = _gemma4()
     renderer = Gemma4Renderer(tokenizer, Gemma4RendererConfig(enable_thinking=True))

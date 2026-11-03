@@ -778,10 +778,12 @@ def scenario_is_valid(
 ) -> bool:
     if scenario.id in case.excluded_scenarios:
         return False
-    # Gemma 4 places visible tool-call content before the calls, where it
-    # occurs in the sampled stream (7263bf0). The template places it after
-    # them, a template bug Google acknowledges in HF discussion #115;
-    # test_gemma4.py pins this intentional deviation.
+    # Gemma 4's template renders an assistant turn's content after its calls
+    # and their responses: Google's training order (tool_calls →
+    # tool_responses → content, per vLLM #42776). When the model samples prose
+    # before a call, the trainer must reproduce that sampled stream, so the HF
+    # oracle doesn't apply to prose + calls; test_gemma4.py pins the sampled
+    # order (7263bf0).
     if case.resolved_renderer == "gemma4" and scenario.id in {
         "tool-call-content",
         "multiple-tool-calls-content",

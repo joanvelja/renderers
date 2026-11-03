@@ -779,9 +779,13 @@ def scenario_is_valid(
     if scenario.id in case.excluded_scenarios:
         return False
     # Gemma 4 places visible tool-call content before the calls, where it
-    # occurs in the sampled stream. The template places it after them
-    # (HF discussion #115); test_gemma4.py pins this intentional deviation.
-    if case.resolved_renderer == "gemma4" and scenario.id == "tool-call-content":
+    # occurs in the sampled stream (7263bf0). The template places it after
+    # them, a template bug Google acknowledges in HF discussion #115;
+    # test_gemma4.py pins this intentional deviation.
+    if case.resolved_renderer == "gemma4" and scenario.id in {
+        "tool-call-content",
+        "multiple-tool-calls-content",
+    }:
         return False
     if (
         scenario.only_renderers

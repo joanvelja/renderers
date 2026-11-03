@@ -1501,13 +1501,14 @@ def _require_tokens(tok: Any, name_or_path: str) -> None:
         )
 
 
-def load_tokenizer(model_name_or_path: str):
+def load_tokenizer(model_name_or_path: str, *, revision: str | None = None):
     """Load a tokenizer with the renderers-package security policy.
 
     Default ``trust_remote_code=False``. Models listed in
     ``TRUSTED_REVISIONS`` (Moonshot Kimi-K2 family) load with
     ``trust_remote_code=True`` AND a pinned ``revision=<sha>`` so
     transformers only executes the reviewed commit's tokenizer Python.
+    ``revision`` pins ordinary assets without overriding reviewed remote code.
 
     ``AutoTokenizer.from_pretrained`` eagerly builds the model config to
     resolve the tokenizer class. If that construction raises on a
@@ -1529,6 +1530,11 @@ def load_tokenizer(model_name_or_path: str):
         _require_transformers("Loading a tokenizer")
         load_name_or_path = _tokenizer_source_for(model_name_or_path)
         kwargs = _tokenizer_load_kwargs(load_name_or_path)
+        if revision is not None:
+            trusted_revision = kwargs.get("revision")
+            if trusted_revision is not None and revision != trusted_revision:
+                raise ValueError("Cannot override the reviewed remote-code revision")
+            kwargs["revision"] = revision
         tok = _load_tokenizer_via_auto(load_name_or_path, **kwargs)
         _require_tokens(tok, load_name_or_path)
         return _preserve_requested_tokenizer_name(

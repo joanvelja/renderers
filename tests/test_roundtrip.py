@@ -26,14 +26,12 @@ from reference_continuations import (
 from replay import assert_evidence, replay_client
 
 from renderers import VLLM_CHAT_PARITY, VllmParsers, create_renderer
-from renderers.base import (
-    MODEL_RENDERER_MAP,
-    ToolCallParseStatus,
-    load_tokenizer,
-    vllm_parsers_for,
-)
+from renderers.base import MODEL_RENDERER_MAP, ToolCallParseStatus, vllm_parsers_for
 from renderers.client import generate
 from renderers.configs import config_from_name
+from tests.model_assets import load_test_tokenizer as load_tokenizer
+
+pytestmark = pytest.mark.model
 
 
 # Both matrices visit checkpoints in groups; reuse within each group only.

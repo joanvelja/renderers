@@ -527,19 +527,33 @@ _WEATHER_TOOLS = [
 ]
 
 
-def _weather_call(index: int, city: str, content: str, reasoning: str | None):
+def _weather_call(index: int, cities: list[str], content: str, reasoning: str | None):
+    """Assistant turn ``index``: one ``weather`` call per city, in order."""
     return {
         "role": "assistant",
         "reasoning_content": reasoning,
         "content": content,
         "tool_calls": [
             {
-                "id": f"call-{index}",
+                "id": f"call-{index}-{k}",
                 "type": "function",
                 "function": {"name": "weather", "arguments": {"city": city}},
             }
+            for k, city in enumerate(cities)
         ],
     }
+
+
+def _weather_responses(index: int, cities: list[str]):
+    """The tool responses to ``_weather_call(index, cities, ...)``, in call order."""
+    return [
+        {
+            "role": "tool",
+            "tool_call_id": f"call-{index}-{k}",
+            "content": f'{{"temperature": {20 + k}}}',
+        }
+        for k in range(len(cities))
+    ]
 
 
 @pytest.mark.parametrize("enable_thinking", [False, True])
@@ -586,20 +600,16 @@ def test_content_before_tool_call_rerenders_as_sampled(enable_thinking, cycles):
             f"Need {city}." if enable_thinking else None
         )
 
-        tool_response = {
-            "role": "tool",
-            "tool_call_id": f"call-{index}",
-            "content": f'{{"temperature": {20 + index}}}',
-        }
+        responses = _weather_responses(index, [city])
         bridged = renderer.bridge_to_next_turn(
-            stream, completion, [tool_response], tools=_WEATHER_TOOLS
+            stream, completion, responses, tools=_WEATHER_TOOLS
         )
         assert bridged is not None
         assert bridged.token_ids[: len(stream) + len(completion)] == stream + completion
         stream = list(bridged.token_ids)
         messages += [
-            _weather_call(index, city, parsed.content, parsed.reasoning_content),
-            tool_response,
+            _weather_call(index, [city], parsed.content, parsed.reasoning_content),
+            *responses,
         ]
 
     final_thought = "Done.\n<channel|>" if enable_thinking else ""
@@ -718,12 +728,8 @@ def test_bridge_after_tool_response_matches_rerender_with_pre_call_content(
     )
     user = {"role": "user", "content": "Weather in Berlin?"}
     reasoning = "Need Berlin." if enable_thinking else None
-    call = _weather_call(0, "Berlin", "Checking Berlin.", reasoning)
-    tool_response = {
-        "role": "tool",
-        "tool_call_id": "call-0",
-        "content": '{"temperature": 20}',
-    }
+    call = _weather_call(0, ["Berlin"], "Checking Berlin.", reasoning)
+    responses = _weather_responses(0, ["Berlin"])
 
     prompt = renderer.render_ids(
         [user], tools=_WEATHER_TOOLS, add_generation_prompt=True
@@ -736,15 +742,16 @@ def test_bridge_after_tool_response_matches_rerender_with_pre_call_content(
     assert completion[-1] == renderer._tool_response_start
 
     bridged = renderer.bridge_to_next_turn(
-        prompt, completion, [tool_response], tools=_WEATHER_TOOLS
+        prompt, completion, responses, tools=_WEATHER_TOOLS
     )
     assert bridged is not None
     assert bridged.token_ids == renderer.render_ids(
-        [user, call, tool_response], tools=_WEATHER_TOOLS, add_generation_prompt=True
+        [user, call, *responses], tools=_WEATHER_TOOLS, add_generation_prompt=True
     )
 
 
-def test_content_before_tool_call_is_a_documented_template_deviation():
+@pytest.mark.parametrize("calls", [1, 2])
+def test_content_before_tool_call_is_a_documented_template_deviation(calls):
     """Pins the stock template's placement so a change to it is noticed.
 
     Google's template renders a tool-calling message's content after its calls
@@ -756,17 +763,15 @@ def test_content_before_tool_call_is_a_documented_template_deviation():
     after the responses, whatever the template does. With a later assistant
     message the turn close is absent in both, so only the prose moves;
     mid-episode the template also emits a ``<turn|>`` that the renderer omits.
+    Pinned for one call and for two calls in the turn.
     """
     tokenizer, _ = _gemma4()
     renderer = Gemma4Renderer(tokenizer, Gemma4RendererConfig(enable_thinking=True))
-    prose = "Checking Berlin."
-    user = {"role": "user", "content": "Weather in Berlin?"}
-    call = _weather_call(0, "Berlin", prose, "Need Berlin.")
-    tool_response = {
-        "role": "tool",
-        "tool_call_id": "call-0",
-        "content": '{"temperature": 20}',
-    }
+    prose = "Checking the weather."
+    cities = ["Berlin", "Paris"][:calls]
+    user = {"role": "user", "content": "Weather in Berlin and Paris?"}
+    call = _weather_call(0, cities, prose, "Need the weather.")
+    responses = _weather_responses(0, cities)
     final = {"role": "assistant", "reasoning_content": "Done.", "content": "20 C."}
 
     def template(messages):
@@ -777,11 +782,12 @@ def test_content_before_tool_call_is_a_documented_template_deviation():
     def ours(messages):
         return tokenizer.decode(renderer.render_ids(messages, tools=_WEATHER_TOOLS))
 
-    completed = [user, call, tool_response, final]
-    assert template(completed).index("<tool_response|>") < template(completed).index(
+    completed = [user, call, *responses, final]
+    assert template(completed).rindex("<tool_response|>") < template(completed).index(
         prose
     )
     rendered = ours(completed)
+    assert rendered.count("<|tool_call>") == calls
     assert (
         rendered.index("<channel|>")
         < rendered.index(prose)
@@ -789,7 +795,7 @@ def test_content_before_tool_call_is_a_documented_template_deviation():
     )
     assert rendered.replace(prose, "") == template(completed).replace(prose, "")
 
-    mid_episode = [user, call, tool_response]
+    mid_episode = [user, call, *responses]
     assert template(mid_episode).endswith(f"<tool_response|>{prose}<turn|>\n")
     assert ours(mid_episode).endswith("<tool_response|>")
     assert ours(mid_episode).replace(prose, "") + f"{prose}<turn|>\n" == template(

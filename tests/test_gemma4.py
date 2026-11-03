@@ -558,13 +558,17 @@ def _weather_responses(index: int, cities: list[str]):
 
 @pytest.mark.parametrize("enable_thinking", [False, True])
 @pytest.mark.parametrize("cycles", [1, 2])
-def test_content_before_tool_call_rerenders_as_sampled(enable_thinking, cycles):
-    """Visible content on a tool-calling turn precedes its calls in the stream.
+@pytest.mark.parametrize("calls", [1, 2])
+def test_content_before_tool_call_rerenders_as_sampled(enable_thinking, cycles, calls):
+    """Visible content on a tool-calling turn precedes all its calls in the stream.
 
     Generation halts at ``<|tool_response>`` right after the calls, so a
-    sampled ``[thought] prose <|tool_call>...<tool_call|>`` turn can only carry
-    its prose before the call. A full re-render of the parsed messages must
-    reproduce that stream byte for byte, across one and two tool cycles.
+    sampled ``[thought] prose <|tool_call>A<tool_call|>[<|tool_call>B<tool_call|>]``
+    turn can only carry its prose before its calls. Re-rendering the parsed
+    messages must reproduce that stream byte for byte, across one and two tool
+    cycles of one or two calls each: the open turn, the bridged prompt once its
+    responses land, and the completed episode. Prose moved after a call, or
+    after the responses where the template places it, breaks it.
     """
     tokenizer, _ = _gemma4()
     renderer = Gemma4Renderer(
@@ -574,46 +578,59 @@ def test_content_before_tool_call_rerenders_as_sampled(enable_thinking, cycles):
     def encode(text: str) -> list[int]:
         return tokenizer.encode(text, add_special_tokens=False)
 
-    user = {"role": "user", "content": "Weather in Berlin and Paris?"}
+    user = {"role": "user", "content": "Weather in Berlin, Paris, Rome and Oslo?"}
     stream = renderer.render_ids(
         [user], tools=_WEATHER_TOOLS, add_generation_prompt=True
     )
     messages = [user]
-    for index, city in enumerate(["Berlin", "Paris"][:cycles]):
+    turns = [["Berlin", "Paris"], ["Rome", "Oslo"]]
+    for index, turn_cities in enumerate(turns[:cycles]):
+        cities = turn_cities[:calls]
         thought = ""
         if enable_thinking:
             # The first turn samples its own opener; after a tool response the
             # bridged prompt already ends with ``<|channel>thought\n``.
             opener = "<|channel>thought\n" if index == 0 else ""
-            thought = f"{opener}Need {city}.\n<channel|>"
+            thought = f"{opener}Need {' and '.join(cities)}.\n<channel|>"
+        prose = f"Checking {' and '.join(cities)}."
         completion = encode(
-            f"{thought}Checking {city}."
-            f'<|tool_call>call:weather{{city:<|"|>{city}<|"|>}}<tool_call|>'
-            "<|tool_response>"
+            thought
+            + prose
+            + "".join(
+                f'<|tool_call>call:weather{{city:<|"|>{city}<|"|>}}<tool_call|>'
+                for city in cities
+            )
+            + "<|tool_response>"
         )
         parsed = renderer.parse_response(
             completion, tools=_WEATHER_TOOLS, prompt_ids=stream
         )
-        assert parsed.content == f"Checking {city}."
-        assert [call.name for call in parsed.tool_calls] == ["weather"]
+        assert parsed.content == prose
+        assert [(call.name, call.arguments) for call in parsed.tool_calls] == [
+            ("weather", {"city": city}) for city in cities
+        ]
         assert parsed.reasoning_content == (
-            f"Need {city}." if enable_thinking else None
+            f"Need {' and '.join(cities)}." if enable_thinking else None
+        )
+        turn = _weather_call(index, cities, parsed.content, parsed.reasoning_content)
+        assert renderer.render_ids([*messages, turn], tools=_WEATHER_TOOLS) == (
+            stream + completion
         )
 
-        responses = _weather_responses(index, [city])
+        responses = _weather_responses(index, cities)
         bridged = renderer.bridge_to_next_turn(
             stream, completion, responses, tools=_WEATHER_TOOLS
         )
         assert bridged is not None
         assert bridged.token_ids[: len(stream) + len(completion)] == stream + completion
+        messages += [turn, *responses]
+        assert bridged.token_ids == renderer.render_ids(
+            messages, tools=_WEATHER_TOOLS, add_generation_prompt=True
+        )
         stream = list(bridged.token_ids)
-        messages += [
-            _weather_call(index, [city], parsed.content, parsed.reasoning_content),
-            *responses,
-        ]
 
     final_thought = "Done.\n<channel|>" if enable_thinking else ""
-    final = encode(f"{final_thought}Berlin 20 C, Paris 21 C.") + [renderer._turn_end]
+    final = encode(f"{final_thought}All checked.") + [renderer._turn_end]
     parsed_final = renderer.parse_response(
         final, tools=_WEATHER_TOOLS, prompt_ids=stream
     )
@@ -628,89 +645,6 @@ def test_content_before_tool_call_rerenders_as_sampled(enable_thinking, cycles):
 
     rerendered = renderer.render_ids(messages, tools=_WEATHER_TOOLS)
     assert rerendered == stream + encode("\n")
-
-
-@pytest.mark.parametrize("enable_thinking", [False, True])
-def test_two_tool_calls_in_one_turn_keep_their_sampled_order(enable_thinking):
-    """A turn's visible text precedes all of its calls in the stream.
-
-    A sampled ``[thought] prose <|tool_call>A<tool_call|><|tool_call>B<tool_call|>
-    <|tool_response>`` turn carries both calls after its prose. Re-rendering the
-    parsed turn must reproduce that stream byte for byte: open, after both
-    responses land, and once the episode completes. Prose moved after the calls,
-    or after the responses as the template does (HF discussion #115), breaks it.
-    """
-    tokenizer, _ = _gemma4()
-    renderer = Gemma4Renderer(
-        tokenizer, Gemma4RendererConfig(enable_thinking=enable_thinking)
-    )
-
-    def encode(text: str) -> list[int]:
-        return tokenizer.encode(text, add_special_tokens=False)
-
-    user = {"role": "user", "content": "Weather in Berlin and Paris?"}
-    prompt = renderer.render_ids(
-        [user], tools=_WEATHER_TOOLS, add_generation_prompt=True
-    )
-    thought = "<|channel>thought\nNeed both.\n<channel|>" if enable_thinking else ""
-    completion = encode(
-        f"{thought}Checking both."
-        '<|tool_call>call:weather{city:<|"|>Berlin<|"|>}<tool_call|>'
-        '<|tool_call>call:weather{city:<|"|>Paris<|"|>}<tool_call|>'
-        "<|tool_response>"
-    )
-    parsed = renderer.parse_response(
-        completion, tools=_WEATHER_TOOLS, prompt_ids=prompt
-    )
-    assert parsed.content == "Checking both."
-    assert [(call.name, call.arguments) for call in parsed.tool_calls] == [
-        ("weather", {"city": "Berlin"}),
-        ("weather", {"city": "Paris"}),
-    ]
-    turn = {
-        "role": "assistant",
-        "reasoning_content": parsed.reasoning_content,
-        "content": parsed.content,
-        "tool_calls": [
-            {
-                "id": f"call-{index}",
-                "type": "function",
-                "function": {"name": call.name, "arguments": call.arguments},
-            }
-            for index, call in enumerate(parsed.tool_calls)
-        ],
-    }
-    assert renderer.render_ids([user, turn], tools=_WEATHER_TOOLS) == (
-        prompt + completion
-    )
-
-    responses = [
-        {"role": "tool", "tool_call_id": "call-0", "content": '{"temperature": 20}'},
-        {"role": "tool", "tool_call_id": "call-1", "content": '{"temperature": 21}'},
-    ]
-    bridged = renderer.bridge_to_next_turn(
-        prompt, completion, responses, tools=_WEATHER_TOOLS
-    )
-    assert bridged is not None
-    stream = list(bridged.token_ids)
-    assert stream[: len(prompt) + len(completion)] == prompt + completion
-    assert stream == renderer.render_ids(
-        [user, turn, *responses], tools=_WEATHER_TOOLS, add_generation_prompt=True
-    )
-
-    final_thought = "Done.\n<channel|>" if enable_thinking else ""
-    final = encode(f"{final_thought}Berlin 20 C, Paris 21 C.") + [renderer._turn_end]
-    parsed_final = renderer.parse_response(
-        final, tools=_WEATHER_TOOLS, prompt_ids=stream
-    )
-    answer = {
-        "role": "assistant",
-        "reasoning_content": parsed_final.reasoning_content,
-        "content": parsed_final.content,
-    }
-    assert renderer.render_ids(
-        [user, turn, *responses, answer], tools=_WEATHER_TOOLS
-    ) == stream + final + encode("\n")
 
 
 @pytest.mark.parametrize("enable_thinking", [False, True])

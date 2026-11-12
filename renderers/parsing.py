@@ -1136,6 +1136,11 @@ def parse_deepseek_v3(
           <｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n{args}\\n```<｜tool▁call▁end｜>
         <｜tool▁calls▁end｜>
 
+    With tool calls, the content is the text before the section and after its
+    last ``<｜tool▁calls▁end｜>``, as vLLM's ``deepseek_v3`` tool parser serves it
+    under tool_choice="auto" (``deepseekv3_tool_parser.py:113-119``); a section
+    without that closer has no text after it.
+
     ``scan_tool_calls=False`` leaves the markup in the content, as a legacy
     vLLM tool parser serves a reply without tool calls.
     """
@@ -1166,8 +1171,12 @@ def parse_deepseek_v3(
         _find(ids, tool_calls_begin_id, reasoning_end) if scan_tool_calls else -1
     )
     tool_calls: list[ParsedToolCall] = []
+    after_section: list[int] = []
     if tc_section_start != -1:
         content_ids = ids[:tc_section_start]
+        closers = _find_all(ids[tc_section_start:], tool_calls_end_id)
+        if closers:
+            after_section = ids[tc_section_start + closers[-1] + 1 :]
         tool_calls = _parse_deepseek_tool_calls(
             tokenizer,
             ids[tc_section_start:],
@@ -1188,6 +1197,7 @@ def parse_deepseek_v3(
         before, _, after = text.partition("</think>")
         reasoning = boundary.text.strip()
         text = after.lstrip("\n")
+    text += _decode(tokenizer, after_section)
 
     return ParsedResponse(
         content=text.strip(),

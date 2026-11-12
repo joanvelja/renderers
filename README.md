@@ -95,9 +95,14 @@ without tools, its streamed reply for an engine-based pair, else its one reply
 whose whole reply this is). No tool calls, the reasoning split unchanged, and the
 tool-call markup kept in the content (a legacy tool parser) or dropped from it
 (an engine-based pair, or Harmony), as `VllmParsers.drops_tool_markup` derives.
+With tool calls, the parse is vLLM's chat path under `tool_choice="auto"` (its
+whole reply, with the tools) for the `deepseek_v3` tool parser (DeepSeek V3 and
+R1) only: the content is the text before the tool-call section and after its
+last `<｜tool▁calls▁end｜>`. For any other tool parser, renderers claims nothing
+about the content vLLM serves next to tool calls.
 `tests/fixtures/vllm_chat_content.json` pins the content and reasoning vLLM
-serves for each reference reply (`tests/vllm_chat_reference.py` regenerates
-it); where vLLM's pair leaves the reasoning in the content and renderers splits
+serves for each reference reply, and the tool calls of the `deepseek_v3` ones
+under `tool_choice="auto"` (`tests/vllm_chat_reference.py` regenerates it); where vLLM's pair leaves the reasoning in the content and renderers splits
 it off (Hy3 under `reasoning_effort` `no_think`, MiniMax-M2.5, Laguna-S-2.1
 unless the request turns thinking on, Qwen3.5-0.8B/2B with thinking on), it pins
 the content after vLLM's reasoning closer, and the regeneration refuses any

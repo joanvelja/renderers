@@ -648,8 +648,10 @@ class ParsedResponse:
 
 VLLM_CHAT_PARITY = "0.33.0"
 """The vLLM release each renderer's ``vllm_parsers`` names parsers of, and whose
-chat path ``parse_response(tool_calls=False)`` mirrors. Re-read the declarations
-and the parser facts below when bumping it."""
+chat path ``parse_response(tool_calls=False)`` mirrors (tool_choice="none"), as
+``parse_response`` with tool calls does for the ``deepseek_v3`` tool parser only
+(tool_choice="auto"). Re-read the declarations and the parser facts below when
+bumping it."""
 
 # ``engine_based_streaming`` of the vLLM (``VLLM_CHAT_PARITY``) parser classes the
 # renderers declare. ``openai`` is gpt-oss's tool parser, which vLLM runs through its
@@ -937,6 +939,8 @@ class Renderer(Protocol):
         Muse Glimmer: the whole one): no tool calls, the reasoning split
         unchanged, and the tool-call markup kept in the content or dropped from
         it as ``vllm_parsers`` derives (``VllmParsers.drops_tool_markup``).
+        With tool calls, the content is vLLM's under tool_choice="auto" (the
+        whole reply, with the tools) for the ``deepseek_v3`` tool parser only.
         """
         ...
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -289,6 +290,34 @@ def test_an_entry_for_a_checkpoint_the_renderer_map_lacks_is_refused_by_name(
 
 
 @pytest.mark.parametrize(
+    "model,renderer",
+    [
+        ("Qwen/Qwen3.5-9B", "qwen3.5"),
+        ("PrimeIntellect/Qwen3-0.6B", "prime-qwen3"),
+        ("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "nemotron-3"),
+    ],
+)
+def test_an_entry_dropping_the_reasoning_parser_the_parse_assumes_is_refused(
+    monkeypatch, model, renderer
+):
+    """A qwen3_coder renderer parses a reply without tool calls as vLLM's
+    qwen3_coder engine serves it beside a reasoning parser, which drops a
+    </think> in the content; without one the engine keeps it. An entry serving
+    such a checkpoint without a reasoning parser is refused, naming its renderer
+    and the parse that assumes one."""
+    from renderers import VllmParsers
+    from renderers.base import MODEL_VLLM_PARSERS, vllm_parsers_for
+
+    monkeypatch.setitem(MODEL_VLLM_PARSERS, model, VllmParsers("qwen3_coder", None))
+    with pytest.raises(
+        ValueError,
+        match=rf"drops the reasoning parser of renderer {re.escape(repr(renderer))}"
+        r".*parse_qwen35",
+    ):
+        vllm_parsers_for(None, model)
+
+
+@pytest.mark.parametrize(
     "model",
     [
         "Qwen/Qwen3-4B-Instruct-2507",
@@ -297,8 +326,6 @@ def test_an_entry_for_a_checkpoint_the_renderer_map_lacks_is_refused_by_name(
         "Qwen/Qwen3-VL-8B-Instruct",
         "Qwen/Qwen3-VL-30B-A3B-Instruct",
         "moonshotai/Kimi-K2-Instruct",
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
     ],
 )
 def test_a_checkpoint_that_answers_without_thinking_is_served_without_a_reasoning_parser(

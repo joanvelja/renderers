@@ -1,9 +1,10 @@
 """GptOssRenderer — adapter over OpenAI's harmony reference encoder.
 
-Wire format: harmony (channel-based, no BOS). The official renderer ships
-in the ``openai-harmony`` package — vLLM uses it directly, so matching
-its output guarantees byte-identical tokens with vLLM's serving path
-(and with what the model was trained on).
+Wire format: harmony (channel-based, no BOS). The renderer adapts the
+reference encoder that ships in the ``openai-harmony`` package. On a
+conversation without tool calls, its prompt equals the one vLLM's chat path
+renders for gpt-oss followed by the ``<|channel|>analysis<|message|>`` header
+this renderer prefills; on one with tool calls it differs.
 
 This renderer is a thin adapter that:
 

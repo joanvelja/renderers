@@ -285,6 +285,40 @@ SERVED_REPLIES = {
         "<parameter=city>\nTokyo\n</parameter>\n<function=get_time\n"
         "</tool_call>\nAfter.<|im_end|>",
     ),
+    # qwen3 grammar with its reasoning parser: a </think> read in content is
+    # dropped.
+    "qwen3.5-repeated-think-end": (
+        "Qwen/Qwen3.5-9B",
+        "Check.\n</think>\n\nSure.\n</think>\n\nMore.<|im_end|>",
+    ),
+    # parser engine: a special token (all_special_tokens) its grammar doesn't
+    # name is dropped from reasoning and content alike; <tts_pad>, flagged
+    # special but not listed, stays.
+    "qwen3.5-special-tokens": (
+        "Qwen/Qwen3.5-9B",
+        "Check<|vision_start|>.\n</think>\n\nSure.<|vision_end|> More<tts_pad>."
+        "<|im_end|>",
+    ),
+    # deepseek_r1, a legacy reasoning parser: the content is all the text after
+    # the first </think>, a repeated one included.
+    "deepseek-r1-repeated-think-end": (
+        "deepseek-ai/DeepSeek-R1",
+        "Check.</think>\n\nSure.</think>\nMore.<｜end▁of▁sentence｜>",
+    ),
+    # deepseek_v3 under tool_choice="auto": the content resumes after the
+    # section's last <｜tool▁calls▁end｜>, a stray one after it included.
+    "deepseek-v3-stray-calls-end": (
+        "deepseek-ai/DeepSeek-V3",
+        "A<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+        '```json\n{"city": "Tokyo"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>B'
+        "<｜tool▁calls▁end｜>C<｜end▁of▁sentence｜>",
+    ),
+    "deepseek-r1-stray-calls-end": (
+        "deepseek-ai/DeepSeek-R1",
+        "Check.</think>A<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function"
+        '<｜tool▁sep｜>get_weather\n```json\n{"city": "Tokyo"}\n```<｜tool▁call▁end｜>'
+        "<｜tool▁calls▁end｜>B<｜tool▁calls▁end｜>C<｜end▁of▁sentence｜>",
+    ),
 }
 
 
@@ -319,19 +353,27 @@ def reasoning_left_in_content(model, chat_template_kwargs):
         # poolside_v1 splits only when the request turns thinking on
         # (deepseek_v3_reasoning_parser.py:28-37); the template thinks unasked.
         return not (kwargs.get("thinking") or kwargs.get("enable_thinking"))
-    if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"}:
-        # Served without a reasoning parser (MODEL_VLLM_PARSERS).
-        return kwargs.get("enable_thinking") is True
     # minimax_m2_append_think serves the whole reply as content, behind a
     # "<think>" (minimax_m2_reasoning_parser.py:58-61).
     return model == "MiniMaxAI/MiniMax-M2.5"
 
 
-def served_key(model, tools, completion_ids, chat_template_kwargs):
+AUTO_TOOL_PARSERS = frozenset({"deepseek_v3"})
+"""Tool parsers whose replies the fixture also pins as served with the tools
+under tool_choice="auto", the one tool_choice besides "none" whose parse
+(``parse_response(tool_calls=True)``) renderers claims is vLLM's."""
+
+
+def served_key(model, tools, completion_ids, chat_template_kwargs, tool_choice):
     """The fixture's key for a reply: a digest of the model, whether the request
-    offers tools, the reply's token ids and the template kwargs it sends. It
-    names what vLLM serves only for the fixed ``MESSAGES`` and ``TOOLS``. The
-    prompt isn't in it: gpt-oss's and Muse Glimmer's print today's date, which
-    vLLM's parse doesn't read, so a key over it would expire the fixture daily."""
+    offers tools, the reply's token ids, the template kwargs it sends and its
+    tool_choice, which only "auto" adds to the digest. It names what vLLM serves
+    only for the fixed ``MESSAGES`` and ``TOOLS``. The prompt isn't in it:
+    gpt-oss's and Muse Glimmer's print today's date, which vLLM's parse doesn't
+    read, so a key over it would expire the fixture daily."""
     inputs = [model, bool(tools), completion_ids, chat_template_kwargs]
+    if tool_choice == "auto":
+        inputs.append(tool_choice)
+    elif tool_choice != "none":
+        raise ValueError(f"the fixture pins no tool_choice={tool_choice!r} reply")
     return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:16]

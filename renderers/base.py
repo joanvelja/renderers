@@ -648,8 +648,14 @@ class ParsedResponse:
 
 VLLM_CHAT_PARITY = "0.33.0"
 """The vLLM release each renderer's ``vllm_parsers`` names parsers of, and whose
-chat path ``parse_response(tool_calls=False)`` mirrors. Re-read the declarations
-and the parser facts below when bumping it."""
+chat path ``parse_response(tool_calls=False)`` mirrors under tool_choice="none"
+for every reply the fixture pins; the README states what else holds. With tool
+calls, for the ``deepseek_v3`` tool parser only, the content beside the calls is
+this release's under tool_choice="auto" when every ``<｜tool▁calls▁end｜>`` comes
+after the section's opener: the text before the tool-call section and after its
+last ``<｜tool▁calls▁end｜>``. Which calls are parsed is this release's only for
+one fenced section (vLLM also parses a later section's calls, and no unfenced
+call). Re-read the declarations and the parser facts below when bumping it."""
 
 # ``engine_based_streaming`` of the vLLM (``VLLM_CHAT_PARITY``) parser classes the
 # renderers declare. ``openai`` is gpt-oss's tool parser, which vLLM runs through its
@@ -937,6 +943,14 @@ class Renderer(Protocol):
         Muse Glimmer: the whole one): no tool calls, the reasoning split
         unchanged, and the tool-call markup kept in the content or dropped from
         it as ``vllm_parsers`` derives (``VllmParsers.drops_tool_markup``).
+        Parity holds for every reply the fixture pins; the README states what
+        else holds. With tool calls, for the ``deepseek_v3`` tool parser only,
+        the content beside the calls is vLLM's under tool_choice="auto" (the
+        whole reply, with the tools) when every ``<｜tool▁calls▁end｜>`` comes
+        after the section's opener: the text before the tool-call section and
+        after its last ``<｜tool▁calls▁end｜>``. Which calls are parsed is
+        vLLM's only for one fenced section: vLLM also parses a later section's
+        calls, and no call without its ```json fence.
         """
         ...
 
@@ -1226,10 +1240,15 @@ MODEL_RENDERER_MAP: dict[str, str] = {
 # vLLM's qwen3 and kimi_k2 reasoning parsers start in reasoning unless the request
 # turns thinking off (vllm/parser/qwen3.py:318, kimi_k2.py:163-167) or, for qwen3,
 # the prompt's own turn closes reasoning (parser/engine/parser_engine.py:235-245),
-# so a checkpoint whose default reply opens no think block is served without one:
-# under it, that reply is all reasoning and its content null. The tool parser,
-# and with it how the renderer parses a reply without tool calls, stays the
-# format's (checked in ``vllm_parsers_for``).
+# so a checkpoint whose default reply opens no think block, behind a prompt that
+# closes none, is served without one: under it, that reply is all reasoning and
+# its content null. The tool parser stays the format's (checked in
+# ``vllm_parsers_for``). Whether the pair has a reasoning parser also changes the
+# content vLLM serves: with one, the qwen3 grammar drops a </think> read in the
+# content, without one it keeps it (abstract_parser.py:156-166). A qwen3_coder
+# renderer's parse without tool calls assumes a reasoning parser
+# (``parse_qwen35``), so an entry without one is refused for it
+# (``vllm_parsers_for``). The other renderers parse alike under either pair.
 MODEL_VLLM_PARSERS: dict[str, VllmParsers] = {
     # Non-thinking checkpoints: they never open a think block.
     "Qwen/Qwen3-4B-Instruct-2507": VllmParsers("hermes", None),
@@ -1238,12 +1257,6 @@ MODEL_VLLM_PARSERS: dict[str, VllmParsers] = {
     "Qwen/Qwen3-VL-8B-Instruct": VllmParsers("hermes", None),
     "Qwen/Qwen3-VL-30B-A3B-Instruct": VllmParsers("hermes", None),
     "moonshotai/Kimi-K2-Instruct": VllmParsers("kimi_k2", None),
-    # Their template's default turns thinking off (an empty think block closes
-    # the generation prompt), which the qwen3 parser reads off the prompt, so
-    # the class pair would serve that reply as content too. Under this pair a
-    # request turning thinking on gets its reasoning back in the content.
-    "Qwen/Qwen3.5-0.8B": VllmParsers("qwen3_coder", None),
-    "Qwen/Qwen3.5-2B": VllmParsers("qwen3_coder", None),
 }
 
 
@@ -1727,6 +1740,21 @@ def vllm_parsers_for(
             f"MODEL_VLLM_PARSERS[{model_name!r}] = {served} changes renderer "
             f"{name!r}'s tool parser or its markup rule ({pair}): only the "
             "reasoning parser is the checkpoint's"
+        )
+    if served.reasoning is None and pair.tool == "qwen3_coder":
+        assuming = sorted(
+            renderer
+            for renderer, cls in RENDERER_REGISTRY.items()
+            if getattr(cls, "vllm_parsers", None) is not None
+            and cls.vllm_parsers.tool == pair.tool
+        )
+        raise ValueError(
+            f"MODEL_VLLM_PARSERS[{model_name!r}] = {served} drops the reasoning "
+            f"parser of renderer {name!r} ({pair}), which its parse without tool "
+            "calls assumes (parse_qwen35, the parse of renderers "
+            f"{', '.join(assuming)}): without one, vLLM's qwen3_coder engine "
+            "keeps a </think> in the content that parse_qwen35 drops. Serve it "
+            "with a reasoning parser"
         )
     return served
 

@@ -168,15 +168,25 @@ def _decode(tokenizer, ids: list[int]) -> str:
 # The qwen3 grammar's terminals (``qwen3_config`` in ``vllm/parser/qwen3.py``),
 # lexed leftmost-longest as vLLM's lexer does, so the ">" closing a name is never
 # read inside another terminal.
-_QWEN3_XML_TERMINAL_RE = re.compile(
-    r"<think>|</think>|<tool_call>|</tool_call>|<function=|</function>"
-    r"|<parameter=|</parameter>|>"
+_QWEN3_XML_TERMINALS = (
+    "<think>",
+    "</think>",
+    "<tool_call>",
+    "</tool_call>",
+    "<function=",
+    "</function>",
+    "<parameter=",
+    "</parameter>",
+    ">",
 )
+_QWEN3_XML_TERMINAL_RE = re.compile("|".join(map(re.escape, _QWEN3_XML_TERMINALS)))
 # Its transitions from the CONTENT state its tool pass starts in, minus those
 # that leave the state and the content unchanged (a parameter tag in the body).
-# The pass reads </think> as text, as with no reasoning parser; a reasoning
-# parser drops a repeated </think> before it, which this doesn't.
+# Served with its reasoning parser, the grammar drops a </think> read in CONTENT
+# (qwen3.py:193-198); only without one would it pass through as text
+# (``skip_reasoning_parsing``, abstract_parser.py:156-166).
 _QWEN3_XML_TRANSITIONS: dict[tuple[str, str], str] = {
+    ("CONTENT", "</think>"): "CONTENT",
     ("CONTENT", "<tool_call>"): "TOOL_PREAMBLE",
     ("CONTENT", "<function="): "TOOL_NAME",
     ("TOOL_PREAMBLE", "</tool_call>"): "CONTENT",
@@ -216,6 +226,27 @@ def _qwen3_xml_content(text: str) -> str:
     if state == "CONTENT":
         kept.append(text[cursor:])
     return "".join(kept)
+
+
+def _without_unnamed_special_tokens(
+    tokenizer, ids: list[int], terminals: tuple[str, ...]
+) -> list[int]:
+    """``ids`` without the special tokens a vLLM parser engine whose grammar
+    names ``terminals`` drops wherever they occur: each of the tokenizer's
+    ``all_special_tokens`` that isn't one of them
+    (``vllm/parser/engine/streaming_parser_engine.py:39-86``, ``:416-417``). A
+    token the tokenizer flags special without listing it there stays. The list
+    depends on the transformers release (Qwen3.5's has 9 tokens under 5.14.1
+    and 17 under 5.20.2), so this matches vLLM only where both run the same
+    transformers."""
+    dropped = {
+        token_id
+        for token, token_id in zip(
+            tokenizer.all_special_tokens, tokenizer.all_special_ids, strict=True
+        )
+        if token not in terminals
+    }
+    return [token for token in ids if token not in dropped]
 
 
 def _reasoning_end_token_index(
@@ -404,9 +435,14 @@ def parse_qwen35(
     Direct helper calls default to an unprefilled completion.
 
     ``drop_tool_calls=True`` parses no calls and keeps the text vLLM's
-    ``qwen3_coder`` engine serves without them (``_qwen3_xml_content``).
+    ``qwen3_coder`` engine, served with its reasoning parser, serves without
+    them: the special tokens its grammar doesn't name dropped
+    (``_without_unnamed_special_tokens``), the reasoning split off, and the
+    rest read as ``_qwen3_xml_content``.
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
+    if drop_tool_calls:
+        ids = _without_unnamed_special_tokens(tokenizer, ids, _QWEN3_XML_TERMINALS)
     boundary = scan_reasoning(
         tokenizer,
         ids,
@@ -1103,6 +1139,11 @@ def parse_deepseek_v3(
           <｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n{args}\\n```<｜tool▁call▁end｜>
         <｜tool▁calls▁end｜>
 
+    With tool calls, the content is the text before the section and after its
+    last ``<｜tool▁calls▁end｜>``, as vLLM's ``deepseek_v3`` tool parser serves it
+    under tool_choice="auto" (``deepseekv3_tool_parser.py:113-119``); a section
+    without that closer has no text after it.
+
     ``scan_tool_calls=False`` leaves the markup in the content, as a legacy
     vLLM tool parser serves a reply without tool calls.
     """
@@ -1133,8 +1174,12 @@ def parse_deepseek_v3(
         _find(ids, tool_calls_begin_id, reasoning_end) if scan_tool_calls else -1
     )
     tool_calls: list[ParsedToolCall] = []
+    after_section: list[int] = []
     if tc_section_start != -1:
         content_ids = ids[:tc_section_start]
+        closers = _find_all(ids[tc_section_start:], tool_calls_end_id)
+        if closers:
+            after_section = ids[tc_section_start + closers[-1] + 1 :]
         tool_calls = _parse_deepseek_tool_calls(
             tokenizer,
             ids[tc_section_start:],
@@ -1155,6 +1200,7 @@ def parse_deepseek_v3(
         before, _, after = text.partition("</think>")
         reasoning = boundary.text.strip()
         text = after.lstrip("\n")
+    text += _decode(tokenizer, after_section)
 
     return ParsedResponse(
         content=text.strip(),

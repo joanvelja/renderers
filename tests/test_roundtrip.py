@@ -13,6 +13,7 @@ import pytest
 from parity import MODEL_CATALOG, TOOLS, kwarg_combinations
 from reference_continuations import (
     ANSWER,
+    AUTO_TOOL_PARSERS,
     BEFORE,
     BEFORE_KWARGS,
     MESSAGES,
@@ -174,7 +175,7 @@ async def _served_without_tool_calls(renderer, model, sampled, kwargs, tools):
     against the content vLLM serves for it (vllm_chat_reference.py)."""
     assert _SERVED["vllm"] == VLLM_CHAT_PARITY
     ctk = {k: v for k, v in kwargs.items() if v is not None}
-    key = served_key(model, tools, sampled, ctk)
+    key = served_key(model, tools, sampled, ctk, "none")
     assert key in _SERVED["served"], (
         "no vLLM content for this reply: regenerate fixtures/vllm_chat_content.json"
     )
@@ -264,6 +265,93 @@ async def test_reply_parsed_without_tool_calls_as_vllm_serves_it(reply, tools):
     renderer = create_renderer(tok, config_from_name(MODEL_RENDERER_MAP[model]))
     sampled = tok.encode(text, add_special_tokens=False)
     await _served_without_tool_calls(renderer, model, sampled, {}, tools)
+
+
+def _served_auto(renderer_name: str, model: str) -> bool:
+    """Whether the fixture pins ``model``'s replies under tool_choice="auto"."""
+    pair = vllm_parsers_for(config_from_name(renderer_name), model)
+    return pair is not None and pair.tool in AUTO_TOOL_PARSERS
+
+
+async def _served_with_tool_calls(renderer, model, sampled, kwargs):
+    """Parse sampled through generate() with the tools and check it against
+    what vLLM's chat path serves for it under tool_choice="auto"
+    (vllm_chat_reference.py): content and reasoning up to the format's
+    whitespace convention, and the tool calls."""
+    assert _SERVED["vllm"] == VLLM_CHAT_PARITY
+    ctk = {k: v for k, v in kwargs.items() if v is not None}
+    key = served_key(model, TOOLS, sampled, ctk, "auto")
+    assert key in _SERVED["served"], (
+        "no vLLM reply for this one: regenerate fixtures/vllm_chat_content.json"
+    )
+    async with replay_client([(sampled, "stop")], []) as client:
+        result = await generate(
+            client=client,
+            renderer=renderer,
+            model=model,
+            messages=MESSAGES,
+            tools=TOOLS,
+            max_prompt_len=100000,
+        )
+    served = _SERVED["messages"][_SERVED["served"][key]]
+    name = MODEL_RENDERER_MAP[model]
+    assert result["content"] == _content_in_renderers_convention(
+        name, served["content"]
+    )
+    assert (result["reasoning_content"] or "") == _reasoning_in_renderers_convention(
+        name, served["reasoning"] or ""
+    )
+    assert [
+        (call.name, call.arguments)
+        for call in result["tool_calls"]
+        if call.status == ToolCallParseStatus.OK
+    ] == [(call, json.loads(arguments)) for call, arguments in served["tool_calls"]]
+    assert result["finish_reason"] == ("tool_calls" if served["tool_calls"] else "stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case,kwargs,calls,content",
+    [
+        p
+        for p in _SERVED_CASES
+        if _served_auto(p.values[0].resolved_renderer, p.values[0].model)
+    ],
+)
+async def test_reference_tool_calls_parsed_as_vllm_serves_tool_choice_auto(
+    case, kwargs, calls, content
+):
+    """A tool parser in ``AUTO_TOOL_PARSERS`` serves a reply carrying tool
+    calls, text after them and ``content`` beside them under
+    tool_choice="auto" as ``generate`` parses it with the tools."""
+    tok = _tokenizer(case.model)
+    renderer = create_renderer(
+        tok,
+        config_from_name(case.resolved_renderer),
+        chat_template_kwargs=kwargs or None,
+    )
+    sampled = tool_reply_with_text_after(
+        tok, renderer, case, kwargs, MESSAGES, TOOLS, calls, content
+    )
+    await _served_with_tool_calls(renderer, case.model, sampled, kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply",
+    sorted(
+        reply
+        for reply, (model, _) in SERVED_REPLIES.items()
+        if _served_auto(MODEL_RENDERER_MAP[model], model)
+    ),
+)
+async def test_reply_parsed_as_vllm_serves_tool_choice_auto(reply):
+    """``SERVED_REPLIES`` of such a tool parser, parsed with the tools."""
+    model, text = SERVED_REPLIES[reply]
+    tok = _tokenizer(model)
+    renderer = create_renderer(tok, config_from_name(MODEL_RENDERER_MAP[model]))
+    sampled = tok.encode(text, add_special_tokens=False)
+    await _served_with_tool_calls(renderer, model, sampled, {})
 
 
 @pytest.mark.asyncio

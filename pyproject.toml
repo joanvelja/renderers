@@ -19,9 +19,10 @@ dependencies = [
     "openai>=1.108.1",
     "tiktoken",
     "jinja2",
-    # Used by GptOssRenderer to render and parse harmony tokens. Vendoring
-    # OpenAI's reference implementation keeps us byte-identical with vLLM
-    # (which also uses it) and saves us mirroring a 330-line Jinja template.
+    # Used by GptOssRenderer to render and parse harmony tokens. Depending on
+    # OpenAI's reference implementation saves us mirroring a 330-line Jinja
+    # template. vLLM 0.33 requires ``oss-harmony`` instead, a fork that
+    # installs the same ``openai_harmony`` module.
     #
     # Floor is ``>=0.0.4`` (not the latest 0.0.8) on purpose: every SGLang
     # release through 0.5.12.post1 hard-pins ``openai-harmony==0.0.4``, so a

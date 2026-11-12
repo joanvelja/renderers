@@ -1,6 +1,6 @@
 """Regenerate ``fixtures/vllm_chat_content.json``: the content and reasoning
 vLLM's chat path serves for each reply ``test_roundtrip.py`` parses without tool
-calls.
+calls, and for a tool parser in ``AUTO_TOOL_PARSERS`` what it serves with them.
 
 Two steps, from the repo root. The replies come from this project's environment,
 so they are the ones the tests build:
@@ -20,12 +20,17 @@ the whole one otherwise. Its output is detokenized by vLLM's own v1 detokenizer
 (``IncrementalDetokenizer``, primed with the prompt, the stop token excluded),
 fast or slow as the tokenizer is. A Harmony
 (gpt-oss) reply is parsed from the channel header renderers' prompt prefills,
-where vLLM's prompt ends.
+where vLLM's prompt ends. A reply whose tool parser is in ``AUTO_TOOL_PARSERS``
+is also served with the tools under ``tool_choice="auto"``, whole: the request
+adjusted as for any tool_choice but "none" (``online_renderer.py:850-855``), the
+reply parsed (``serving.py:1014-1020``) and its message fields assembled
+(``message_assembly.py:53-62``), tool calls kept.
 
 The fixture maps a digest of each reply's inputs (``served_key``: the model,
-whether tools are offered, the reply's ids and the template kwargs) to an index
-into its ``messages``, vLLM's content and reasoning, and records each model's
-pair. Where vLLM's pair leaves the reasoning in the content and renderers splits
+whether tools are offered, the reply's ids, the template kwargs and a
+tool_choice other than "none") to an index into its ``messages``, vLLM's content
+and reasoning, plus its tool calls (name, arguments) under "auto", and records
+each model's pair. Where vLLM's pair leaves the reasoning in the content and renderers splits
 it off, a gap listed per checkpoint (``reasoning_left_in_content``), the fixture
 keeps the content after vLLM's reasoning closer: there the split is renderers'
 convention, not this parse's. Anywhere else the pair is wrong, and the
@@ -158,9 +163,15 @@ def _harmony_prefill(tok, prompt_ids):
     return prompt_ids[:split], prompt_ids[split:]
 
 
-def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
-    """(reasoning, content) of vLLM's reply to ``ids`` under tool_choice="none"."""
+def _serve(
+    tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, tool_choice, stream
+):
+    """(reasoning, content, tool calls) of vLLM's reply to ``ids`` under
+    ``tool_choice``: the calls as (name, arguments), none under "none"."""
     from reference_continuations import MESSAGES
+    from vllm.entrypoints.openai.chat_completion.message_assembly import (
+        assemble_chat_message_fields,
+    )
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.parser.parser_manager import ParserManager
 
@@ -168,7 +179,7 @@ def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
     if harmony:
         prompt_ids, prefill = _harmony_prefill(tok, prompt_ids)
         ids = prefill + ids
-    data = {"model": model, "messages": MESSAGES, "tool_choice": "none"}
+    data = {"model": model, "messages": MESSAGES, "tool_choice": tool_choice}
     if tools:
         data["tools"] = tools
     if ctk:
@@ -189,10 +200,16 @@ def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
             tok, request.tools, chat_template_kwargs=template_kwargs, model_config=None
         )
 
-    # A reasoning parser (or Harmony) adjusts the request (online_renderer.py:
-    # 850-875, Harmony :529-545). The prompt it is given there first
-    # (set_prompt_token_ids) only matters to the parse, not to the request.
-    if harmony or parser_cls.always_adjust_request or parser_cls.reasoning_parser_cls:
+    # A reasoning parser, a tool_choice but "none" (or Harmony) adjusts the
+    # request (online_renderer.py:850-875, Harmony :529-545). The prompt it is
+    # given there first (set_prompt_token_ids) only matters to the parse, not
+    # to the request.
+    if (
+        harmony
+        or parser_cls.always_adjust_request
+        or parser_cls.reasoning_parser_cls is not None
+        or tool_choice != "none"
+    ):
         request = parser().adjust_request(request=request) or request
     stopped = bool(ids) and ids[-1] in stop_ids
     text_ids = ids[:-1] if stopped else ids
@@ -200,10 +217,23 @@ def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
     if not stream:
         whole = parser()
         whole.set_prompt_token_ids(list(prompt_ids))
-        reasoning, content, _ = whole.parse(
+        reasoning, content, calls = whole.parse(
             "".join(pieces), request, enable_auto_tools=True, model_output_token_ids=ids
         )
-        return reasoning, content
+        fields = assemble_chat_message_fields(
+            request,
+            reasoning,
+            content,
+            calls,
+            enable_auto_tools=True,
+            parser_cls=parser_cls,
+        )
+        return (
+            fields.reasoning,
+            fields.content,
+            tuple((c.function.name, c.function.arguments) for c in fields.tool_calls),
+        )
+    assert tool_choice == "none", "only a tool_choice='none' reply is streamed"
     streaming = parser()
     steps = [(piece, [t]) for piece, t in zip(pieces, text_ids)]
     if stopped:
@@ -216,14 +246,18 @@ def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
         if delta is not None:
             reasoning += delta.reasoning or ""
             content += delta.content or ""
-    return reasoning or None, content or None
+    return reasoning or None, content or None, ()
 
 
 def serve(in_path):
     from importlib.metadata import version
 
     from parity import TOOLS
-    from reference_continuations import reasoning_left_in_content, served_key
+    from reference_continuations import (
+        AUTO_TOOL_PARSERS,
+        reasoning_left_in_content,
+        served_key,
+    )
 
     from renderers import VllmParsers
 
@@ -233,8 +267,11 @@ def serve(in_path):
         tok = _tokenizer(model)
         pair = VllmParsers(*reply["pair"])
         pairs[model] = reply["pair"]
-        for label, tools in (("tools", TOOLS), ("no_tools", None)):
-            reasoning, content = _serve(
+        requests = [("tools", TOOLS, "none"), ("no_tools", None, "none")]
+        if pair.tool in AUTO_TOOL_PARSERS:
+            requests.append(("tools", TOOLS, "auto"))
+        for label, tools, tool_choice in requests:
+            reasoning, content, calls = _serve(
                 tok,
                 model,
                 pair,
@@ -243,6 +280,7 @@ def serve(in_path):
                 set(reply["stops"]),
                 tools=tools,
                 ctk=ctk,
+                tool_choice=tool_choice,
                 stream=tools is None and pair.engine_based,
             )
             content = content or ""
@@ -260,8 +298,9 @@ def serve(in_path):
                         f"{reply['id']}: no reasoning closer in {content!r}"
                     )
                 content = content[close.end() :]
-            key = served_key(model, tools, reply["ids"], ctk)
-            if served.setdefault(key, (content, reasoning)) != (content, reasoning):
+            key = served_key(model, tools, reply["ids"], ctk, tool_choice)
+            message = (content, reasoning) + ((calls,) if tool_choice == "auto" else ())
+            if served.setdefault(key, message) != message:
                 raise ValueError(f"{reply['id']}: one input, two replies")
         print(reply["id"], flush=True)
     messages = sorted(set(served.values()), key=json.dumps)
@@ -269,7 +308,10 @@ def serve(in_path):
     fixture = {
         "vllm": version("vllm"),
         "pairs": pairs,
-        "messages": [{"content": c, "reasoning": r} for c, r in messages],
+        "messages": [
+            {"content": c, "reasoning": r} | ({"tool_calls": auto[0]} if auto else {})
+            for c, r, *auto in messages
+        ],
         "served": {key: index[message] for key, message in served.items()},
     }
     FIXTURE.write_text(json.dumps(fixture, indent=0, sort_keys=True) + "\n")

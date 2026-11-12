@@ -649,11 +649,11 @@ class ParsedResponse:
 VLLM_CHAT_PARITY = "0.33.0"
 """The vLLM release each renderer's ``vllm_parsers`` names parsers of, and whose
 chat path ``parse_response(tool_calls=False)`` mirrors under tool_choice="none"
-for every reply the fixture pins, with the gaps the README lists. With tool
+for every reply the fixture pins; the README states what else holds. With tool
 calls, for the ``deepseek_v3`` tool parser only, the content beside the calls is
-this release's under tool_choice="auto": the text before the tool-call section
-and after its last ``<｜tool▁calls▁end｜>`` (when that closer precedes the
-section, vLLM appends all the text after it); which calls are parsed, only for
+this release's under tool_choice="auto" when every ``<｜tool▁calls▁end｜>`` comes
+after the section's opener: the text before the tool-call section and after its
+last ``<｜tool▁calls▁end｜>``. Which calls are parsed is this release's only for
 one fenced section (vLLM also parses a later section's calls, and no unfenced
 call). Re-read the declarations and the parser facts below when bumping it."""
 
@@ -943,14 +943,14 @@ class Renderer(Protocol):
         Muse Glimmer: the whole one): no tool calls, the reasoning split
         unchanged, and the tool-call markup kept in the content or dropped from
         it as ``vllm_parsers`` derives (``VllmParsers.drops_tool_markup``).
-        Parity holds for every reply the fixture pins, with the gaps the README
-        lists. With tool calls, for the ``deepseek_v3`` tool parser only, the
-        content beside the calls is vLLM's under tool_choice="auto" (the whole
-        reply, with the tools): the text before the tool-call section and after
-        its last ``<｜tool▁calls▁end｜>`` (when that closer precedes the
-        section, vLLM appends all the text after it). Which calls are parsed
-        is vLLM's only for one fenced section: vLLM also parses a later
-        section's calls, and no call without its ```json fence.
+        Parity holds for every reply the fixture pins; the README states what
+        else holds. With tool calls, for the ``deepseek_v3`` tool parser only,
+        the content beside the calls is vLLM's under tool_choice="auto" (the
+        whole reply, with the tools) when every ``<｜tool▁calls▁end｜>`` comes
+        after the section's opener: the text before the tool-call section and
+        after its last ``<｜tool▁calls▁end｜>``. Which calls are parsed is
+        vLLM's only for one fenced section: vLLM also parses a later section's
+        calls, and no call without its ```json fence.
         """
         ...
 
@@ -1243,12 +1243,12 @@ MODEL_RENDERER_MAP: dict[str, str] = {
 # so a checkpoint whose default reply opens no think block, behind a prompt that
 # closes none, is served without one: under it, that reply is all reasoning and
 # its content null. The tool parser stays the format's (checked in
-# ``vllm_parsers_for``). The reasoning parser still shapes the content vLLM serves
-# beside it: with one, the qwen3 grammar drops a </think> read in the content,
-# without one it keeps it (abstract_parser.py:156-166). A qwen3_coder renderer's
-# parse without tool calls assumes the reasoning parser (``parse_qwen35``), so an
-# entry without one is refused for it (``vllm_parsers_for``). The other
-# renderers parse alike under either pair, with the gaps the README lists.
+# ``vllm_parsers_for``). Whether the pair has a reasoning parser also changes the
+# content vLLM serves: with one, the qwen3 grammar drops a </think> read in the
+# content, without one it keeps it (abstract_parser.py:156-166). A qwen3_coder
+# renderer's parse without tool calls assumes a reasoning parser
+# (``parse_qwen35``), so an entry without one is refused for it
+# (``vllm_parsers_for``). The other renderers parse alike under either pair.
 MODEL_VLLM_PARSERS: dict[str, VllmParsers] = {
     # Non-thinking checkpoints: they never open a think block.
     "Qwen/Qwen3-4B-Instruct-2507": VllmParsers("hermes", None),

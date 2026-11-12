@@ -109,32 +109,29 @@ leaves the reasoning in the content and renderers splits it off (Hy3 under
 turns thinking on), it pins the content after vLLM's reasoning closer, and the
 regeneration refuses any other checkpoint doing so.
 
-A known gap under `tool_choice="none"`: vLLM drops a repeated reasoning closer
-from the content, and the special tokens the pair's grammar doesn't name.
-Renderers drops both only for the qwen3_coder pairs (Qwen3.5/3.6/3.8,
-Prime-Qwen3, Nemotron-3). It keeps both for the hermes+qwen3 pair (the qwen3
-and qwen3-vl renderers), Kimi-K2 / K2.5 and Gemma 4 (whose closer is
-`<channel|>`), and for GLM and DeepSeek V4 drops the repeated closer, as vLLM
-does, but keeps the special tokens. For the qwen3 and qwen3-vl renderers the
-special-token half applies under either of their pairs: without a reasoning
-parser vLLM's detokenizer drops the special tokens (`skip_special_tokens`) and
-keeps the `</think>`. Where a parser engine drops them, the dropped special
-tokens are the tokenizer's `all_special_tokens`, which depend on the
+Beyond those replies, for the qwen3_coder pairs (Qwen3.5/3.6/3.8, Prime-Qwen3,
+Nemotron-3) the parse without tool calls drops a `</think>` read in the content
+and the special tokens the grammar doesn't name, as vLLM's engine does. Those
+special tokens are the tokenizer's `all_special_tokens`, which depend on the
 transformers release (Qwen3.5 lists 9 under transformers 5.14.1 and 17 under
-5.20.2), so parity on special tokens holds only where renderers and vLLM run
-the same transformers.
+5.20.2), so this holds only where renderers and vLLM run the same transformers.
+For every other pair, renderers claims nothing about a repeated reasoning
+closer or a special token in a reply: vLLM's handling of them there is not
+mirrored.
 
-With tool calls, for the `deepseek_v3` tool parser (DeepSeek V3 and R1) the
+With tool calls, for the `deepseek_v3` tool parser (DeepSeek V3 and R1), the
 content beside the calls is what vLLM serves under `tool_choice="auto"` (its
-whole reply, with the tools): the text before the tool-call section and after
-its last `<｜tool▁calls▁end｜>` (when that closer precedes the section, vLLM
-appends all the text after it). Which calls are parsed is vLLM's only for a
-reply with one fenced section, the shape the fixture pins; vLLM also parses the
-calls of a later section, which renderers doesn't, and parses no call that lacks
-its ```` ```json ```` fence, where renderers parses one. For any other tool
-parser, renderers claims nothing about what vLLM serves beside tool calls. A
-renderer that parses tool calls but pins no pair (`DefaultRenderer` with a
-`tool_parser`) refuses the parse.
+whole reply, with the tools) for a reply whose only `<｜tool▁calls▁end｜>`
+tokens come after the section's opener: the text before the tool-call section
+and after its last `<｜tool▁calls▁end｜>`. Which calls are parsed is vLLM's only
+for a reply with one fenced section, the shape the fixture pins. Three
+differences are known: when a `<｜tool▁calls▁end｜>` precedes the section,
+renderers' content ends at the section's start and vLLM's doesn't; vLLM also
+parses the calls of a later section, which renderers doesn't; and vLLM parses
+no call that lacks its ```` ```json ```` fence, where renderers parses one. For
+any other tool parser, renderers claims nothing about what vLLM serves beside
+tool calls. A renderer that parses tool calls but pins no pair
+(`DefaultRenderer` with a `tool_parser`) refuses the parse.
 
 Summary consumers should require normal termination (`finish_reason="stop"`),
 nonempty final content, and no tool calls. A length-limited final answer remains

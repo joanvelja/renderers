@@ -285,6 +285,26 @@ SERVED_REPLIES = {
         "<parameter=city>\nTokyo\n</parameter>\n<function=get_time\n"
         "</tool_call>\nAfter.<|im_end|>",
     ),
+    # qwen3 grammar with its reasoning parser: a </think> read in content is
+    # dropped.
+    "qwen3.5-repeated-think-end": (
+        "Qwen/Qwen3.5-9B",
+        "Check.\n</think>\n\nSure.\n</think>\n\nMore.<|im_end|>",
+    ),
+    # parser engine: a special token (all_special_tokens) its grammar doesn't
+    # name is dropped from reasoning and content alike; <tts_pad>, flagged
+    # special but not listed, stays.
+    "qwen3.5-special-tokens": (
+        "Qwen/Qwen3.5-9B",
+        "Check<|vision_start|>.\n</think>\n\nSure.<|vision_end|> More<tts_pad>."
+        "<|im_end|>",
+    ),
+    # deepseek_r1, a legacy reasoning parser: the content is all the text after
+    # the first </think>, a repeated one included.
+    "deepseek-r1-repeated-think-end": (
+        "deepseek-ai/DeepSeek-R1",
+        "Check.</think>\n\nSure.</think>\nMore.<｜end▁of▁sentence｜>",
+    ),
 }
 
 

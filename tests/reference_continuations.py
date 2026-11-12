@@ -347,11 +347,22 @@ def reasoning_left_in_content(model, chat_template_kwargs):
     return model == "MiniMaxAI/MiniMax-M2.5"
 
 
-def served_key(model, tools, completion_ids, chat_template_kwargs):
+AUTO_TOOL_PARSERS = frozenset({"deepseek_v3"})
+"""Tool parsers whose replies the fixture also pins as served with the tools
+under tool_choice="auto", the one tool_choice besides "none" whose parse
+(``parse_response(tool_calls=True)``) renderers claims is vLLM's."""
+
+
+def served_key(model, tools, completion_ids, chat_template_kwargs, tool_choice):
     """The fixture's key for a reply: a digest of the model, whether the request
-    offers tools, the reply's token ids and the template kwargs it sends. It
-    names what vLLM serves only for the fixed ``MESSAGES`` and ``TOOLS``. The
-    prompt isn't in it: gpt-oss's and Muse Glimmer's print today's date, which
-    vLLM's parse doesn't read, so a key over it would expire the fixture daily."""
+    offers tools, the reply's token ids, the template kwargs it sends and its
+    tool_choice, which only "auto" adds to the digest. It names what vLLM serves
+    only for the fixed ``MESSAGES`` and ``TOOLS``. The prompt isn't in it:
+    gpt-oss's and Muse Glimmer's print today's date, which vLLM's parse doesn't
+    read, so a key over it would expire the fixture daily."""
     inputs = [model, bool(tools), completion_ids, chat_template_kwargs]
+    if tool_choice == "auto":
+        inputs.append(tool_choice)
+    elif tool_choice != "none":
+        raise ValueError(f"the fixture pins no tool_choice={tool_choice!r} reply")
     return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()[:16]

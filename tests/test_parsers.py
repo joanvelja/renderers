@@ -291,6 +291,35 @@ def test_an_entry_for_a_checkpoint_the_renderer_map_lacks_is_refused_by_name(
 @pytest.mark.parametrize(
     "model",
     [
+        "Qwen/Qwen3.5-9B",
+        "PrimeIntellect/Qwen3-0.6B",
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    ],
+)
+def test_an_entry_dropping_the_reasoning_parser_the_parse_assumes_is_refused(
+    monkeypatch, model
+):
+    """A qwen3_coder renderer parses a reply without tool calls as vLLM's
+    qwen3_coder engine serves it beside a reasoning parser, which drops a
+    </think> in the content; without one the engine keeps it. An entry serving
+    such a checkpoint without a reasoning parser is refused, naming the
+    renderers that parse so."""
+    from renderers import VllmParsers
+    from renderers.base import MODEL_VLLM_PARSERS, vllm_parsers_for
+
+    monkeypatch.setitem(MODEL_VLLM_PARSERS, model, VllmParsers("qwen3_coder", None))
+    with pytest.raises(
+        ValueError,
+        match=r"drops the reasoning parser .* renderers nemotron-3, "
+        r"nemotron-3-ultra, nemotron-3\.5, prime-qwen3, qwen3\.5, qwen3\.6, "
+        r"qwen3\.8\): ",
+    ):
+        vllm_parsers_for(None, model)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
         "Qwen/Qwen3-4B-Instruct-2507",
         "Qwen/Qwen3-30B-A3B-Instruct-2507",
         "Qwen/Qwen3-VL-4B-Instruct",

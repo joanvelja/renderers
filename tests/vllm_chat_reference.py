@@ -11,9 +11,10 @@ tests/vllm_chat_reference.py serve replies.json``.
 
 Each reply goes through vLLM's own parser stack as ``chat_completion/serving.py``
 drives it, with the pair its model is served with (``vllm_parsers_for``) and
-``tool_choice="none"``: with the tools, the whole reply (``:997-1047``); without
-tools, the streamed reply for an engine-based pair (``:666``) and the whole one
-otherwise. Its output is detokenized by vLLM's own v1 detokenizer
+``tool_choice="none"``: with the tools, the whole reply (``:996-1044``: the
+parser is given the prompt, then parses the reply); without tools, the streamed
+reply for an engine-based pair (``:712-717``, ``stream_processor.py:76-91``) and
+the whole one otherwise. Its output is detokenized by vLLM's own v1 detokenizer
 (``IncrementalDetokenizer``, primed with the prompt, the stop token excluded),
 fast or slow as the tokenizer is. A Harmony
 (gpt-oss) reply is parsed from the channel header renderers' prompt prefills,
@@ -186,7 +187,9 @@ def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
             tok, request.tools, chat_template_kwargs=template_kwargs, model_config=None
         )
 
-    # online_renderer.py: a reasoning parser (or Harmony) adjusts the request.
+    # A reasoning parser (or Harmony) adjusts the request (online_renderer.py:
+    # 850-875, Harmony :529-545). The prompt it is given there first
+    # (set_prompt_token_ids) only matters to the parse, not to the request.
     if harmony or parser_cls.always_adjust_request or parser_cls.reasoning_parser_cls:
         request = parser().adjust_request(request=request) or request
     stopped = bool(ids) and ids[-1] in stop_ids

@@ -1232,8 +1232,13 @@ MODEL_RENDERER_MAP: dict[str, str] = {
 # the prompt's own turn closes reasoning (parser/engine/parser_engine.py:235-245),
 # so a checkpoint whose default reply opens no think block, behind a prompt that
 # closes none, is served without one: under it, that reply is all reasoning and
-# its content null. The tool parser, and with it how the renderer parses a reply
-# without tool calls, stays the format's (checked in ``vllm_parsers_for``).
+# its content null. The tool parser stays the format's (checked in
+# ``vllm_parsers_for``). The reasoning parser still shapes the content vLLM serves
+# beside it: with one, the qwen3 grammar drops a </think> read in the content,
+# without one it keeps it (abstract_parser.py:156-166). A qwen3_coder renderer's
+# parse without tool calls assumes the reasoning parser (``parse_qwen35``), so an
+# entry without one is refused for it (``vllm_parsers_for``). The other
+# renderers parse alike under either pair, with the gaps the README lists.
 MODEL_VLLM_PARSERS: dict[str, VllmParsers] = {
     # Non-thinking checkpoints: they never open a think block.
     "Qwen/Qwen3-4B-Instruct-2507": VllmParsers("hermes", None),
@@ -1725,6 +1730,21 @@ def vllm_parsers_for(
             f"MODEL_VLLM_PARSERS[{model_name!r}] = {served} changes renderer "
             f"{name!r}'s tool parser or its markup rule ({pair}): only the "
             "reasoning parser is the checkpoint's"
+        )
+    if served.reasoning is None and pair.tool == "qwen3_coder":
+        assuming = sorted(
+            renderer
+            for renderer, cls in RENDERER_REGISTRY.items()
+            if getattr(cls, "vllm_parsers", None) is not None
+            and cls.vllm_parsers.tool == pair.tool
+        )
+        raise ValueError(
+            f"MODEL_VLLM_PARSERS[{model_name!r}] = {served} drops the reasoning "
+            f"parser of renderer {name!r} ({pair}), which its parse without tool "
+            "calls assumes (parse_qwen35, the parse of renderers "
+            f"{', '.join(assuming)}): without one, vLLM's qwen3_coder engine "
+            "keeps a </think> in the content that parse_qwen35 drops. Serve it "
+            "with a reasoning parser"
         )
     return served
 

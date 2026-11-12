@@ -165,38 +165,55 @@ def _decode(tokenizer, ids: list[int]) -> str:
     return tokenizer.decode(ids, skip_special_tokens=False)
 
 
-_QWEN3_XML_TERMINAL_RE = re.compile(r"</?tool_call>|<function=|</function>")
+# The qwen3 grammar's terminals (``qwen3_config`` in ``vllm/parser/qwen3.py``),
+# lexed leftmost-longest as vLLM's lexer does, so the ">" closing a name is never
+# read inside another terminal.
+_QWEN3_XML_TERMINAL_RE = re.compile(
+    r"<think>|</think>|<tool_call>|</tool_call>|<function=|</function>"
+    r"|<parameter=|</parameter>|>"
+)
+# Its transitions from the CONTENT state its tool pass starts in, minus those
+# that leave the state and the content unchanged (a parameter tag in the body).
+# The pass reads </think> as text, as with no reasoning parser; a reasoning
+# parser drops a repeated </think> before it, which this doesn't.
+_QWEN3_XML_TRANSITIONS: dict[tuple[str, str], str] = {
+    ("CONTENT", "<tool_call>"): "TOOL_PREAMBLE",
+    ("CONTENT", "<function="): "TOOL_NAME",
+    ("TOOL_PREAMBLE", "</tool_call>"): "CONTENT",
+    ("TOOL_PREAMBLE", "<function="): "TOOL_NAME",
+    ("TOOL_NAME", ">"): "TOOL_ARGS",
+    ("TOOL_NAME", "</function>"): "TOOL_BETWEEN",
+    ("TOOL_NAME", "</tool_call>"): "CONTENT",
+    ("TOOL_NAME", "<tool_call>"): "TOOL_PREAMBLE",
+    ("TOOL_NAME", "<function="): "TOOL_NAME",
+    ("TOOL_ARGS", "</function>"): "TOOL_BETWEEN",
+    ("TOOL_ARGS", "<function="): "TOOL_NAME",
+    ("TOOL_BETWEEN", "</tool_call>"): "CONTENT",
+    ("TOOL_BETWEEN", "<tool_call>"): "TOOL_PREAMBLE",
+    ("TOOL_BETWEEN", "<function="): "TOOL_NAME",
+}
 
 
 def _qwen3_xml_content(text: str) -> str:
     """The text vLLM's qwen3 grammar (``vllm/parser/qwen3.py`` at
     ``VLLM_CHAT_PARITY``, the ``qwen3_coder`` engine) serves as content when it
     parses no calls from ``text``: what it reads in its CONTENT state. A
-    ``<tool_call>`` or a bare ``<function=`` leaves CONTENT and only a
-    ``</tool_call>`` returns to it, so the text after a bare ``</function>`` is
-    dropped until one. A terminal with no transition from CONTENT stays text."""
+    terminal with no transition from the state it meets stays in that state,
+    and is text in CONTENT; everything read in a tool state is dropped. So an
+    unclosed name returns to CONTENT at a ``</tool_call>``, while a body runs
+    until its ``</function>`` or a new ``<function=``."""
     kept: list[str] = []
-    state = "content"  # or "tool" (TOOL_NAME/TOOL_ARGS), "wrapper" (PREAMBLE/BETWEEN)
+    state = "CONTENT"
     cursor = 0
     for match in _QWEN3_XML_TERMINAL_RE.finditer(text):
-        terminal = match.group()
-        if state == "content":
-            kept.append(text[cursor : match.start()])
-            if terminal == "<tool_call>":
-                state = "wrapper"
-            elif terminal == "<function=":
-                state = "tool"
-            else:
-                kept.append(terminal)
-        elif state == "tool":
-            if terminal == "</function>":
-                state = "wrapper"
-        elif terminal == "</tool_call>":
-            state = "content"
-        elif terminal == "<function=":
-            state = "tool"
+        next_state = _QWEN3_XML_TRANSITIONS.get((state, match.group()))
+        if state == "CONTENT":
+            kept.append(
+                text[cursor : match.end() if next_state is None else match.start()]
+            )
+        state = next_state or state
         cursor = match.end()
-    if state == "content":
+    if state == "CONTENT":
         kept.append(text[cursor:])
     return "".join(kept)
 

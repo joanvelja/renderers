@@ -646,7 +646,7 @@ class ParsedResponse:
     """
 
 
-VLLM_CHAT_PARITY = "0.32.0"
+VLLM_CHAT_PARITY = "0.33.0"
 """The vLLM release each renderer's ``vllm_parsers`` names parsers of, and whose
 chat path ``parse_response(tool_calls=False)`` mirrors. Re-read the declarations
 and the parser facts below when bumping it."""
@@ -712,7 +712,7 @@ class VllmParsers:
     @property
     def engine_based(self) -> bool:
         """Whether vLLM parses with one engine for both parsers
-        (``abstract_parser.py:151-154``): neither is a legacy parser."""
+        (``abstract_parser.py:152-155``): neither is a legacy parser."""
         return (self.tool is None or _ENGINE_TOOL_PARSER[self.tool]) and (
             self.reasoning is None or _ENGINE_REASONING_PARSER[self.reasoning]
         )
@@ -723,9 +723,9 @@ class VllmParsers:
         content when it parses no calls from it (``tool_choice="none"``, which a
         request without tools defaults to). Harmony drops tool messages; an
         engine-based pair runs its engine and drops the tool events
-        (``abstract_parser.py:394-397``), keeping the text around the blocks. A
+        (``abstract_parser.py:401-404``), keeping the text around the blocks. A
         legacy tool parser hands the reasoning parser's content on whole
-        (``:398``), and without a tool parser nothing is a call (``:390``)."""
+        (``:405``), and without a tool parser nothing is a call (``:398-399``)."""
         if self.tool is None:
             return False
         return self.tool == "openai" or self.engine_based
@@ -1224,8 +1224,9 @@ MODEL_RENDERER_MAP: dict[str, str] = {
 # The vLLM parser pair of a mapped checkpoint served differently from its
 # renderer's format (``Renderer.vllm_parsers``); ``vllm_parsers_for`` reads it.
 # vLLM's qwen3 and kimi_k2 reasoning parsers start in reasoning unless the request
-# turns thinking off (vllm/parser/qwen3.py:231, kimi_k2.py:163-167), so a
-# checkpoint whose default reply opens no think block is served without one:
+# turns thinking off (vllm/parser/qwen3.py:318, kimi_k2.py:163-167) or, for qwen3,
+# the prompt's own turn closes reasoning (parser/engine/parser_engine.py:235-245),
+# so a checkpoint whose default reply opens no think block is served without one:
 # under it, that reply is all reasoning and its content null. The tool parser,
 # and with it how the renderer parses a reply without tool calls, stays the
 # format's (checked in ``vllm_parsers_for``).
@@ -1238,9 +1239,9 @@ MODEL_VLLM_PARSERS: dict[str, VllmParsers] = {
     "Qwen/Qwen3-VL-30B-A3B-Instruct": VllmParsers("hermes", None),
     "moonshotai/Kimi-K2-Instruct": VllmParsers("kimi_k2", None),
     # Their template's default turns thinking off (an empty think block closes
-    # the generation prompt), which the parser can't see unless the request
-    # sends enable_thinking=false. A request turning thinking on gets its
-    # reasoning back in the content.
+    # the generation prompt), which the qwen3 parser reads off the prompt, so
+    # the class pair would serve that reply as content too. Under this pair a
+    # request turning thinking on gets its reasoning back in the content.
     "Qwen/Qwen3.5-0.8B": VllmParsers("qwen3_coder", None),
     "Qwen/Qwen3.5-2B": VllmParsers("qwen3_coder", None),
 }

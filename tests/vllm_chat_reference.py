@@ -5,15 +5,18 @@ calls.
 Two steps, from the repo root. The replies come from this project's environment,
 so they are the ones the tests build:
 ``uv run python tests/vllm_chat_reference.py replies replies.json``. vLLM then
-serves them where ``VLLM_CHAT_PARITY`` imports (Linux):
-``uv run --no-project --with vllm==0.32.0 --with-editable . python
-tests/vllm_chat_reference.py serve replies.json``.
+serves them where it imports (Linux):
+``uv run --no-project --with vllm==0.33.0 --with-editable . python
+tests/vllm_chat_reference.py serve replies.json``. The fixture records the vLLM
+release that served it, which ``test_roundtrip.py`` requires to be
+``VLLM_CHAT_PARITY``.
 
 Each reply goes through vLLM's own parser stack as ``chat_completion/serving.py``
 drives it, with the pair its model is served with (``vllm_parsers_for``) and
-``tool_choice="none"``: with the tools, the whole reply (``:997-1047``); without
-tools, the streamed reply for an engine-based pair (``:666``) and the whole one
-otherwise. Its output is detokenized by vLLM's own v1 detokenizer
+``tool_choice="none"``: with the tools, the whole reply (``:996-1044``: the
+parser is given the prompt, then parses the reply); without tools, the streamed
+reply for an engine-based pair (``:712-717``, ``stream_processor.py:76-91``) and
+the whole one otherwise. Its output is detokenized by vLLM's own v1 detokenizer
 (``IncrementalDetokenizer``, primed with the prompt, the stop token excluded),
 fast or slow as the tokenizer is. A Harmony
 (gpt-oss) reply is parsed from the channel header renderers' prompt prefills,
@@ -186,7 +189,9 @@ def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
             tok, request.tools, chat_template_kwargs=template_kwargs, model_config=None
         )
 
-    # online_renderer.py: a reasoning parser (or Harmony) adjusts the request.
+    # A reasoning parser (or Harmony) adjusts the request (online_renderer.py:
+    # 850-875, Harmony :529-545). The prompt it is given there first
+    # (set_prompt_token_ids) only matters to the parse, not to the request.
     if harmony or parser_cls.always_adjust_request or parser_cls.reasoning_parser_cls:
         request = parser().adjust_request(request=request) or request
     stopped = bool(ids) and ids[-1] in stop_ids
@@ -215,10 +220,12 @@ def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
 
 
 def serve(in_path):
+    from importlib.metadata import version
+
     from parity import TOOLS
     from reference_continuations import reasoning_left_in_content, served_key
 
-    from renderers import VLLM_CHAT_PARITY, VllmParsers
+    from renderers import VllmParsers
 
     pairs, served = {}, {}
     for reply in json.loads(Path(in_path).read_text()):
@@ -260,7 +267,7 @@ def serve(in_path):
     messages = sorted(set(served.values()), key=json.dumps)
     index = {message: i for i, message in enumerate(messages)}
     fixture = {
-        "vllm": VLLM_CHAT_PARITY,
+        "vllm": version("vllm"),
         "pairs": pairs,
         "messages": [{"content": c, "reasoning": r} for c, r in messages],
         "served": {key: index[message] for key, message in served.items()},

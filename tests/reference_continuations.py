@@ -256,6 +256,35 @@ SERVED_REPLIES = {
         "Check.\n</think>\n\nSure.\n<function=get_weather>\n<parameter=city>\n"
         "Tokyo\n</parameter>\n</function>\nafter<|im_end|>",
     ),
+    # qwen3 grammar: an unclosed name returns to the content at </tool_call>.
+    "qwen3.5-unclosed-name": (
+        "Qwen/Qwen3.5-9B",
+        "Check.\n</think>\n\nSure.\n<tool_call>\n<function=get_weather\n"
+        "</tool_call>\nAfter.<|im_end|>",
+    ),
+    # qwen3 grammar: a <tool_call> in a name opens a wrapper, where a ">" opens
+    # no body, so the </tool_call> returns to the content.
+    "qwen3.5-tool-call-in-name": (
+        "Qwen/Qwen3.5-9B",
+        "Check.\n</think>\n\nSure.\n<tool_call>\n<function=get_weather"
+        "<tool_call>\n<parameter=city>\nTokyo\n</parameter>\n</tool_call>\n"
+        "After.<|im_end|>",
+    ),
+    # qwen3 grammar: a <function= in a name keeps the name open until its ">",
+    # and the body that opens swallows the </tool_call> and the text after it.
+    "qwen3.5-function-in-name": (
+        "Qwen/Qwen3.5-9B",
+        "Check.\n</think>\n\nSure.\n<tool_call>\n<function=get_weather"
+        "<function=get_time>\n</tool_call>\nAfter.<|im_end|>",
+    ),
+    # qwen3 grammar: a <function= in a body opens a name, which an unclosed
+    # name's </tool_call> leaves for the content.
+    "qwen3.5-function-in-body": (
+        "Qwen/Qwen3.5-9B",
+        "Check.\n</think>\n\nSure.\n<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nTokyo\n</parameter>\n<function=get_time\n"
+        "</tool_call>\nAfter.<|im_end|>",
+    ),
 }
 
 

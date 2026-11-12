@@ -305,6 +305,20 @@ SERVED_REPLIES = {
         "deepseek-ai/DeepSeek-R1",
         "Check.</think>\n\nSure.</think>\nMore.<｜end▁of▁sentence｜>",
     ),
+    # deepseek_v3 under tool_choice="auto": the content resumes after the
+    # section's last <｜tool▁calls▁end｜>, a stray one after it included.
+    "deepseek-v3-stray-calls-end": (
+        "deepseek-ai/DeepSeek-V3",
+        "A<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+        '```json\n{"city": "Tokyo"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>B'
+        "<｜tool▁calls▁end｜>C<｜end▁of▁sentence｜>",
+    ),
+    "deepseek-r1-stray-calls-end": (
+        "deepseek-ai/DeepSeek-R1",
+        "Check.</think>A<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function"
+        '<｜tool▁sep｜>get_weather\n```json\n{"city": "Tokyo"}\n```<｜tool▁call▁end｜>'
+        "<｜tool▁calls▁end｜>B<｜tool▁calls▁end｜>C<｜end▁of▁sentence｜>",
+    ),
 }
 
 

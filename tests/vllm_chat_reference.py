@@ -5,9 +5,11 @@ calls.
 Two steps, from the repo root. The replies come from this project's environment,
 so they are the ones the tests build:
 ``uv run python tests/vllm_chat_reference.py replies replies.json``. vLLM then
-serves them where ``VLLM_CHAT_PARITY`` imports (Linux):
-``uv run --no-project --with vllm==0.32.0 --with-editable . python
-tests/vllm_chat_reference.py serve replies.json``.
+serves them where it imports (Linux):
+``uv run --no-project --with vllm==0.33.0 --with-editable . python
+tests/vllm_chat_reference.py serve replies.json``. The fixture records the vLLM
+release that served it, which ``test_roundtrip.py`` requires to be
+``VLLM_CHAT_PARITY``.
 
 Each reply goes through vLLM's own parser stack as ``chat_completion/serving.py``
 drives it, with the pair its model is served with (``vllm_parsers_for``) and
@@ -218,10 +220,12 @@ def _serve(tok, model, pair, prompt_ids, ids, stop_ids, *, tools, ctk, stream):
 
 
 def serve(in_path):
+    from importlib.metadata import version
+
     from parity import TOOLS
     from reference_continuations import reasoning_left_in_content, served_key
 
-    from renderers import VLLM_CHAT_PARITY, VllmParsers
+    from renderers import VllmParsers
 
     pairs, served = {}, {}
     for reply in json.loads(Path(in_path).read_text()):
@@ -263,7 +267,7 @@ def serve(in_path):
     messages = sorted(set(served.values()), key=json.dumps)
     index = {message: i for i, message in enumerate(messages)}
     fixture = {
-        "vllm": VLLM_CHAT_PARITY,
+        "vllm": version("vllm"),
         "pairs": pairs,
         "messages": [{"content": c, "reasoning": r} for c, r in messages],
         "served": {key: index[message] for key, message in served.items()},

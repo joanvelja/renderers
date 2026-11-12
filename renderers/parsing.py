@@ -235,7 +235,10 @@ def _without_unnamed_special_tokens(
     names ``terminals`` drops wherever they occur: each of the tokenizer's
     ``all_special_tokens`` that isn't one of them
     (``vllm/parser/engine/streaming_parser_engine.py:39-86``, ``:416-417``). A
-    token the tokenizer flags special without listing it there stays."""
+    token the tokenizer flags special without listing it there stays. The list
+    depends on the transformers release (Qwen3.5's has 9 tokens under 5.14.1
+    and 17 under 5.20.2), so this matches vLLM only where both run the same
+    transformers."""
     dropped = {
         token_id
         for token, token_id in zip(

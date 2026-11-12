@@ -65,11 +65,18 @@ without inserting a close. A closing marker later in the completion still wins:
 tool markup before it stays reasoning. Inkling ends thinking and tool segments
 with the same `<|end_message|>`, so there the first opener decides.
 
-For reasoning-first formats, only an initial `<think>` (after any assistant
-header) or reasoning already opened in the prompt starts reasoning. After its
-first closing marker, the rest is content. Later think markers remain literal
-content: `Before<think>example</think>After` is entirely content. Harmony,
-Gemma, and Inkling follow their explicit channel or message-segment grammar.
+For the `<think>` reasoning-first formats (Qwen3 / Qwen3-VL / Qwen3.5+,
+Prime-Qwen3, Nemotron-3, MiniMax-M2, Kimi-K2 / K2.5, DeepSeek V3 / R1, Laguna),
+only an initial `<think>` (after any assistant header) or reasoning already
+opened in the prompt starts reasoning. After its first closing marker, the rest
+is content, and later think markers stay in it as text:
+`Before<think>example</think>After` is all content. Parsed without tool calls,
+Qwen3.5+, Prime-Qwen3 and Nemotron-3 drop each `</think>` from that content, as
+vLLM's qwen3 grammar does (`Before<think>exampleAfter`). GLM and DeepSeek V4
+also take the initial channel from the configured generation mode, and read
+every `<think>…</think>` block as reasoning (`BeforeAfter`, reasoning
+`example`). Harmony, Gemma, and Inkling follow their explicit channel or
+message-segment grammar.
 
 `ParsedResponse.reasoning_complete` is `False` while a reasoning channel is open,
 `True` when it is closed (or the format has no reasoning channel), and `None` when
@@ -94,19 +101,40 @@ without tools, its streamed reply for an engine-based pair, else its one reply
 whose whole reply this is). No tool calls, the reasoning split unchanged, and the
 tool-call markup kept in the content (a legacy tool parser) or dropped from it
 (an engine-based pair, or Harmony), as `VllmParsers.drops_tool_markup` derives.
-With tool calls, the parse is vLLM's chat path under `tool_choice="auto"` (its
-whole reply, with the tools) for the `deepseek_v3` tool parser (DeepSeek V3 and
-R1) only: the content is the text before the tool-call section and after its
-last `<｜tool▁calls▁end｜>`. For any other tool parser, renderers claims nothing
-about the content vLLM serves next to tool calls.
 `tests/fixtures/vllm_chat_content.json` pins the content and reasoning vLLM
-serves for each reference reply, and the tool calls of the `deepseek_v3` ones
-under `tool_choice="auto"` (`tests/vllm_chat_reference.py` regenerates it);
-where vLLM's pair leaves the reasoning in the content and renderers splits it
-off (Hy3 under `reasoning_effort` `no_think`, MiniMax-M2.5, Laguna-S-2.1 unless
-the request turns thinking on), it pins the content after vLLM's reasoning
-closer, and the regeneration refuses any other checkpoint doing so. A renderer that parses tool calls but pins no pair
-(`DefaultRenderer` with a `tool_parser`) refuses the parse.
+serves under that pair for each reference reply (`tests/vllm_chat_reference.py`
+regenerates it), and parity holds for every reply it pins; where vLLM's pair
+leaves the reasoning in the content and renderers splits it off (Hy3 under
+`reasoning_effort` `no_think`, MiniMax-M2.5, Laguna-S-2.1 unless the request
+turns thinking on), it pins the content after vLLM's reasoning closer, and the
+regeneration refuses any other checkpoint doing so.
+
+A known gap under `tool_choice="none"`: vLLM drops a repeated reasoning closer
+from the content, and the special tokens the pair's grammar doesn't name.
+Renderers drops both only for the qwen3_coder pairs (Qwen3.5/3.6/3.8,
+Prime-Qwen3, Nemotron-3). It keeps both for the hermes+qwen3 pair (the qwen3
+and qwen3-vl renderers), Kimi-K2 / K2.5 and Gemma 4 (whose closer is
+`<channel|>`), and for GLM and DeepSeek V4 drops the repeated closer, as vLLM
+does, but keeps the special tokens. For the qwen3 and qwen3-vl renderers the
+special-token half applies under either of their pairs: without a reasoning
+parser vLLM's detokenizer drops the special tokens (`skip_special_tokens`) and
+keeps the `</think>`. Where a parser engine drops them, the dropped special
+tokens are the tokenizer's `all_special_tokens`, which depend on the
+transformers release (Qwen3.5 lists 9 under transformers 5.14.1 and 17 under
+5.20.2), so parity on special tokens holds only where renderers and vLLM run
+the same transformers.
+
+With tool calls, for the `deepseek_v3` tool parser (DeepSeek V3 and R1) the
+content beside the calls is what vLLM serves under `tool_choice="auto"` (its
+whole reply, with the tools): the text before the tool-call section and after
+its last `<｜tool▁calls▁end｜>` (when that closer precedes the section, vLLM
+appends all the text after it). Which calls are parsed is vLLM's only for a
+reply with one fenced section, the shape the fixture pins; vLLM also parses the
+calls of a later section, which renderers doesn't, and parses no call that lacks
+its ```` ```json ```` fence, where renderers parses one. For any other tool
+parser, renderers claims nothing about what vLLM serves beside tool calls. A
+renderer that parses tool calls but pins no pair (`DefaultRenderer` with a
+`tool_parser`) refuses the parse.
 
 Summary consumers should require normal termination (`finish_reason="stop"`),
 nonempty final content, and no tool calls. A length-limited final answer remains

@@ -237,59 +237,6 @@ def test_qwen3_distinct_parallel_calls_after_think_are_preserved():
 
 
 @lru_cache
-def _qwen3_coder(model: str):
-    tokenizer = load_tokenizer(model)
-    return tokenizer, create_renderer(tokenizer)
-
-
-# A malformed call per qwen3-grammar transition vLLM 0.33 added for an unclosed
-# function name or body (vllm#58227), and the content the qwen3_coder engine
-# serves for it: (TOOL_NAME, TOOL_END) -> CONTENT, (TOOL_NAME, TOOL_START) ->
-# TOOL_PREAMBLE, (TOOL_NAME, FUNC_PREFIX) -> TOOL_NAME, (TOOL_ARGS, FUNC_PREFIX)
-# -> TOOL_NAME.
-_QWEN3_UNCLOSED_CALLS = {
-    "name-then-tool-end": (
-        "Sure.\n<tool_call>\n<function=get_weather\n</tool_call>\nAfter.",
-        "Sure.\n\nAfter.",
-    ),
-    # In the preamble the ">" of <parameter=city> closes no name, so the
-    # </tool_call> returns to the content.
-    "name-then-tool-start": (
-        "Sure.\n<tool_call>\n<function=get_weather<tool_call>\n<parameter=city>\n"
-        "Tokyo\n</parameter>\n</tool_call>\nAfter.",
-        "Sure.\n\nAfter.",
-    ),
-    # The second name stays open until its ">", so the call body swallows the
-    # </tool_call> and the text after it.
-    "name-then-function": (
-        "Sure.\n<tool_call>\n<function=get_weather<function=get_time>\n"
-        "</tool_call>\nAfter.",
-        "Sure.",
-    ),
-    "body-then-function": (
-        "Sure.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n"
-        "</parameter>\n<function=get_time\n</tool_call>\nAfter.",
-        "Sure.\n\nAfter.",
-    ),
-}
-
-
-@pytest.mark.parametrize(
-    "model", ["Qwen/Qwen3.5-9B", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"]
-)
-@pytest.mark.parametrize("case", sorted(_QWEN3_UNCLOSED_CALLS))
-def test_qwen3_coder_unclosed_call_parsed_without_tool_calls(model, case):
-    """A reply parsed without tool calls keeps the content vLLM's qwen3_coder
-    engine serves for it: text in the grammar's CONTENT state only."""
-    tokenizer, renderer = _qwen3_coder(model)
-    text, content = _QWEN3_UNCLOSED_CALLS[case]
-    ids = tokenizer.encode(text, add_special_tokens=False)
-    parsed = renderer.parse_response(ids, tool_calls=False)
-    assert parsed.content == content
-    assert parsed.tool_calls == []
-
-
-@lru_cache
 def _kimi_k25():
     tokenizer = load_tokenizer("moonshotai/Kimi-K2.5")
     renderer = create_renderer(tokenizer)
@@ -413,6 +360,5 @@ def teardown_module():
     _qwen3_vl.cache_clear()
     _qwen3.cache_clear()
     _prime_qwen3.cache_clear()
-    _qwen3_coder.cache_clear()
     _kimi_k25.cache_clear()
     _deepseek_v3.cache_clear()

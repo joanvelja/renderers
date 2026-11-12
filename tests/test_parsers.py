@@ -297,8 +297,6 @@ def test_an_entry_for_a_checkpoint_the_renderer_map_lacks_is_refused_by_name(
         "Qwen/Qwen3-VL-8B-Instruct",
         "Qwen/Qwen3-VL-30B-A3B-Instruct",
         "moonshotai/Kimi-K2-Instruct",
-        "Qwen/Qwen3.5-0.8B",
-        "Qwen/Qwen3.5-2B",
     ],
 )
 def test_a_checkpoint_that_answers_without_thinking_is_served_without_a_reasoning_parser(

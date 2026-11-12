@@ -339,9 +339,6 @@ def reasoning_left_in_content(model, chat_template_kwargs):
         # poolside_v1 splits only when the request turns thinking on
         # (deepseek_v3_reasoning_parser.py:28-37); the template thinks unasked.
         return not (kwargs.get("thinking") or kwargs.get("enable_thinking"))
-    if model in {"Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-2B"}:
-        # Served without a reasoning parser (MODEL_VLLM_PARSERS).
-        return kwargs.get("enable_thinking") is True
     # minimax_m2_append_think serves the whole reply as content, behind a
     # "<think>" (minimax_m2_reasoning_parser.py:58-61).
     return model == "MiniMaxAI/MiniMax-M2.5"

@@ -84,8 +84,7 @@ Each renderer declares the vLLM parser pair its format is served with,
 `VLLM_CHAT_PARITY`. A checkpoint served differently has its own pair in
 `MODEL_VLLM_PARSERS`: one whose default reply opens no think block
 (Qwen3-*-Instruct-2507, Qwen3-VL-*-Instruct, Kimi-K2-Instruct) is served without
-a reasoning parser, under which vLLM would read that reply as reasoning, and so
-are Qwen3.5-0.8B/2B, whose template turns thinking off by default.
+a reasoning parser, under which vLLM would read that reply as reasoning.
 `vllm_parsers_for(config, model)` returns the pair to serve, without a
 tokenizer, for whoever launches vLLM. `parse_response(..., tool_calls=False)`
 (and `generate(..., tool_calls=False)`) parses a reply as vLLM's chat path serves
@@ -102,11 +101,11 @@ last `<｜tool▁calls▁end｜>`. For any other tool parser, renderers claims n
 about the content vLLM serves next to tool calls.
 `tests/fixtures/vllm_chat_content.json` pins the content and reasoning vLLM
 serves for each reference reply, and the tool calls of the `deepseek_v3` ones
-under `tool_choice="auto"` (`tests/vllm_chat_reference.py` regenerates it); where vLLM's pair leaves the reasoning in the content and renderers splits
-it off (Hy3 under `reasoning_effort` `no_think`, MiniMax-M2.5, Laguna-S-2.1
-unless the request turns thinking on, Qwen3.5-0.8B/2B with thinking on), it pins
-the content after vLLM's reasoning closer, and the regeneration refuses any
-other checkpoint doing so. A renderer that parses tool calls but pins no pair
+under `tool_choice="auto"` (`tests/vllm_chat_reference.py` regenerates it);
+where vLLM's pair leaves the reasoning in the content and renderers splits it
+off (Hy3 under `reasoning_effort` `no_think`, MiniMax-M2.5, Laguna-S-2.1 unless
+the request turns thinking on), it pins the content after vLLM's reasoning
+closer, and the regeneration refuses any other checkpoint doing so. A renderer that parses tool calls but pins no pair
 (`DefaultRenderer` with a `tool_parser`) refuses the parse.
 
 Summary consumers should require normal termination (`finish_reason="stop"`),

@@ -1230,10 +1230,10 @@ MODEL_RENDERER_MAP: dict[str, str] = {
 # vLLM's qwen3 and kimi_k2 reasoning parsers start in reasoning unless the request
 # turns thinking off (vllm/parser/qwen3.py:318, kimi_k2.py:163-167) or, for qwen3,
 # the prompt's own turn closes reasoning (parser/engine/parser_engine.py:235-245),
-# so a checkpoint whose default reply opens no think block is served without one:
-# under it, that reply is all reasoning and its content null. The tool parser,
-# and with it how the renderer parses a reply without tool calls, stays the
-# format's (checked in ``vllm_parsers_for``).
+# so a checkpoint whose default reply opens no think block, behind a prompt that
+# closes none, is served without one: under it, that reply is all reasoning and
+# its content null. The tool parser, and with it how the renderer parses a reply
+# without tool calls, stays the format's (checked in ``vllm_parsers_for``).
 MODEL_VLLM_PARSERS: dict[str, VllmParsers] = {
     # Non-thinking checkpoints: they never open a think block.
     "Qwen/Qwen3-4B-Instruct-2507": VllmParsers("hermes", None),
@@ -1242,12 +1242,6 @@ MODEL_VLLM_PARSERS: dict[str, VllmParsers] = {
     "Qwen/Qwen3-VL-8B-Instruct": VllmParsers("hermes", None),
     "Qwen/Qwen3-VL-30B-A3B-Instruct": VllmParsers("hermes", None),
     "moonshotai/Kimi-K2-Instruct": VllmParsers("kimi_k2", None),
-    # Their template's default turns thinking off (an empty think block closes
-    # the generation prompt), which the qwen3 parser reads off the prompt, so
-    # the class pair would serve that reply as content too. Under this pair a
-    # request turning thinking on gets its reasoning back in the content.
-    "Qwen/Qwen3.5-0.8B": VllmParsers("qwen3_coder", None),
-    "Qwen/Qwen3.5-2B": VllmParsers("qwen3_coder", None),
 }
 
 

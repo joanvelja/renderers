@@ -64,11 +64,10 @@ source = "vcs"
 # regex accepts any PEP 440-valid suffix after the prefix so we can
 # tag pre-releases like ``renderers-v0.2.0rc1`` later if needed.
 tag-pattern = '^renderers-v(?P<version>.+)$'
-# Used when building from a context without VCS metadata (e.g. an
-# sdist consumed by a downstream that doesn't ship .git). Real
-# builds from a checkout get the resolved version; this fallback
-# only fires when the resolver has nothing to go on.
-fallback-version = "0.0.0"
+# The version when the tree has no usable VCS metadata (e.g. rsync'd or
+# Docker-copied without .git), and the base of a checkout with no matching
+# tag (0.0.1.devN+unknown); the label states that the version is unknown.
+fallback-version = "0.0.0+unknown"
 
 [tool.hatch.version.raw-options]
 # Only stable ``renderers-v<MAJOR>.<MINOR>.<PATCH>`` tags participate in

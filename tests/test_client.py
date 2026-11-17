@@ -87,7 +87,7 @@ def _replayed_choice(rows, sampled):
 
 
 @pytest.mark.parametrize(
-    "error", [None, "mass", "unsampled", "duplicate", "mask", "empty"]
+    "error", [None, "mass", "unsampled", "duplicate", "mask", "empty", "draws"]
 )
 def test_replayed_support_keeps_the_recorded_mask_with_its_probabilities(error):
     rows = [[(3, 0.2), (1, 0.6), (2, 0.2)], [(9, 1.0)]]
@@ -105,6 +105,9 @@ def test_replayed_support_keeps_the_recorded_mask_with_its_probabilities(error):
         )["sampling_mask"]
     elif error == "empty":
         choice = _replayed_choice([], [])
+    elif error == "draws":
+        # Rows that would pass as a replay, flagged as sampler draws.
+        choice["compact_logprobs"]["samples"] = True
     if error not in (None, "empty"):
         with pytest.raises(MalformedGenerateResponseError):
             _parse_replayed_support(choice, sampled)

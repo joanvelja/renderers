@@ -262,6 +262,10 @@ def _parse_replayed_support(
     """A replayed request's sampled logprobs and support: the recorded sampling mask with the sampler's
     logprob of every kept id, which must normalize over it."""
     ids, values, offsets, _ = _decode_compact_logprobs(choice, completion_ids)
+    if choice["compact_logprobs"].get("samples") is True:
+        raise MalformedGenerateResponseError(
+            "Compact sampler draws cannot come with a recorded sampling mask"
+        )
     mask = choice.get("sampling_mask")
     if not isinstance(mask, Mapping):
         raise MalformedGenerateResponseError("Invalid packed sampling mask")

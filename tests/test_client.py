@@ -567,6 +567,52 @@ def test_generate_detokenizes_only_when_stop_strings_need_it(
     assert sent.get("detokenize", True) is detokenize
 
 
+def _encoded(array):
+    """prime-rl's ``encode_array``: base64 bytes with their shape and dtype name."""
+    array = np.ascontiguousarray(array)
+    return {
+        "data": base64.b64encode(array.tobytes()).decode("ascii"),
+        "shape": list(array.shape),
+        "dtype": array.dtype.name,
+    }
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["list", "packed"])
+@pytest.mark.parametrize(
+    ("rows", "refused"),
+    [([[7, 4, 9], [8]], False), ([[4, 9], [8]], True), ([[7], []], True)],
+    ids=["recorded", "unsampled", "empty-row"],
+)
+def test_generate_returns_a_recorded_mask_without_a_head_as_replayed_support(
+    packed, rows, refused
+):
+    # Truncated sampling against prime-rl's server: packed sampled logprobs and the
+    # recorded sampling mask, no top-k head.
+    client = _FakeClient()
+    client.choice["logprobs"] = None
+    client.choice["completion_logprobs"] = _encoded(np.float32([-0.1, -0.2]))
+    client.choice["sampling_mask"] = (
+        {
+            "ids": _encoded(np.int32([i for row in rows for i in row])),
+            "counts": _encoded(np.int32([len(row) for row in rows])),
+        }
+        if packed
+        else rows
+    )
+
+    if refused:
+        with pytest.raises(MalformedGenerateResponseError):
+            _run_generate(client)
+        return
+    result = _run_generate(client)
+
+    np.testing.assert_allclose(result["completion_logprobs"], [-0.1, -0.2])
+    support = result["sampler_support"]
+    assert support["replayed"] and support["logprobs"] is None
+    assert support["ids"].dtype == np.int32 and support["ids"].tolist() == [7, 4, 9, 8]
+    assert support["counts"].dtype == np.int32 and support["counts"].tolist() == [3, 1]
+
+
 def test_generate_process_multimodal_false_sends_content_parts():
     class DeferredMultimodalRenderer(_FakeRenderer):
         supports_process_multimodal = True
